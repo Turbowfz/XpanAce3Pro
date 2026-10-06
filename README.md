@@ -84,7 +84,8 @@ bash build.sh   # 需要 Android SDK (build-tools 35 + platform android-35) 与 
 - 仅供学习研究，刷入产生的任何问题由使用者自行承担
 - `system/odm/etc/camera/config/` 下的三个配置文件提取自一加 ColorOS 16 固件，
   版权归一加/OPPO 所有，仅用于个人设备恢复默认相机行为，请勿商用
+- 本仓库基于 GPL-3.0 开源：修改后再分发需同样以 GPL-3.0 开源并保留版权声明
 
 ## License
 
-MIT
+GPL-3.0
