@@ -1,0 +1,7 @@
+id=XpanAce3Pro
+name=X-Pan（Ace 3 Pro）
+version=v1.1
+versionCode=18
+author=Turbo
+updateJson=https://gitee.com/turbowfz/XpanAce3Pro/raw/main/update.json
+description=给一加 Ace 3 Pro 开启哈苏 X-Pan 模式。本版起支持 Gitee 云更新（管理器内检查更新）。
