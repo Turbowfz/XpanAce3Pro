@@ -88,6 +88,9 @@ public class XpanHook implements IXposedHookLoadPackage {
     /** 当前是否正在为 X-Pan 模式构建流（只有这时才改尺寸） */
     private static volatile boolean sXpanActive = false;
 
+    /** XPanPresenter(bh.c) 实例 —— FeatureFactory.b 的返回值，滤镜重新装配必须用它 */
+    private static volatile Object sPresenter = null;
+
     /** 是否已经排了一次"拍完恢复 UI"的任务（避免重复排队） */
     private static volatile boolean sRestorePending = false;
 
@@ -784,7 +787,8 @@ public class XpanHook implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             XposedBridge.log(TAG + "!! xpan feature inject failed: " + t);
         }
-        // 2) 工厂闸：只许 xpan 模式创建 XPanPresenter
+        // 2) 工厂闸：只许 xpan 模式创建 XPanPresenter；★ 顺手把 presenter 实例存下来
+        //    （后面"滤镜重新装配"必须要它，而应用没有任何全局注册表能拿到它）
         try {
             Class<?> d0 = Class.forName("q7.d0", false, lp.classLoader);
             Class<?> ui = Class.forName("com.oplus.camera.protocal.ui.a", false, lp.classLoader);
@@ -792,18 +796,21 @@ public class XpanHook implements IXposedHookLoadPackage {
                     int.class, android.app.Activity.class, ui);
             XposedBridge.hookMethod(b, new XC_MethodHook() {
                 @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
+                protected void afterHookedMethod(MethodHookParam param) {
                     try {
                         if (!FEAT_XPAN.equals(param.args[0])) return;
                         String mode = String.valueOf(param.args[1]);
-                        if ("xpan".equals(mode)) {
-                            XposedBridge.log(TAG + "FeatureFactory 放行: xpan 功能请求自 mode="
-                                    + mode);
+                        Object r = param.getResult();
+                        if ("xpan".equals(mode) && r != null) {
+                            sPresenter = r;    // bh.c(XPanPresenter) 实例
+                            XposedBridge.log(TAG + "FeatureFactory 放行: xpan | presenter 已捕获");
                             return;
                         }
-                        param.setResult(null);   // 其他模式装作不支持
-                        XposedBridge.log(TAG + "FeatureFactory 拦截: xpan 功能请求自 mode="
-                                + mode + "（已返回 null）");
+                        if (r != null) {
+                            param.setResult(null);   // 其他模式装作不支持
+                            XposedBridge.log(TAG + "FeatureFactory 拦截: xpan 功能请求自 mode="
+                                    + mode + "（已返回 null）");
+                        }
                     } catch (Throwable ignored) {
                     }
                 }
@@ -879,6 +886,27 @@ public class XpanHook implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             XposedBridge.log(TAG + "!! xpan switch fix failed: " + t);
         }
+        // 覆盖"应用自己初始化"的路径：应用调 c1(屏幕) 会重建视图 —— 重建后的滤镜视图
+        // 是新实例，应用的滤镜装配如果发生在重建之前就落空了。c1 一跑完就重新装配一次
+        // （幂等 setter，重复无害）。这样无论"应用先建/我补建"谁先谁后，滤镜都能接上。
+        try {
+            Class<?> zlq = Class.forName("zl.q", false, lp.classLoader);
+            Class<?> scr = Class.forName("bk.g", false, lp.classLoader);
+            Method c1 = zlq.getDeclaredMethod("c1", scr);
+            XposedBridge.hookMethod(c1, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    try {
+                        if (!sXpanActive || sPresenter == null) return;
+                        wireXpanFilter(param.thisObject);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+            XposedBridge.log(TAG + "hook installed OK (xpan c1 rewire)");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "!! xpan c1 rewire failed: " + t);
+        }
         // 持久兜底：切换路径下应用会反复重置容器（实测状态 6→7→-1→…，甚至重建实例），
         // 定时驱动修完一版会被再次重置覆盖。xa() 是应用频繁查询的状态口 ——
         // 只要 X-Pan 会话里 Q 仍停在 -1（从未初始化），就补一次初始化，直到成功为止。
@@ -926,6 +954,50 @@ public class XpanHook implements IXposedHookLoadPackage {
 
     /** 连续失败次数，用于退避（避免在热路径上高频重试反射）。 */
     private static volatile int sDriveFails = 0;
+
+    /* ---------------- 修复：补建后重新装配滤镜（列表 + 点击监听） ----------------
+     * 应用的滤镜装配（setXpanFilterList / setFilterViewListener）发生在视图管理器初始化时，
+     * 针对的是"当时的视图实例"。我们的补建如果重建了视图（新实例），或者时序赶在装配之后，
+     * 新视图就是"没有滤镜列表、没有点击监听"的空壳 —— 表现为滤镜徽标点不开。
+     *
+     * 这里照抄应用自己的装配三步（见反编译 dh/w 的视图装配代码）：
+     *   filterView.setXpanFilterList(presenter.m0())      滤镜列表
+     *   filterView.j(presenter.w0(), false)               当前选中项
+     *   filterView.setFilterViewListener(new dh.u(dh/w))  点击回调
+     * presenter 用 FeatureFactory.b 的返回值（installXpanFeatureInject 已捕获）。
+     * setXxx 都是幂等 setter，重复调用无害。
+     */
+    private void wireXpanFilter(Object container) {
+        try {
+            Object presenter = sPresenter;
+            if (presenter == null) return;
+            Object w = field(presenter, "F");             // dh/p (运行时是 dh/w = XPanViewManagerV3)
+            if (w == null) return;
+            Object fv = field(container, "B");            // XpanPhysicalFilterView
+            if (fv == null) return;
+            Class<?> dhu = Class.forName("dh.u", false, container.getClass().getClassLoader());
+            Object listener = dhu.getConstructors()[0].newInstance(w);
+            Object list = presenter.getClass().getMethod("m0").invoke(presenter);
+            Object cur = presenter.getClass().getMethod("w0").invoke(presenter);
+            fvm(fv, "setXpanFilterList", java.util.List.class).invoke(fv, list);
+            fvm(fv, "j", String.class, boolean.class).invoke(fv, cur, Boolean.FALSE);
+            fvm(fv, "setFilterViewListener", dhu).invoke(fv, listener);
+            if ("1".equals(prop("debug.xpan.diag"))) {
+                XposedBridge.log(TAG + "filter 重装配完成（列表 "
+                        + ((java.util.List<?>) list).size() + " 项）");
+            }
+        } catch (Throwable t) {
+            Throwable cause = (t.getCause() != null) ? t.getCause() : t;
+            XposedBridge.log(TAG + "filter 重装配失败: " + cause);
+        }
+    }
+
+    private static java.lang.reflect.Method fvm(Object o, String name, Class<?>... types)
+            throws NoSuchMethodException {
+        java.lang.reflect.Method m = o.getClass().getMethod(name, types);
+        m.setAccessible(true);
+        return m;
+    }
 
     /** 诊断：把一个 View 描述成 "id/挂载状态/可见性" */
     private static String describeView(Object v) {
@@ -975,21 +1047,14 @@ public class XpanHook implements IXposedHookLoadPackage {
 
     /** 替应用补一次容器初始化。只在 Q==-1（休眠）时动手；返回 false 表示容器还没就绪。
      *
-     *  ★ 关键：必须"让应用先自己初始化，失败了我们才补"。
-     *  应用的初始化有 `Q == -1 才执行` 的守卫（zl.q.c1()）。如果我们在它之前就把 Q 改成非 -1，
-     *  应用会认为"已经初始化过"从而**整个跳过**自己的装配流程 —— 结果滤镜面板(dh/w.Y)、
-     *  各种监听全都没接上，表现就是"右下角滤镜点不开"（实测 2026-10-06，直开态也会中招）。
-     *  所以这里先等一段宽限期（sXpanEnterTime + GRACE），宽限期内一律不插手。
+     *  ⚠️ 时序说明：v2.9 曾加 2.6s 宽限期"让应用先初始化"，结果往返路径边框反而更慢
+     *  且滤镜依旧打不开（应用在往返路径根本不会自己初始化，等了也白等）。
+     *  现在的策略：快速补建（600ms，边框不慢）+ 补建后用 presenter 重新装配滤镜
+     *  （wireXpanFilter）+ 挂 zl.q.c1 后置装配兜底 —— 谁后执行谁都能把滤镜接上。
      */
-    private static volatile long sXpanEnterTime = 0L;
-    private static final long GRACE_MS = 2600L;
-
     private boolean driveXpanContainer() {
         try {
             if (!sXpanActive) return true;   // 已退出 X-Pan：绝不能再把视图建上去（会与照片等界面重叠）
-            if (System.currentTimeMillis() - sXpanEnterTime < GRACE_MS) {
-                return false;                // 宽限期内：让应用自己初始化（别抢它的活）
-            }
             Object ui = sControlUI;
             if (ui == null) return false;
             Object b = field(ui, "H");                    // CameraControlUI.H : com.oplus.camera.b
@@ -1053,6 +1118,7 @@ public class XpanHook implements IXposedHookLoadPackage {
             boolean skin = (Boolean) zlq.getDeclaredMethod("b5").invoke(container);
             fQ.setInt(container, skin ? 6 : 0);
             zlq.getDeclaredMethod("ic").invoke(container);
+            wireXpanFilter(container);   // 补建/复用视图后，滤镜列表与监听必须重新装配
             if ("1".equals(prop("debug.xpan.diag"))) {
                 XposedBridge.log(TAG + "drive: 挂载检查 B(滤镜视图)=" + describeView(field(container, "B"))
                         + " C(滤镜面板)=" + describeView(field(container, "C"))
@@ -1176,11 +1242,9 @@ public class XpanHook implements IXposedHookLoadPackage {
                             sXpanActive = isXpan;
                             XposedBridge.log(TAG + "xpan stream building = " + isXpan);
                             if (isXpan) {
-                                // 进入 X-Pan：复位会话级状态
+                                // 进入 X-Pan：复位会话级状态 + 快速补建（滤镜由 wireXpanFilter 负责接回）
                                 sDriveDone = false;
                                 sDriveFails = 0;
-                                sXpanEnterTime = System.currentTimeMillis();
-                                // 宽限期后先试一次（应用自己初始化的话这里会空转）
                                 android.os.Handler h = new android.os.Handler(
                                         android.os.Looper.getMainLooper());
                                 h.postDelayed(new Runnable() {
@@ -1188,13 +1252,13 @@ public class XpanHook implements IXposedHookLoadPackage {
                                     public void run() {
                                         driveXpanContainer();
                                     }
-                                }, GRACE_MS + 300);
+                                }, 600);
                                 h.postDelayed(new Runnable() {
                                     @Override
                                     public void run() {
                                         driveXpanContainer();
                                     }
-                                }, GRACE_MS + 1500);
+                                }, 1800);
                             } else {
                                 // 退出 X-Pan：卸掉可能残留的容器视图，防止与其他模式界面重叠
                                 android.os.Handler h = new android.os.Handler(
