@@ -114,6 +114,8 @@ public class XpanHook implements IXposedHookLoadPackage {
         installXpanZoomPointFix(lp);
         installXpanFeatureInject(lp);
         installXpanSwitchFix(lp);
+        installXpanPanelFix(lp);
+        installXpanExitCleanup(lp);
 
         // 下面两个是排查用的取证 hook，日志量大，默认关闭。
         // 需要复现问题时：setprop debug.xpan.diag 1，重启相机即可。
@@ -976,12 +978,23 @@ public class XpanHook implements IXposedHookLoadPackage {
             Object fv = field(container, "B");            // XpanPhysicalFilterView
             if (fv == null) return;
             Class<?> dhu = Class.forName("dh.u", false, container.getClass().getClassLoader());
+            // setFilterViewListener 的参数类型是内部接口 XpanPhysicalFilterView$d，
+            // 不能拿实现类 dh.u 去 getMethod（会 NoSuchMethod）
+            Class<?> dIface = Class.forName(
+                    "com.oplus.camera.feature.xpan.view.widget.XpanPhysicalFilterView$d",
+                    false, container.getClass().getClassLoader());
             Object listener = dhu.getConstructors()[0].newInstance(w);
             Object list = presenter.getClass().getMethod("m0").invoke(presenter);
             Object cur = presenter.getClass().getMethod("w0").invoke(presenter);
             fvm(fv, "setXpanFilterList", java.util.List.class).invoke(fv, list);
             fvm(fv, "j", String.class, boolean.class).invoke(fv, cur, Boolean.FALSE);
-            fvm(fv, "setFilterViewListener", dhu).invoke(fv, listener);
+            fvm(fv, "setFilterViewListener", dIface).invoke(fv, listener);
+            // 面板(xpan_textured_filter_panel，dh/w.Y)在往返切换后会被应用摘下来（attached=false），
+            // 徽标点击展开的就是它 —— 不挂回去点了就没反应。
+            Object panelObj = field(w, "Y");
+            if (panelObj instanceof android.view.View) {
+                reattachPanelView((android.view.View) panelObj);
+            }
             if ("1".equals(prop("debug.xpan.diag"))) {
                 XposedBridge.log(TAG + "filter 重装配完成（列表 "
                         + ((java.util.List<?>) list).size() + " 项）");
@@ -1031,6 +1044,15 @@ public class XpanHook implements IXposedHookLoadPackage {
             Object container = field(k0, "p");
             if (container == null) return false;
             container.getClass().getDeclaredMethod("fc").invoke(container);
+            // fc() 内部会跳过面板（id 0x7f090795），它是常驻视图 —— 退出时必须自己摘掉，
+            // 否则 X-Pan 面板会留在照片等模式上（实测残留，界面重叠）。
+            Object panel = field(container, "C");
+            if (panel instanceof android.view.View) {
+                android.view.View pv = (android.view.View) panel;
+                if (pv.getParent() instanceof android.view.ViewGroup) {
+                    ((android.view.ViewGroup) pv.getParent()).removeView(pv);
+                }
+            }
             java.lang.reflect.Field fQ = container.getClass().getDeclaredField("Q");
             fQ.setAccessible(true);
             if (fQ.getInt(container) != -1) {
@@ -1118,7 +1140,13 @@ public class XpanHook implements IXposedHookLoadPackage {
             boolean skin = (Boolean) zlq.getDeclaredMethod("b5").invoke(container);
             fQ.setInt(container, skin ? 6 : 0);
             zlq.getDeclaredMethod("ic").invoke(container);
-            wireXpanFilter(container);   // 补建/复用视图后，滤镜列表与监听必须重新装配
+            // 优先重放应用自己的完整装配（滤镜列表/监听、面板、曝光轮都在里面）；
+            // 拿不到装配参数时才退回手工装配那三步。
+            if (sViewSetup != null) {
+                replayViewSetup();
+            } else {
+                wireXpanFilter(container);
+            }
             if ("1".equals(prop("debug.xpan.diag"))) {
                 XposedBridge.log(TAG + "drive: 挂载检查 B(滤镜视图)=" + describeView(field(container, "B"))
                         + " C(滤镜面板)=" + describeView(field(container, "C"))
@@ -1221,6 +1249,197 @@ public class XpanHook implements IXposedHookLoadPackage {
             XposedBridge.log(TAG + "hook installed OK (filter listener trace)");
         } catch (Throwable t) {
             XposedBridge.log(TAG + "!! filter listener trace failed: " + t);
+        }
+    }
+
+    /* ---------------- 修复：滤镜面板视图脱管（往返切换后徽标点不开） ----------------
+     * 实测（2026-10-07）：往返切换后徽标点击能走到面板的展开逻辑 c1(true)，但面板视图
+     * (xpan_textured_filter_panel，widget c，1264x729) 已经被应用的清理摘下来（attached=false）——
+     * 对脱管视图做展开等于什么都没发生。
+     * 修法：挂住面板的 c1/w0/n1，执行前发现脱管就先挂回根布局（滤镜视图所在的根），
+     * 再让应用自己的展开逻辑跑。wireXpanFilter 装配滤镜时也会做同样的事。
+     */
+    private void installXpanPanelFix(XC_LoadPackage.LoadPackageParam lp) {
+        // ★ 捕获应用自己的"X-Pan 视图管理器初始化"调用参数：dh/w.h(Activity, ui.a, dh/p$f, bh/c$b)。
+        //   这个方法里才做了完整装配（滤镜列表/监听、面板、曝光轮…），
+        //   往返路径下它的效果被容器重置冲掉，光靠我手工补几步是不够的 —— 需要在补建后重放它。
+        try {
+            Class<?> w = Class.forName("dh.w", false, lp.classLoader);
+            for (Method m : w.getDeclaredMethods()) {
+                if (!"h".equals(m.getName()) || m.getParameterTypes().length != 4) continue;
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        try {
+                            sViewSetup = new Object[]{param.thisObject,
+                                    param.args[0], param.args[1], param.args[2], param.args[3]};
+                            if ("1".equals(prop("debug.xpan.diag"))) {
+                                XposedBridge.log(TAG + "已捕获 X-Pan 视图装配参数");
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                });
+            }
+            XposedBridge.log(TAG + "hook installed OK (view setup capture)");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "!! view setup capture failed: " + t);
+        }
+        try {
+            Class<?> c = Class.forName(
+                    "com.oplus.camera.feature.xpan.view.widget.c", false, lp.classLoader);
+            for (Method m : c.getDeclaredMethods()) {
+                final String nm = m.getName();
+                if (!"c1".equals(nm) && !"w0".equals(nm) && !"n1".equals(nm)) continue;
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        try {
+                            android.view.View v = (android.view.View) param.thisObject;
+                            if (v.getParent() != null) return;      // 还挂着，不用管
+                            if (!sXpanActive) return;               // 不在 X-Pan 就不管
+                            reattachPanelView(v);
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                });
+            }
+            XposedBridge.log(TAG + "hook installed OK (xpan panel fix)");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "!! xpan panel fix failed: " + t);
+        }
+        // 退出清理：应用自己卸 X-Pan 视图时调 zl.q.fc()，但 fc() 内部会"跳过面板"，
+        // 于是面板留在屏幕上跟照片等模式重叠。挂在 fc() 上，它一卸就把面板也摘掉 ——
+        // 不依赖模式门（实测退出走"轮盘切模式"时 buildStreamSurface 不会重跑，模式门不翻转）。
+        try {
+            Class<?> zlq = Class.forName("zl.q", false, lp.classLoader);
+            Method fc = zlq.getDeclaredMethod("fc");
+            XposedBridge.hookMethod(fc, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    try {
+                        Object panel = field(param.thisObject, "C");
+                        if (panel instanceof android.view.View) {
+                            android.view.View pv = (android.view.View) panel;
+                            if (pv.getParent() instanceof android.view.ViewGroup) {
+                                ((android.view.ViewGroup) pv.getParent()).removeView(pv);
+                                if ("1".equals(prop("debug.xpan.diag"))) {
+                                    XposedBridge.log(TAG + "面板已随 fc() 摘除");
+                                }
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+            XposedBridge.log(TAG + "hook installed OK (panel detach on fc)");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "!! panel detach on fc failed: " + t);
+        }
+    }
+
+    /** 重放应用自己的 X-Pan 视图装配（dh/w.h），用当前 presenter 替换第三参数 */
+    private static volatile Object[] sViewSetup = null;
+
+    private void replayViewSetup() {
+        try {
+            Object[] a = sViewSetup;
+            if (a == null) return;
+            Object w = a[0];
+            if (w == null) return;
+            ClassLoader cl = w.getClass().getClassLoader();
+            Class<?> actCls = Class.forName("android.app.Activity", false, cl);
+            Class<?> uiCls = Class.forName("com.oplus.camera.protocal.ui.a", false, cl);
+            Class<?> pfCls = Class.forName("dh.p$f", false, cl);
+            Class<?> bCls = Class.forName("bh.c$b", false, cl);
+            Method h = w.getClass().getMethod("h", actCls, uiCls, pfCls, bCls);
+            h.setAccessible(true);
+            h.invoke(w, a[1], a[2], sPresenter != null ? sPresenter : a[3], a[4]);
+            if ("1".equals(prop("debug.xpan.diag"))) {
+                XposedBridge.log(TAG + "已重放 X-Pan 视图装配（dh.w.h）");
+            }
+        } catch (Throwable t) {
+            Throwable cause = (t.getCause() != null) ? t.getCause() : t;
+            XposedBridge.log(TAG + "视图装配重放失败: " + cause);
+        }
+    }
+
+    /** 面板视图脱管时重新挂回根布局（通过容器里还挂着的视图找到根；沿用面板自身 LayoutParams） */
+    private boolean reattachPanelView(android.view.View panel) {
+        try {
+            if (panel.getParent() != null) return true;     // 已挂载
+            if (!sXpanActive) return false;
+            Object ui = sControlUI;
+            if (ui == null) return false;
+            Object b = field(ui, "H");
+            if (b == null) return false;
+            Object k0 = b.getClass().getMethod("M").invoke(b);
+            if (k0 == null) return false;
+            Object container = field(k0, "p");
+            if (container == null) return false;
+            // 容器里任意一个还挂载着的 X-Pan 视图，用它的根当挂载点
+            android.view.ViewGroup root = null;
+            for (String f : new String[]{"B", "A", "o", "n"}) {
+                Object v = field(container, f);
+                if (v instanceof android.view.View && ((android.view.View) v).getParent() != null) {
+                    root = (android.view.ViewGroup) ((android.view.View) v).getRootView();
+                    break;
+                }
+            }
+            if (root == null) return false;
+            root.addView(panel);
+            panel.bringToFront();          // 提到最前：否则会被上层的控制面板挡住触摸
+            panel.requestLayout();
+            if ("1".equals(prop("debug.xpan.diag"))) {
+                XposedBridge.log(TAG + "面板已重新挂回根布局");
+            }
+            return true;
+        } catch (Throwable t) {
+            Throwable cause = (t.getCause() != null) ? t.getCause() : t;
+            XposedBridge.log(TAG + "面板重挂失败: " + cause);
+            return true;   // 失败不再重试
+        }
+    }
+
+    /* ---------------- 退出清理：靠"功能表重建"信号（比模式门可靠） ----------------
+     * 实测退出走"轮盘切模式"时：buildStreamSurface 不重跑（模式门不翻转）、fc() 也不调，
+     * 于是 X-Pan 的皮肤/面板留在照片模式上重叠。
+     * 但模式切换时应用一定会重建功能表：q7.x0.e(Activity, modeName, ...)，modeName 就是新模式名。
+     * 只要 modeName 不是 "xpan"，就说明离开了 X-Pan → 延迟卸掉容器视图与面板。
+     */
+    private void installXpanExitCleanup(XC_LoadPackage.LoadPackageParam lp) {
+        try {
+            Class<?> x0 = Class.forName("q7.x0", false, lp.classLoader);
+            for (Method m : x0.getDeclaredMethods()) {
+                if (!"e".equals(m.getName()) || m.getParameterTypes().length != 7) continue;
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        try {
+                            String mode = String.valueOf(param.args[1]);
+                            if ("xpan".equals(mode)) return;      // 还在 X-Pan
+                            if (!sXpanActive) return;             // 本来就不在
+                            sXpanActive = false;                  // 模式门没翻转也要清，这里直接置位
+                            sDriveDone = true;                    // 别让 xa() 兜底再把它建回来
+                            android.os.Handler h = new android.os.Handler(
+                                    android.os.Looper.getMainLooper());
+                            Runnable r = new Runnable() {
+                                @Override
+                                public void run() {
+                                    cleanupXpanContainer();
+                                }
+                            };
+                            h.postDelayed(r, 300);
+                            h.postDelayed(r, 1200);
+                            XposedBridge.log(TAG + "离开 X-Pan（新模式=" + mode + "）→ 触发界面清理");
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                });
+            }
+            XposedBridge.log(TAG + "hook installed OK (xpan exit cleanup)");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "!! xpan exit cleanup failed: " + t);
         }
     }
 
