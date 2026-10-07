@@ -4,7 +4,7 @@
 配合 LSPosed 使用。**卸载即还原**，不改动系统分区。
 
 > 作者：**Turbowfz**（Turbo）
-> 模块本体：`XpanAce3Pro-v1.2.zip`（可直接刷入；**支持 Gitee 云更新**，管理器内可直接检查更新）
+> 模块本体：`XpanAce3Pro-v1.0.zip`（可直接刷入；**支持 Gitee 云更新**，管理器内可直接检查更新）
 
 ---
 
@@ -29,7 +29,7 @@
 
 ## 安装 / 云更新
 
-1. KernelSU 刷入 `XpanAce3Pro-v1.2.zip`
+1. KernelSU 刷入 `XpanAce3Pro-v1.0.zip`
 2. 之后有新版本时，**KernelSU 管理器内会直接提示更新**（模块走 Gitee 云更新通道，
    清单在 `update.json`，无需重新进本仓库下载）
 3. 也可以随时在本仓库手动下载最新 zip 刷入
@@ -62,7 +62,7 @@
 ## 仓库结构
 
 ```
-├── XpanAce3Pro-v1.2.zip   # 可直接刷入的模块包（含云更新）
+├── XpanAce3Pro-v1.0.zip   # 可直接刷入的模块包（含云更新）
 ├── update.json            # 云更新清单（管理器读这个检查新版本）
 ├── changelog.md           # 更新日志（管理器内展示）
 └── hook/                  # LSPosed hook 源码
