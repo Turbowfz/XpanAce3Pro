@@ -94,6 +94,13 @@ public class XpanHook implements IXposedHookLoadPackage {
     /** 当前是否正在为 X-Pan 模式构建流（只有这时才改尺寸） */
     private static volatile boolean sXpanActive = false;
 
+    /** X-Pan 会话内最近的变焦请求值（fh.g.f 钳制钩子记录；进模式时复位 1.0）。
+     *  ★ v1.2 实测：拍照流 8192 宽超出传感器活动阵列(4096x3072)时，HAL 不理变焦裁剪
+     *  —— 2× 预览正常(预览流 2304 在阵列内)但拍出来只有 ~1.12× 视野(CamX currentZoom
+     *  实锤，无 2.0)。所以变焦 ≠1× 时拍照流回退 4096x1512（v1.1 验证过 2× 正常；
+     *  2× 下真实细节本来就只有 ~2048 宽，不吃亏），1× 才用 8192x3024 大图。 */
+    private static volatile float sXpanZoomReq = 1.0f;
+
     /** XPanPresenter(bh.c) 实例 —— FeatureFactory.b 的返回值，滤镜重新装配必须用它 */
     private static volatile Object sPresenter = null;
     /** 当次 X-Pan 的 Activity 与 ui.a（重放视图装配要用最新实例，旧实例会把预览绑错） */
@@ -615,10 +622,16 @@ public class XpanHook implements IXposedHookLoadPackage {
                 if (!"b0".equals(m.getName()) || m.getParameterTypes().length != 1) continue;
                 XposedBridge.hookMethod(m, new XC_MethodHook() {
                     @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
+                    protected void afterHookedMethod(MethodHookParam param) {
                         try {
-                            XposedBridge.log(TAG + "zoom 下发 HAL gh.z.b0 e0="
-                                    + field(param.thisObject, "e0"));
+                            // 记录真正下发 HAL 的变焦值：b0(arg) 把模型值写进自身 e0 再下发，
+                            // after 里 e0 已是新值（比 UI 钳制函数可靠：点按/滑动/复位都走这）
+                            Object e0 = field(param.thisObject, "e0");
+                            if (sXpanActive && e0 instanceof Number) {
+                                float z = ((Number) e0).floatValue();
+                                if (z >= 1.0f) sXpanZoomReq = z;
+                            }
+                            XposedBridge.log(TAG + "zoom 下发 HAL gh.z.b0 e0=" + e0);
                         } catch (Throwable ignored) {
                         }
                     }
@@ -657,11 +670,12 @@ public class XpanHook implements IXposedHookLoadPackage {
                 XposedBridge.hookMethod(m, new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
-                        try {
-                            if (!sXpanActive) return;
-                            if (param.getResult() == null) return;
-                            float want = (Float) param.args[0];
-                            if (want < 1.0f) return;                 // 0.6× / 坏档位 0.0 都保持原样
+                    try {
+                        if (!sXpanActive) return;
+                        if (param.getResult() == null) return;
+                        float want = (Float) param.args[0];
+                        if (want >= 1.0f) sXpanZoomReq = want;   // 记录当前变焦档（大图回退判断用）
+                        if (want < 1.0f) return;                 // 0.6× / 坏档位 0.0 都保持原样
                             float got = (Float) param.getResult();
                             if (got >= want) return;                 // 没被钳制，不用管
                             float fixed = Math.min(want, XPAN_MAX_ZOOM);
@@ -1689,6 +1703,7 @@ public class XpanHook implements IXposedHookLoadPackage {
                         boolean isXpan = thiz != null && CLS_XPAN_MODE.equals(thiz.getClass().getName());
                         if (sXpanActive != isXpan) {
                             sXpanActive = isXpan;
+                            if (isXpan) sXpanZoomReq = 1.0f;     // 进模式复位变焦档
                             XposedBridge.log(TAG + "xpan stream building = " + isXpan);
                             if (isXpan) {
                                 // 进入 X-Pan：复位会话级状态 + 快速补建（滤镜由 wireXpanFilter 负责接回）
@@ -1858,6 +1873,17 @@ public class XpanHook implements IXposedHookLoadPackage {
             Size want = (forced != null) ? parseSize(forced)
                     : (isPreview ? previewSize() : captureSize());
             if (want == null) return null;
+
+            // ★ 变焦 ≠1× 时拍照流回退 4096x1512：8192 宽大流超出活动阵列，HAL 不理
+            //   变焦裁剪（2× 实拍只有 ~1.12× 视野，见 sXpanZoomReq 注释）。prop 显式
+            //   指定时尊重 prop（老语义，自行承担）。
+            if (!isPreview && forced == null && sXpanZoomReq > 1.05f) {
+                Size real = parseSize(DEFAULT_CAPTURE);
+                if (real != null) {
+                    want = real;
+                    XposedBridge.log(TAG + "变焦档回退: " + sXpanZoomReq + "x -> " + real);
+                }
+            }
 
             // 超广角的 HAL 流必须用它自己支持的宽度（imx355 流表最大 3200/3216），
             // 否则绿帧/噪声；JPEG 输出仍由应用侧的 4096x1512 负责（APS 缩放）。
