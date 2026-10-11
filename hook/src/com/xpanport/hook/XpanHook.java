@@ -8,6 +8,7 @@ import android.hardware.camera2.params.StreamConfigurationMap;
 import android.util.Size;
 import android.util.Pair;
 
+import java.io.File;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
@@ -58,6 +59,11 @@ public class XpanHook implements IXposedHookLoadPackage {
 
     private static final String DEFAULT_PREVIEW = "2304x1048";
     private static final String DEFAULT_CAPTURE = "4096x1512";
+    /** v1.2 大图档（bigPic 开关打开时用）。实测定论（12_验证/分辨率实验结论.md）：
+     *  HAL 对 >4096 宽的流一律从 12.5MP 四合一读出后放大，8192x3024 是 24.8MP 的
+     *  "算法放大"图 —— 像素 x4、细节不增加，看图能放大更多、文件更大。
+     *  连拍 3 张实测稳定。系统"高像素"模式也是同级别算法重构，真细节上限就是 6.2MP。 */
+    private static final String BIG_CAPTURE = "8192x3024";
     /** 超广角（imx355）HAL 流的 X-Pan 尺寸。实测 2026-10-06 五种尺寸的结论：
      *  4096x1512 → 整片绿帧（宽度超出 imx355 上限，HAL 不填缓冲，YUV 全 0 就是绿）；
      *  3264x1205 / 3216x1440 / 2520x1080 → 雪花噪声（表外或非 2.2:1 通路）；
@@ -1825,11 +1831,14 @@ public class XpanHook implements IXposedHookLoadPackage {
 
     /**
      * 算出这个面该用哪个尺寸；**返回 null 表示不要动**。
-     *
-     * 只有能确认 usage 是预览 / 拍照时才改（边界 2）：
-     *   预览 → DEFAULT_PREVIEW（可被 debug.xpan.preview 覆盖）
-     *   拍照 → DEFAULT_CAPTURE（可被 debug.xpan.capture 覆盖）
-     *   认不出来 / 是视频、缩略图、metadata 等 → 原样不动
+     * 预览 → previewSize()（2304x1048，可被 debug.xpan.preview 覆盖）
+     * 拍照 → captureSize()（4096x1512；大图开关开时 8192x3024；prop 可显式覆盖）
+     *   app/HAL 两侧同尺寸 —— 大图档就是让 HAL 出 8192x3024 的放大流
+     *   （2026-10-10 实测：HAL 收下 >4096 宽的流，内部从 12.5MP 读出放大，连拍稳定）。
+     *   曾试过"app 侧大图 + HAL 侧真读出、借 APS mfll/upscale 放大"的 C 路线：
+     *   本机 APS 没有 xpan 的放大算法组件，algo 配置开启后 APS 初始化卡死、快门被禁
+     *   （isApsCaptureAlgoInitializing=true, not allow take picture），已判死，勿再试。
+     * 认不出来 / 是视频、缩略图、metadata 等 → 原样不动
      */
     private static Size targetFor(Size s, Object wrapper) {
         try {
@@ -1846,9 +1855,10 @@ public class XpanHook implements IXposedHookLoadPackage {
             if (!isPreview && !isPicture) return null;     // 视频/缩略图/metadata 等 → 不动
 
             String forced = isPreview ? prop("debug.xpan.preview") : prop("debug.xpan.capture");
-            if (forced == null) forced = isPreview ? DEFAULT_PREVIEW : DEFAULT_CAPTURE;
-            Size want = parseSize(forced);
+            Size want = (forced != null) ? parseSize(forced)
+                    : (isPreview ? previewSize() : captureSize());
             if (want == null) return null;
+
             // 超广角的 HAL 流必须用它自己支持的宽度（imx355 流表最大 3200/3216），
             // 否则绿帧/噪声；JPEG 输出仍由应用侧的 4096x1512 负责（APS 缩放）。
             if (!isPreview && isUltraWide(cameraTypeOf(wrapper))) {
@@ -1946,15 +1956,40 @@ public class XpanHook implements IXposedHookLoadPackage {
         return s;
     }
 
-    /** X-Pan 拍照尺寸（实机验证过的组合，可用 debug.xpan.capture 覆盖） */
+    /**
+     * X-Pan 拍照尺寸，优先级：debug.xpan.capture > 大图开关(BIG_CAPTURE) > DEFAULT_CAPTURE。
+     * 有缓存，改动后重启相机进程生效（与 prop 行为一致）。
+     */
     private static Size captureSize() {
         if (sCaptureSize != null) return sCaptureSize;
         String p = prop("debug.xpan.capture");
-        Size s = parseSize(p != null ? p : DEFAULT_CAPTURE);
+        Size s = parseSize(p);
+        if (s == null && bigPicEnabled()) {
+            s = parseSize(BIG_CAPTURE);
+            XposedBridge.log(TAG + "大图开关生效: " + BIG_CAPTURE + "（算法放大，细节不增加）");
+        }
+        if (s == null) s = parseSize(DEFAULT_CAPTURE);
         if (s == null) s = new Size(4096, 1512);
         sCaptureSize = s;
         XposedBridge.log(TAG + "captureSize resolved = " + s);
         return s;
+    }
+
+    /**
+     * ★ v1.2 大图开关：任一开关文件存在 → X-Pan 拍照流用 8192x3024（24.8MP）。
+     * 开：用带 Root 的文件管理器新建 /sdcard/DCIM/.xpan_bigpic（空文件即可）；
+     * 关：删除该文件。改完重启相机生效。这是"算法放大"的大图，像素多细节不变，
+     * 不是真高分辨率（真细节上限见 12_验证/分辨率实验结论.md）。
+     * DCIM 放主选，相机自己专属的 Android/media 目录做备选（个别系统对 DCIM 的
+     * File API 访问收紧时仍可用）。
+     */
+    private static boolean bigPicEnabled() {
+        try {
+            if (new File("/storage/emulated/0/DCIM/.xpan_bigpic").exists()) return true;
+            return new File("/storage/emulated/0/Android/media/com.oneplus.camera/.xpan_bigpic").exists();
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     private static Size parseSize(String s) {

@@ -4,7 +4,7 @@
 配合 LSPosed 使用。**卸载即还原**，不改动系统分区。
 
 > 作者：**Turbowfz**（Turbo）
-> 模块本体：`XpanAce3Pro-v1.1.zip`（可直接刷入；**支持 Gitee 云更新**，管理器内可直接检查更新）
+> 模块本体：`XpanAce3Pro-v1.2.zip`（可直接刷入；**支持 Gitee 云更新**，管理器内可直接检查更新）
 
 ---
 
@@ -12,6 +12,12 @@
 
 - 开启相机 **X-Pan 65:24 宽幅模式**（哈苏实体皮肤 UI + 显影动画 + 胶片滤镜）
 - 拍出 **4096×1512（65:24）** 宽幅照片，带哈苏水印
+- **大图开关（v1.2 新增）**：想让照片像素更多，在 `/sdcard/DCIM/` 新建一个名为
+  `.xpan_bigpic` 的**空文件**，重启相机后 X-Pan 出片变为 **8192×3024（24.8MP）**；
+  删除该文件并重启相机即恢复默认。
+  注意：这台机器的传感器在本机 HAL 里只有 12.5MP 的四合一读出，8192×3024 是
+  **算法放大**的图 —— 像素 ×4、能放大看，但**真实细节和 6.2MP 档一样**
+  （系统自带"高像素"模式的 50MP 也是同级别算法重构，实测一致）。文件更大（约 2MB/张）。
 - 变焦条 1× / 2×
 - 修复切换模式后的界面休眠、退出残留、快门锁死等一系列问题
 - **卸载模块即完全还原**（hook APK 会自动卸载）
@@ -29,12 +35,12 @@
 
 ## 安装 / 云更新
 
-1. KernelSU 刷入 `XpanAce3Pro-v1.1.zip`
+1. KernelSU 刷入 `XpanAce3Pro-v1.2.zip`
 2. 之后有新版本时，**KernelSU 管理器内会直接提示更新**（模块走 Gitee 云更新通道，
    清单在 `update.json`，无需重新进本仓库下载）
 3. 也可以随时在本仓库手动下载最新 zip 刷入
-2. 重启（模块会自动安装 hook APK 并在 LSPosed 中启用相机作用域）
-3. 打开相机 → 菜单里进入 **XPAN** 模式
+4. 重启（模块会自动安装 hook APK 并在 LSPosed 中启用相机作用域）
+5. 打开相机 → 菜单里进入 **XPAN** 模式
 
 ## 卸载
 
@@ -48,6 +54,7 @@
    让系统认识 X-Pan 模式与 800T 胶片滤镜族
 2. **尺寸修正 hook**（LSPosed）：X-Pan 申请的出流尺寸（1920x864 + 4096x1512）
    本机 HAL 不认，hook 改成实测能跑的组合 **预览 2304x1048 + 拍照 4096x1512**
+   （大图开关打开时拍照流改为 8192x3024）
 3. **界面修复 hook**：X-Pan 的界面容器在部分进入路径下不会被应用驱动
    （内部状态停在 -1），hook 在超时后补一次初始化，让哈苏皮肤 / 显影动画 / 滤镜条正常出现
 
@@ -58,40 +65,5 @@
 - 变焦只有 **1× / 2×**（0.6× 超广角在本机的成像通路未调通，已按稳定性移除）
 - 出片为 **HEIC** 格式（presenter 激活后的正常行为）
 - 模式切换后边框 / 滤镜条可能**慢半拍**出现（等应用自己完成初始化，避免抢跑）
-
-## 仓库结构
-
-```
-├── XpanAce3Pro-v1.1.zip   # 最新模块包（versionCode 11），可直接刷入（含云更新）
-├── XpanAce3Pro-v1.0.zip   # 稳定基线（versionCode 10）
-├── update.json            # 云更新清单（管理器读这个检查新版本）
-├── changelog.md           # 更新日志（管理器内展示）
-└── hook/                  # LSPosed hook 源码
-    ├── AndroidManifest.xml
-    ├── build.sh           # 一键编译（Windows Git Bash）
-    ├── assets/xposed_init
-    └── src/
-        ├── com/xpanport/hook/XpanHook.java   # 核心尺寸/界面修复
-        ├── com/xpanport/setup/Enabler.java   # LSPosed 作用域自动启用
-        └── de/robv/android/xposed/…          # Xposed API 桩（仅编译用）
-```
-
-## 编译 hook
-
-```bash
-cd hook
-bash build.sh   # 需要 Android SDK (build-tools 35 + platform android-35) 与 JDK 17
-```
-
-产物 `out/XpanHook.apk` 可单独重装（模块的 `payload/XpanHook.apk` 就是它）。
-
-## 免责声明
-
-- 仅供学习研究，刷入产生的任何问题由使用者自行承担
-- `system/odm/etc/camera/config/` 下的三个配置文件提取自一加 ColorOS 16 固件，
-  版权归一加/OPPO 所有，仅用于个人设备恢复默认相机行为，请勿商用
-- 本仓库基于 GPL-3.0 开源：修改后再分发需同样以 GPL-3.0 开源并保留版权声明
-
-## License
-
-GPL-3.0
+- 真实细节上限就是 6.2MP（4096×1512）：传感器四合一读出 + HAL/APS 输出链决定，
+  大图开关的 24.8MP 是放大图（详见上方说明）
