@@ -59,7 +59,7 @@ public class XpanHook implements IXposedHookLoadPackage {
 
     private static final String DEFAULT_PREVIEW = "2304x1048";
     private static final String DEFAULT_CAPTURE = "4096x1512";
-    /** v1.2 大图档（bigPic 开关打开时用）。实测定论（12_验证/分辨率实验结论.md）：
+    /** v1.3 起的默认拍照档。实测定论（12_验证/分辨率实验结论.md）：
      *  HAL 对 >4096 宽的流一律从 12.5MP 四合一读出后放大，8192x3024 是 24.8MP 的
      *  "算法放大"图 —— 像素 x4、细节不增加，看图能放大更多、文件更大。
      *  连拍 3 张实测稳定。系统"高像素"模式也是同级别算法重构，真细节上限就是 6.2MP。 */
@@ -1832,7 +1832,7 @@ public class XpanHook implements IXposedHookLoadPackage {
     /**
      * 算出这个面该用哪个尺寸；**返回 null 表示不要动**。
      * 预览 → previewSize()（2304x1048，可被 debug.xpan.preview 覆盖）
-     * 拍照 → captureSize()（4096x1512；大图开关开时 8192x3024；prop 可显式覆盖）
+     * 拍照 → captureSize()（默认 8192x3024；建 .xpan_smallpic 回 4096x1512；prop 可显式覆盖）
      *   app/HAL 两侧同尺寸 —— 大图档就是让 HAL 出 8192x3024 的放大流
      *   （2026-10-10 实测：HAL 收下 >4096 宽的流，内部从 12.5MP 读出放大，连拍稳定）。
      *   曾试过"app 侧大图 + HAL 侧真读出、借 APS mfll/upscale 放大"的 C 路线：
@@ -1957,16 +1957,19 @@ public class XpanHook implements IXposedHookLoadPackage {
     }
 
     /**
-     * X-Pan 拍照尺寸，优先级：debug.xpan.capture > 大图开关(BIG_CAPTURE) > DEFAULT_CAPTURE。
+     * X-Pan 拍照尺寸，优先级：debug.xpan.capture > 默认档 > DEFAULT_CAPTURE。
+     * v1.3 起默认 = BIG_CAPTURE（8192x3024，24.8MP 算法放大）；
+     * 想回 6.2MP 小文件档：新建 /sdcard/DCIM/.xpan_smallpic（空文件）并重启相机。
      * 有缓存，改动后重启相机进程生效（与 prop 行为一致）。
      */
     private static Size captureSize() {
         if (sCaptureSize != null) return sCaptureSize;
         String p = prop("debug.xpan.capture");
         Size s = parseSize(p);
-        if (s == null && bigPicEnabled()) {
+        if (s == null && !smallPicEnabled()) {
             s = parseSize(BIG_CAPTURE);
-            XposedBridge.log(TAG + "大图开关生效: " + BIG_CAPTURE + "（算法放大，细节不增加）");
+            XposedBridge.log(TAG + "默认大图档: " + BIG_CAPTURE + "（算法放大，细节不增加；"
+                    + "建 /sdcard/DCIM/.xpan_smallpic 可回 6.2MP）");
         }
         if (s == null) s = parseSize(DEFAULT_CAPTURE);
         if (s == null) s = new Size(4096, 1512);
@@ -1976,17 +1979,16 @@ public class XpanHook implements IXposedHookLoadPackage {
     }
 
     /**
-     * ★ v1.2 大图开关：任一开关文件存在 → X-Pan 拍照流用 8192x3024（24.8MP）。
-     * 开：用带 Root 的文件管理器新建 /sdcard/DCIM/.xpan_bigpic（空文件即可）；
-     * 关：删除该文件。改完重启相机生效。这是"算法放大"的大图，像素多细节不变，
-     * 不是真高分辨率（真细节上限见 12_验证/分辨率实验结论.md）。
-     * DCIM 放主选，相机自己专属的 Android/media 目录做备选（个别系统对 DCIM 的
-     * File API 访问收紧时仍可用）。
+     * ★ v1.3 退出开关：/sdcard/DCIM/.xpan_smallpic（空文件）存在 → 回 6.2MP（4096x1512）。
+     * 默认（无文件）= 8192x3024 大图档。改完重启相机生效。
+     * 注意大图档是"算法放大"：像素 ×4、细节不变（本机真细节上限 6.2MP，
+     * 见 12_验证/分辨率实验结论.md）。DCIM 为主选，相机的 Android/media 目录做备选
+     * （个别系统对 DCIM 的 File API 收紧时仍可用）。
      */
-    private static boolean bigPicEnabled() {
+    private static boolean smallPicEnabled() {
         try {
-            if (new File("/storage/emulated/0/DCIM/.xpan_bigpic").exists()) return true;
-            return new File("/storage/emulated/0/Android/media/com.oneplus.camera/.xpan_bigpic").exists();
+            if (new File("/storage/emulated/0/DCIM/.xpan_smallpic").exists()) return true;
+            return new File("/storage/emulated/0/Android/media/com.oneplus.camera/.xpan_smallpic").exists();
         } catch (Throwable t) {
             return false;
         }
