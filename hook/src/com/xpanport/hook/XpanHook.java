@@ -140,6 +140,7 @@ public class XpanHook implements IXposedHookLoadPackage {
         if ("1".equals(prop("debug.xpan.diag"))) {
             installXpanContainerWake(lp);
             installShutterWatch(lp);
+            installRequestProbe(lp);
             installXpanUiStateWatch(lp);
             installXpanContainerTrace(lp, "zl.q");
             installXpanContainerTrace(lp, "bh.c");
@@ -229,6 +230,42 @@ public class XpanHook implements IXposedHookLoadPackage {
      * 这里在 View.setEnabled(false) 被调用且目标类名含 ShutterButton 时打调用栈，
      * 直接定位到禁用快门的那行代码。
      */
+    /** 诊断：看应用往 CaptureRequest 里设了哪些变焦/裁剪相关键（去重+限量，防刷屏）。
+     *  用途：确认 2× 时拍照请求里 SCALER_CROP_REGION / com.oplus.original.zoomRatio 的真实值。 */
+    private static final java.util.Set<String> sProbeSeen = new java.util.HashSet<>();
+
+    private void installRequestProbe(XC_LoadPackage.LoadPackageParam lp) {
+        try {
+            Class<?> cls = Class.forName("android.hardware.camera2.CaptureRequest$Builder",
+                    false, lp.classLoader);
+            Method set = cls.getDeclaredMethod("set",
+                    android.hardware.camera2.CaptureRequest.Key.class, Object.class);
+            XposedBridge.hookMethod(set, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        if (!sXpanActive) return;
+                        String name = String.valueOf(param.args[0]);
+                        String ln = name.toLowerCase();
+                        if (!ln.contains("crop") && !ln.contains("zoom")
+                                && !ln.contains("jpeg") && !ln.contains("raw")) return;
+                        Object v = param.args[1];
+                        String sig = name + " = " + (v instanceof android.graphics.Rect
+                                ? "Rect" + v : String.valueOf(v));
+                        synchronized (sProbeSeen) {
+                            if (sProbeSeen.size() >= 200 || !sProbeSeen.add(sig)) return;
+                        }
+                        XposedBridge.log(TAG + "req.set " + sig);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+            XposedBridge.log(TAG + "hook installed OK (request probe)");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "!! request probe failed: " + t);
+        }
+    }
+
     private void installShutterWatch(XC_LoadPackage.LoadPackageParam lp) {
         try {
             Class<?> view = Class.forName("android.view.View", false, lp.classLoader);
@@ -1877,6 +1914,8 @@ public class XpanHook implements IXposedHookLoadPackage {
             // ★ 变焦 ≠1× 时拍照流回退 4096x1512：8192 宽大流超出活动阵列，HAL 不理
             //   变焦裁剪（2× 实拍只有 ~1.12× 视野，见 sXpanZoomReq 注释）。prop 显式
             //   指定时尊重 prop（老语义，自行承担）。
+            //   注：2026-10-11 实验过"改发显式 SCALER_CROP_REGION"的替代方案 ——
+            //   HAL 直接崩进程（拍照请求带 crop 就 SIGSEGV），此路不通，勿再试。
             if (!isPreview && forced == null && sXpanZoomReq > 1.05f) {
                 Size real = parseSize(DEFAULT_CAPTURE);
                 if (real != null) {
