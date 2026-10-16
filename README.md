@@ -60,6 +60,17 @@
 
 详细踩坑记录见源码内注释（`hook/src/com/xpanport/hook/XpanHook.java`）。
 
+## 仓库结构
+
+| 路径 | 说明 |
+|---|---|
+| `XpanAce3Pro-v1.2.zip` | **最新版模块**（KernelSU 直接刷入；云更新也指向这份） |
+| `releases/` | 历史版本 zip 存档（v1.0 / v1.1），一般不用下载 |
+| `hook/` | LSPosed hook 源码（`XpanHook.java` 内含大量实测踩坑注释） |
+| `update.json` | 云更新清单（版本号 / zip 地址 / 更新日志地址） |
+| `changelog.md` | 逐版本更新日志 |
+| `LICENSE` | GPL-3.0 |
+
 ## 已知限制
 
 - 变焦只有 **1× / 2×**（0.6× 超广角在本机的成像通路未调通，已按稳定性移除）
