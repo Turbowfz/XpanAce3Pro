@@ -125,6 +125,7 @@ public class XpanHook implements IXposedHookLoadPackage {
         installHalSizeFix(lp);
         installSurfaceSetters(lp);
         installXpanSurfaceSize(lp);
+        installTakePictureProbe(lp);
         installXpanUiRestore(lp);
         installXpanZoomUnlock(lp);
         installXpanZoomPointFix(lp);
@@ -234,6 +235,42 @@ public class XpanHook implements IXposedHookLoadPackage {
      *  用途：确认 2× 时拍照请求里 SCALER_CROP_REGION / com.oplus.original.zoomRatio 的真实值。 */
     private static final java.util.Set<String> sProbeSeen = new java.util.HashSet<>();
 
+    /** 诊断: 拍照时刻的 CameraRequestTag.mZoomRatio(拍照链路真正用的变焦值)。 */
+    private void installTakePictureProbe(XC_LoadPackage.LoadPackageParam lp) {
+        try {
+            Class<?> c = Class.forName("com.oplus.ocs.camera.producer.device.Camera2Impl",
+                    false, lp.classLoader);
+            int n = 0;
+            for (Method m : c.getDeclaredMethods()) {
+                if (!"takePicture".equals(m.getName()) || m.getParameterTypes().length != 5) continue;
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        try {
+                            if (!sXpanActive) return;
+                            Object tag = param.args[0];
+                            XposedBridge.log(TAG + "takePicture tag.mZoomRatio="
+                                    + field(tag, "mZoomRatio") + " sXpanZoomReq=" + sXpanZoomReq
+                                    + " tag.mXpanMfllOutputSize=" + field(tag, "mXpanMfllOutputSize"));
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                });
+                n++;
+            }
+            XposedBridge.log(TAG + "hook installed OK (takePicture probe x" + n + ")");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "!! takePicture probe failed: " + t);
+        }
+    }
+
+    private static String fmtValue(Object v) {
+        if (v == null) return "null";
+        if (v instanceof int[]) return java.util.Arrays.toString((int[]) v);
+        if (v instanceof android.graphics.Rect) return "Rect" + v;
+        return String.valueOf(v);
+    }
+
     private void installRequestProbe(XC_LoadPackage.LoadPackageParam lp) {
         try {
             Class<?> cls = Class.forName("android.hardware.camera2.CaptureRequest$Builder",
@@ -248,14 +285,43 @@ public class XpanHook implements IXposedHookLoadPackage {
                         String name = String.valueOf(param.args[0]);
                         String ln = name.toLowerCase();
                         if (!ln.contains("crop") && !ln.contains("zoom")
-                                && !ln.contains("jpeg") && !ln.contains("raw")) return;
-                        Object v = param.args[1];
-                        String sig = name + " = " + (v instanceof android.graphics.Rect
-                                ? "Rect" + v : String.valueOf(v));
+                                && !ln.contains("only.") && !ln.contains("bpc")) return;
+                        String sig = name + " = " + fmtValue(param.args[1]);
                         synchronized (sProbeSeen) {
-                            if (sProbeSeen.size() >= 200 || !sProbeSeen.add(sig)) return;
+                            if (sProbeSeen.size() >= 300 || !sProbeSeen.add(sig)) return;
                         }
                         XposedBridge.log(TAG + "req.set " + sig);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+            // build() 之后把请求里所有变焦/裁剪相关的最终值打出来（含框架补的 SCALER_CROP_REGION）
+            Method build = cls.getDeclaredMethod("build");
+            XposedBridge.hookMethod(build, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    try {
+                        if (!sXpanActive) return;
+                        Object req = param.getResult();
+                        if (req == null) return;
+                        Method getKeys = req.getClass().getMethod("getKeys");
+                        Object keys = getKeys.invoke(req);
+                        if (!(keys instanceof java.util.Set)) return;
+                        StringBuilder sb = new StringBuilder();
+                        for (Object k : (java.util.Set<?>) keys) {
+                            String kn = String.valueOf(k).toLowerCase();
+                            if (!kn.contains("crop") && !kn.contains("zoom")) continue;
+                            Method get = req.getClass().getMethod("get",
+                                    android.hardware.camera2.CaptureRequest.Key.class);
+                            Object v = get.invoke(req, k);
+                            sb.append(String.valueOf(k)).append('=').append(fmtValue(v)).append(" | ");
+                        }
+                        if (sb.length() == 0) return;
+                        String sig = "BUILT " + sb;
+                        synchronized (sProbeSeen) {
+                            if (sProbeSeen.size() >= 400 || !sProbeSeen.add(sig)) return;
+                        }
+                        XposedBridge.log(TAG + "req.build " + sig);
                     } catch (Throwable ignored) {
                     }
                 }
