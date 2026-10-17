@@ -192,6 +192,7 @@ public class XpanHook implements IXposedHookLoadPackage {
         installXpanZoomPointFix(lp);
         installXpanZoomLabelFix(lp);
         installXpanShotZoomWatch(lp);
+        installWatermarkCapture(lp);   // 捕获水印参数，裁剪后重画
         installToneEnable(lp);          // 影调引擎开关（哈苏色彩/影调）
         installXpanFeatureInject(lp);
         installXpanSwitchFix(lp);
@@ -1034,8 +1035,10 @@ public class XpanHook implements IXposedHookLoadPackage {
     private static final String TONE_KEY = "com.oplus.natural.tone.support";
 
     private void installToneEnable(XC_LoadPackage.LoadPackageParam lp) {
-        if ("0".equals(prop("debug.xpan.tone"))) {
-            XposedBridge.log(TAG + "note: 影调开关已关闭（debug.xpan.tone=0），保持原厂行为");
+        // ★ 用户 2026-10-17 要求"先改回去"：默认**不开**影调（保持原厂行为）。
+        //   想再试：setprop debug.xpan.tone 1 后重启相机（照片/人像等模式生效，X-Pan 吃不到）。
+        if (!"1".equals(prop("debug.xpan.tone"))) {
+            XposedBridge.log(TAG + "note: 影调保持原厂（要开：debug.xpan.tone=1 + 重启相机）");
             return;
         }
         try {
@@ -2597,6 +2600,287 @@ public class XpanHook implements IXposedHookLoadPackage {
         }
     }
 
+    /* ---------------- 裁剪后重画哈苏水印 ----------------
+     * 背景（2026-10-17 实测）：水印是应用在存图前**烘焙进画面**的，位置在画面最底部
+     *   （约 y 93%~99%）。我们的软件裁剪是中心裁，1.167× 时保留 [7.1%, 92.9%] ——
+     *   正好把整条水印裁掉（不留残影）。所以变焦档必须**裁完再画一遍**，
+     *   否则照片就没有哈苏水印了（用户报的"水印被裁掉一部分"就是这个）。
+     * 做法：hook 应用的
+     *   `WatermarkProcessUnit.init(WatermarkInitParameter, Bitmap)`
+     *   `WatermarkProcessUnit.processImage(WatermarkProcessParameter, ProcessConfig)`
+     *   把这两个参数对象存下来（每张照片都会刷新），裁剪完成后用同样的参数在我们
+     *   自己的位图上重放一次 → 水印落在成片底部，样式/文字与应用原版一致。
+     * 开关：debug.xpan.rewatermark=0 关（默认开）。
+     */
+    private static volatile Object sWmInitParam = null;
+    private static volatile Object sWmProcessParam = null;
+    private static volatile Object sWmConfig = null;
+    /** 应用实际调用的方法与单元类 —— 必须复用它们（Class.forName 用模块的 ClassLoader
+     *  会 ClassNotFoundException：这个类在应用的 dex 里，不在我们包里）。 */
+    private static volatile java.lang.reflect.Method sWmInitMethod = null;
+    private static volatile java.lang.reflect.Method sWmProcMethod = null;
+    private static volatile Class<?> sWmUnitCls = null;
+    /** 应用那个"已经初始化好"的水印单元实例 —— 新建的单元 processImage 会返回 null 位图
+     *  （缺初始化/上下文），复用应用自己的实例才拿得到结果。 */
+    private static volatile Object sWmUnitInst = null;
+
+    private void installWatermarkCapture(XC_LoadPackage.LoadPackageParam lp) {
+        try {
+            Class<?> c = Class.forName(
+                    "com.oplus.ocs.camera.ipuapi.process.watermark.WatermarkProcessUnit",
+                    false, lp.classLoader);
+            int n = 0;
+            for (Method m : c.getDeclaredMethods()) {
+                String name = m.getName();
+                Class<?>[] pt = m.getParameterTypes();
+                if ("init".equals(name) && pt.length == 2
+                        && pt[1].equals(android.graphics.Bitmap.class)) {
+                    XposedBridge.hookMethod(m, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            sWmInitParam = param.args[0];      // WatermarkInitParameter
+                            sWmInitMethod = (java.lang.reflect.Method) param.method;
+                            if (param.thisObject != null) {
+                                sWmUnitCls = param.thisObject.getClass();
+                                sWmUnitInst = param.thisObject;
+                            }
+                        }
+                    });
+                    n++;
+                } else if ("processImage".equals(name) && pt.length == 2
+                        && pt[1].getName().endsWith("ProcessConfig")) {
+                    XposedBridge.hookMethod(m, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            sWmProcessParam = param.args[0];   // WatermarkProcessParameter
+                            sWmConfig = param.args[1];
+                            sWmProcMethod = (java.lang.reflect.Method) param.method;
+                            if (param.thisObject != null) {
+                                sWmUnitCls = param.thisObject.getClass();
+                                sWmUnitInst = param.thisObject;
+                            }
+                        }
+                    });
+                    n++;
+                }
+            }
+            XposedBridge.log(TAG + "hook installed OK (水印参数捕获 x" + n + ")");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "!! 水印参数捕获失败: " + t);
+        }
+    }
+
+    /** 把捕获到的水印参数在给定位图上重放一次（失败就原样返回） */
+    private static android.graphics.Bitmap redrawWatermark(android.graphics.Bitmap src) {
+        if ("0".equals(prop("debug.xpan.rewatermark"))) return src;
+        Object initParam = sWmInitParam, procParam = sWmProcessParam, cfg = sWmConfig;
+        java.lang.reflect.Method initM = sWmInitMethod, procM = sWmProcMethod;
+        Class<?> unitCls = sWmUnitCls;
+        if (initParam == null || procParam == null || initM == null || procM == null || unitCls == null) {
+            XposedBridge.log(TAG + "重画水印跳过：还没捕获到参数（本会话没走过水印链？）");
+            return src;
+        }
+        try {
+            Context ctx = currentContext();
+            Object unit = sWmUnitInst;
+            if (unit == null) {
+                if (ctx == null) return src;
+                unit = unitCls.getConstructor(Context.class).newInstance(ctx);
+            }
+            initM.invoke(unit, initParam, src);          // 用我们的位图重新初始化
+            Object res = procM.invoke(unit, procParam, cfg);
+            Object bmp = res.getClass().getMethod("getResultBitmap").invoke(res);
+            Object buf = null;
+            try {
+                buf = res.getClass().getMethod("getResultWatermarkBufferBitmap").invoke(res);
+            } catch (Throwable ignored) {
+            }
+            String sz = "src=" + src.getWidth() + "x" + src.getHeight()
+                    + " result=" + describeBmp(bmp) + " buffer=" + describeBmp(buf);
+            android.graphics.Bitmap pick = null;
+            if (bmp instanceof android.graphics.Bitmap
+                    && ((android.graphics.Bitmap) bmp).getWidth() == src.getWidth()) {
+                pick = (android.graphics.Bitmap) bmp;
+            } else if (buf instanceof android.graphics.Bitmap
+                    && ((android.graphics.Bitmap) buf).getWidth() == src.getWidth()) {
+                pick = (android.graphics.Bitmap) buf;
+            }
+            XposedBridge.log(TAG + "重画水印：" + sz + (pick != null ? " → 采用" : " → 尺寸不符，保留原图"));
+            if (pick != null) return pick;
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "重画水印失败（保留无水的成片）: " + t);
+        }
+        return src;
+    }
+
+    /** 轻度 USM（unsharp mask）锐化：3x3 均值模糊做底，量很小(0.6)不产生白边。
+     *  分块处理（每块 256 行 + 上下各 1 行重叠）—— 24.8MP 一次性取 int[] 要 ~99MB，会爆。 */
+    private static void unsharpMask(android.graphics.Bitmap bmp, float amount) {
+        try {
+            final int W = bmp.getWidth(), H = bmp.getHeight();
+            final int STRIP = 256;
+            int[] buf = new int[W * (STRIP + 2)];
+            int[] out = new int[W * STRIP];
+            for (int y0 = 0; y0 < H; y0 += STRIP) {
+                int h = Math.min(STRIP, H - y0);
+                int yStart = Math.max(0, y0 - 1);
+                int rows = Math.min(H - yStart, h + 2);
+                bmp.getPixels(buf, 0, W, 0, yStart, W, rows);
+                for (int yy = 0; yy < h; yy++) {
+                    int cy = yy + (y0 - yStart);
+                    for (int x = 0; x < W; x++) {
+                        int c = buf[cy * W + x];
+                        int r = 0, g = 0, b = 0, n = 0;
+                        for (int dy = -1; dy <= 1; dy++) {
+                            int ny = cy + dy;
+                            if (ny < 0 || ny >= rows) continue;
+                            for (int dx = -1; dx <= 1; dx++) {
+                                int nx = x + dx;
+                                if (nx < 0 || nx >= W) continue;
+                                int q = buf[ny * W + nx];
+                                r += (q >> 16) & 0xFF;
+                                g += (q >> 8) & 0xFF;
+                                b += q & 0xFF;
+                                n++;
+                            }
+                        }
+                        int rr = (c >> 16) & 0xFF, gg = (c >> 8) & 0xFF, bb = c & 0xFF;
+                        int nr = clamp255(rr + (int) (amount * (rr - r / (float) n)));
+                        int ng = clamp255(gg + (int) (amount * (gg - g / (float) n)));
+                        int nb = clamp255(bb + (int) (amount * (bb - b / (float) n)));
+                        out[yy * W + x] = 0xFF000000 | (nr << 16) | (ng << 8) | nb;
+                    }
+                }
+                bmp.setPixels(out, 0, W, 0, y0, W, h);
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "USM 锐化失败（跳过）: " + t);
+        }
+    }
+
+    /** 水印"重画"（近似方案）。
+     *  为什么不用应用的 WatermarkProcessUnit 重放：实测在裁剪线程里调
+     *  init+processImage 拿到的结果位图是 **null**（它依赖应用自己的 GL/IPU 上下文，
+     *  连复用应用实例也一样）→ 走不通，别在这上面再花时间。
+     *  近似做法：水印是画面最底部的**白色细笔画（高频）**，底下场景是低频渐变。
+     *  从原图底部按**全分辨率**抠出这一条带、做高通（减去自身大半径均值）+ 阈值，
+     *  只留下笔画，再加到成片底部 —— 场景低频不会跟过来，所以不会出现"方块接缝"。
+     *  代价（如实说明）：笔画边缘是阈值切出来的，比应用原生水印略"硬"一点；
+     *  如果原图那一带本身有强高频纹理（比如密集文字），可能带出轻微鬼影。
+     */
+    private static void stampWatermark(android.graphics.Bitmap dst, String origPath, int origW, int origH) {
+        if ("0".equals(prop("debug.xpan.rewatermark"))) return;
+        try {
+            final int W = dst.getWidth(), H = dst.getHeight();
+            int bandH = Math.round(origH * 0.16f);            // 底部 16%（水印两行都在这条带里）
+            if (bandH < 8 || origW < 16) return;
+            android.graphics.BitmapRegionDecoder dec =
+                    android.graphics.BitmapRegionDecoder.newInstance(origPath, false);
+            android.graphics.Bitmap band = dec.decodeRegion(
+                    new android.graphics.Rect(0, origH - bandH, origW, origH), null);
+            dec.recycle();
+            if (band == null) return;
+            final int bw = band.getWidth(), bh = band.getHeight();
+            int[] src = new int[bw * bh];
+            band.getPixels(src, 0, bw, 0, 0, bw, bh);
+            band.recycle();
+
+            // 竖直方向的滑动均值（半径 r）当"背景"，用 src - 背景 得高频层
+            final int r = Math.max(2, bh / 100);          // 半径要小：太大把笔画本身的低频也抹掉
+            int[] bg = new int[bw * bh];
+            long[] acc = new long[bw * 3];
+            for (int y = 0; y < bh; y++) {
+                int y0 = Math.max(0, y - r), y1 = Math.min(bh - 1, y + r);
+                if (y == 0) {
+                    java.util.Arrays.fill(acc, 0);
+                    for (int yy = y0; yy <= y1; yy++) {
+                        for (int x = 0; x < bw; x++) {
+                            int p = src[yy * bw + x];
+                            acc[x * 3] += (p >> 16) & 0xFF;
+                            acc[x * 3 + 1] += (p >> 8) & 0xFF;
+                            acc[x * 3 + 2] += p & 0xFF;
+                        }
+                    }
+                } else {
+                    int yOut = y - r - 1, yIn = y + r;
+                    if (yOut >= 0) {
+                        for (int x = 0; x < bw; x++) {
+                            int p = src[yOut * bw + x];
+                            acc[x * 3] -= (p >> 16) & 0xFF;
+                            acc[x * 3 + 1] -= (p >> 8) & 0xFF;
+                            acc[x * 3 + 2] -= p & 0xFF;
+                        }
+                    }
+                    if (yIn < bh) {
+                        for (int x = 0; x < bw; x++) {
+                            int p = src[yIn * bw + x];
+                            acc[x * 3] += (p >> 16) & 0xFF;
+                            acc[x * 3 + 1] += (p >> 8) & 0xFF;
+                            acc[x * 3 + 2] += p & 0xFF;
+                        }
+                    }
+                }
+                int n = y1 - y0 + 1;
+                for (int x = 0; x < bw; x++) {
+                    int p = src[y * bw + x];
+                    int rr = (p >> 16) & 0xFF, gg = (p >> 8) & 0xFF, bb = p & 0xFF;
+                    int dr = rr - (int) (acc[x * 3] / n);
+                    int dg = gg - (int) (acc[x * 3 + 1] / n);
+                    int db = bb - (int) (acc[x * 3 + 2] / n);
+                    // 只保留"明显更亮"的笔画（水印是白字），阈值以下当背景丢掉
+                    if (dr < 18 && dg < 18 && db < 18) {
+                        bg[y * bw + x] = 0;
+                    } else {
+                        // 笔画略提亮一点（高通会让细笔画变淡）
+                        bg[y * bw + x] = 0xFF000000
+                                | (Math.min(255, Math.max(0, (int) (dr * 1.25f))) << 16)
+                                | (Math.min(255, Math.max(0, (int) (dg * 1.25f))) << 8)
+                                | Math.min(255, Math.max(0, (int) (db * 1.25f)));
+                    }
+                }
+            }
+
+            // 贴到成片底部（等比对齐：成片宽 W，原图宽 origW）
+            float sx = W / (float) bw, sy = H / (float) origH;
+            int dstY0 = H - Math.round(bh * sy);
+            int[] row = new int[W];
+            int[] bandRow = new int[bw];
+            for (int y = 0; y < Math.round(bh * sy); y++) {
+                int oy = Math.min(bh - 1, (int) (y / sy));
+                int[] line = new int[bw];
+                System.arraycopy(bg, oy * bw, line, 0, bw);
+                dst.getPixels(row, 0, W, 0, dstY0 + y, W, 1);
+                for (int x = 0; x < W; x++) {
+                    int ox = Math.min(bw - 1, (int) (x / sx));
+                    int d = line[ox];
+                    if ((d & 0xFF000000) == 0) continue;
+                    int p = row[x];
+                    int rr = Math.min(255, ((p >> 16) & 0xFF) + ((d >> 16) & 0xFF));
+                    int gg = Math.min(255, ((p >> 8) & 0xFF) + ((d >> 8) & 0xFF));
+                    int bb = Math.min(255, (p & 0xFF) + (d & 0xFF));
+                    row[x] = 0xFF000000 | (rr << 16) | (gg << 8) | bb;
+                }
+                dst.setPixels(row, 0, W, 0, dstY0 + y, W, 1);
+                bandRow = line;
+            }
+            XposedBridge.log(TAG + "水印笔画已贴回成片底部（band " + bw + "x" + bh + " -> y" + dstY0 + "）");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "贴水印失败（跳过）: " + t);
+        }
+    }
+
+    private static String describeBmp(Object o) {
+        if (o instanceof android.graphics.Bitmap) {
+            android.graphics.Bitmap b = (android.graphics.Bitmap) o;
+            return b.getWidth() + "x" + b.getHeight();
+        }
+        return String.valueOf(o);
+    }
+
+    private static int clamp255(int v) {
+        return v < 0 ? 0 : (v > 255 ? 255 : v);
+    }
+
     /** 按焦段裁切 + 按档位定尺寸 → 重编码写回原文件。
      *  两个作用：① 真焦段（HAL 不会裁，见上方说明）② 出片尺寸档位（4096 / 8192）。
      *  若两样都不需要（1× 且原生尺寸已经对），直接返回、不碰原文件（保住 HEIC/水印/EXIF）。 */
@@ -2644,6 +2928,10 @@ public class XpanHook implements IXposedHookLoadPackage {
             if (scaled != cut) cut.recycle();
             cut = null;                  // 所有权交给 scaled（可能是同一个对象）
             out = scaled;
+            // 插值放大后画面偏软 → 轻度 USM 锐化（只对变焦档做；1× 不走这条路）
+            if (z > 1.05f) unsharpMask(out, 0.6f);
+            // 水印：原图那条在画面最底部、已被中心裁切整条裁掉 → 从原图把水印笔画抠出来贴回底部
+            stampWatermark(out, f.getAbsolutePath(), sw, sh);
 
             boolean ok;
             java.io.FileOutputStream fos = new java.io.FileOutputStream(tmp);
