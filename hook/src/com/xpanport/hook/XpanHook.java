@@ -134,6 +134,45 @@ public class XpanHook implements IXposedHookLoadPackage {
     private static volatile Size sCaptureSize = null;
     /** HAL 侧拍照流尺寸（见 DEFAULT_HAL_CAPTURE 注释） */
     private static volatile Size sHalCaptureSize = null;
+
+    /** ★ 出片档位：true = 4096x1512（6.2MP 小文件档），false = 8192x3024（24.8MP）。
+     *  null = 还没读过（首次从 /sdcard/DCIM/.xpan_smallpic 文件读）。
+     *  界面上的切换按钮直接改它（并同步那个文件，重启相机后仍保持）。
+     *  注意：HAL 流尺寸在会话建立时就定了，改档位不会立刻换流 —— 所以出片尺寸由
+     *  存盘后处理（postProcessInPlace）兜底，点一下下张照片就生效。 */
+    private static volatile Boolean sSmallPic = null;
+
+    private static boolean smallPicMode() {
+        Boolean b = sSmallPic;
+        if (b == null) {
+            b = smallPicEnabled();
+            sSmallPic = b;
+        }
+        return b;
+    }
+
+    private static void setSmallPicMode(boolean on) {
+        sSmallPic = on;
+        sCaptureSize = null;            // 尺寸缓存失效：下次建流按新档位
+        try {
+            java.io.File f = new java.io.File("/storage/emulated/0/DCIM/.xpan_smallpic");
+            if (on) {
+                if (!f.exists()) f.createNewFile();
+            } else if (f.exists()) {
+                f.delete();
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "写 .xpan_smallpic 失败: " + t);
+        }
+    }
+
+    private static int targetWidth() {
+        return smallPicMode() ? 4096 : 8192;
+    }
+
+    private static int targetHeight() {
+        return smallPicMode() ? 1512 : 3024;
+    }
     private static volatile Size[] sAvail = null;
 
     @Override
@@ -1939,13 +1978,27 @@ public class XpanHook implements IXposedHookLoadPackage {
                                         driveXpanContainer();
                                     }
                                 }, 1800);
+                                // 出片尺寸切换按钮（挂在窗口右上角空白处）
+                                h.postDelayed(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        attachSizeButton();
+                                    }
+                                }, 1500);
+                                h.postDelayed(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        attachSizeButton();
+                                    }
+                                }, 3500);
                             } else {
-                                // 退出 X-Pan：卸掉可能残留的容器视图，防止与其他模式界面重叠
+                                // 退出 X-Pan：卸掉可能残留的容器视图 + 尺寸按钮，防止与其他模式界面重叠
                                 android.os.Handler h = new android.os.Handler(
                                         android.os.Looper.getMainLooper());
                                 h.postDelayed(new Runnable() {
                                     @Override
                                     public void run() {
+                                        removeSizeButton();
                                         cleanupXpanContainer();
                                     }
                                 }, 300);
@@ -2220,7 +2273,7 @@ public class XpanHook implements IXposedHookLoadPackage {
         if (sCaptureSize != null) return sCaptureSize;
         String p = prop("debug.xpan.capture");
         Size s = parseSize(p);
-        if (s == null && !smallPicEnabled()) {
+        if (s == null && !smallPicMode()) {
             s = parseSize(BIG_CAPTURE);
             XposedBridge.log(TAG + "默认大图档: " + BIG_CAPTURE + "（算法放大，细节不增加；"
                     + "建 /sdcard/DCIM/.xpan_smallpic 可回 6.2MP）");
@@ -2228,7 +2281,8 @@ public class XpanHook implements IXposedHookLoadPackage {
         if (s == null) s = parseSize(DEFAULT_CAPTURE);
         if (s == null) s = new Size(4096, 1512);
         sCaptureSize = s;
-        XposedBridge.log(TAG + "captureSize resolved = " + s);
+        XposedBridge.log(TAG + "captureSize resolved = " + s + "（档位="
+                + (smallPicMode() ? "4096 小图" : "8192 大图") + "）");
         return s;
     }
 
@@ -2312,8 +2366,9 @@ public class XpanHook implements IXposedHookLoadPackage {
                             Object z = field(param.args[0], "mZoomRatio");
                             if (z instanceof Number) sShotZoom = ((Number) z).floatValue();
                             sShotAt = android.os.SystemClock.elapsedRealtime();
-                            // 变焦了才需要软件裁切：起一个短命线程轮询目录等新文件
-                            if (sShotZoom >= 1.05f && !"0".equals(prop("debug.xpan.swcrop"))) {
+                            // 每次都起观察线程：要不要处理由 postProcess 自己判断
+                            // （1× 且原生尺寸已符合档位时它会直接返回，不动原文件）
+                            if (!"0".equals(prop("debug.xpan.swcrop"))) {
                                 final java.io.File dir = new java.io.File(DCIM_CAMERA);
                                 final java.util.Set<String> before = listNames(dir);
                                 final float z2 = sShotZoom;
@@ -2378,7 +2433,9 @@ public class XpanHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** 按中心 1/zoom 裁切 → 放大回原尺寸 → 重编码写回原文件 */
+    /** 按焦段裁切 + 按档位定尺寸 → 重编码写回原文件。
+     *  两个作用：① 真焦段（HAL 不会裁，见上方说明）② 出片尺寸档位（4096 / 8192）。
+     *  若两样都不需要（1× 且原生尺寸已经对），直接返回、不碰原文件（保住 HEIC/水印/EXIF）。 */
     private static void softCropInPlace(java.io.File f, float zoom) {
         android.graphics.Bitmap src = null;
         android.graphics.Bitmap cut = null;
@@ -2392,6 +2449,10 @@ public class XpanHook implements IXposedHookLoadPackage {
             final int sw = b.outWidth, sh = b.outHeight;
             if (sw <= 0 || sh <= 0) return;
 
+            final float z = Math.max(1.0f, zoom);
+            final int tw = targetWidth(), th = targetHeight();
+            if (z < 1.05f && sw == tw) return;      // 无需处理：原生出片已符合档位
+
             // 源图本身就是"算法放大"的，解到真细节那一档就够，省内存也更快
             int sample = 1;
             while (sw / (sample * 2) >= SOFT_CROP_DECODE_WIDTH) sample *= 2;
@@ -2402,14 +2463,23 @@ public class XpanHook implements IXposedHookLoadPackage {
             if (src == null) return;
 
             int w = src.getWidth(), h = src.getHeight();
-            int cw = Math.max(16, Math.round(w / zoom)), ch = Math.max(16, Math.round(h / zoom));
+            int cw = Math.max(16, Math.round(w / z)), ch = Math.max(16, Math.round(h / z));
             cut = android.graphics.Bitmap.createBitmap(src, (w - cw) / 2, (h - ch) / 2, cw, ch);
-            src.recycle();
+            // ⚠️ createBitmap 在"裁剪区域 = 整张图"时**直接返回原对象**（createScaledBitmap
+            //    同理）—— 所以必须先判同一个对象再回收，否则会把还要用的图 recycle 掉
+            //    （实测报 "Can't compress a recycled bitmap"）。
+            if (cut != src) src.recycle();
             src = null;
 
-            out = (cw == sw && ch == sh) ? cut
-                    : android.graphics.Bitmap.createScaledBitmap(cut, sw, sh, true);
-            if (out != cut) { cut.recycle(); cut = null; }
+            android.graphics.Bitmap scaled;
+            if (cw == tw && ch == th) {
+                scaled = cut;
+            } else {
+                scaled = android.graphics.Bitmap.createScaledBitmap(cut, tw, th, true);
+            }
+            if (scaled != cut) cut.recycle();
+            cut = null;                  // 所有权交给 scaled（可能是同一个对象）
+            out = scaled;
 
             boolean ok;
             java.io.FileOutputStream fos = new java.io.FileOutputStream(tmp);
@@ -2437,8 +2507,8 @@ public class XpanHook implements IXposedHookLoadPackage {
                 XposedBridge.log(TAG + "softcrop 改名失败 " + name);
                 return;
             }
-            XposedBridge.log(TAG + "softcrop OK " + dst.getName() + " zoom=" + zoom
-                    + " " + sw + "x" + sh + " -> 裁 " + cw + "x" + ch + " -> " + sw + "x" + sh);
+            XposedBridge.log(TAG + "softcrop OK " + dst.getName() + " zoom=" + z
+                    + " " + sw + "x" + sh + " -> 裁 " + cw + "x" + ch + " -> " + tw + "x" + th);
             scanFile(dst.getAbsolutePath());
         } catch (Throwable t) {
             XposedBridge.log(TAG + "softCropInPlace failed: " + t);
@@ -2458,6 +2528,97 @@ public class XpanHook implements IXposedHookLoadPackage {
             if (app == null) return;
             android.media.MediaScannerConnection.scanFile(
                     (android.content.Context) app, new String[]{path}, null, null);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /* ---------------- X-Pan 界面上的"出片尺寸"切换按钮 ----------------
+     * 为什么做成模块自己画的按钮：相机应用里没有对应的设置项可挂，而改 HAL 流尺寸
+     * 要重建会话（必须重启相机）。所以按钮只改档位，尺寸由存盘后处理兜底 → 点一下
+     * 下张照片就生效，不用重启。按钮很小、挂在窗口 content 的右上角空白处，
+     * 进出 X-Pan 时跟着挂上/摘掉（避免残留到别的模式）。
+     */
+    private static volatile android.view.View sSizeBtn = null;
+
+    private void attachSizeButton() {
+        try {
+            if (!sXpanActive) return;
+            if (sSizeBtn != null && sSizeBtn.getParent() != null) {
+                updateSizeBtnLabel();
+                return;
+            }
+            android.view.ViewGroup host = null;
+            if (sAct instanceof android.app.Activity) {
+                android.view.View decor = ((android.app.Activity) sAct).getWindow().getDecorView();
+                android.view.View content = decor.findViewById(android.R.id.content);
+                if (content instanceof android.view.ViewGroup) host = (android.view.ViewGroup) content;
+            }
+            if (host == null) return;
+
+            android.widget.TextView tv = new android.widget.TextView(host.getContext());
+            tv.setTextColor(0xFFFFFFFF);
+            tv.setTextSize(13f);
+            tv.setPadding(30, 16, 30, 16);
+            android.graphics.drawable.GradientDrawable bg =
+                    new android.graphics.drawable.GradientDrawable();
+            bg.setColor(0x88000000);
+            bg.setCornerRadius(30);
+            bg.setStroke(2, 0xAAFFFFFF);
+            tv.setBackground(bg);
+            tv.setClickable(true);
+            tv.setOnClickListener(new android.view.View.OnClickListener() {
+                @Override
+                public void onClick(android.view.View v) {
+                    try {
+                        boolean on = !smallPicMode();
+                        setSmallPicMode(on);
+                        updateSizeBtnLabel();
+                        android.widget.Toast.makeText(v.getContext(),
+                                on ? "X-Pan 出片：4096×1512（6.2MP 小文件）"
+                                   : "X-Pan 出片：8192×3024（24.8MP 大图）",
+                                android.widget.Toast.LENGTH_SHORT).show();
+                        XposedBridge.log(TAG + "出片档位切换 -> " + (on ? "4096" : "8192"));
+                    } catch (Throwable t) {
+                        XposedBridge.log(TAG + "size button click failed: " + t);
+                    }
+                }
+            });
+            updateSizeBtnLabel();
+            android.widget.FrameLayout.LayoutParams lp =
+                    new android.widget.FrameLayout.LayoutParams(
+                            android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
+                            android.view.ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.gravity = android.view.Gravity.TOP | android.view.Gravity.END;
+            lp.topMargin = 20;
+            lp.rightMargin = 24;
+            tv.setLayoutParams(lp);
+            host.addView(tv);
+            tv.bringToFront();
+            sSizeBtn = tv;
+            XposedBridge.log(TAG + "出片尺寸按钮已挂上（" + (smallPicMode() ? "4096" : "8192") + "）");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "attachSizeButton failed: " + t);
+        }
+    }
+
+    private static void updateSizeBtnLabel() {
+        try {
+            android.view.View v = sSizeBtn;
+            if (v instanceof android.widget.TextView) {
+                ((android.widget.TextView) v).setText(targetWidth() + "px");
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void removeSizeButton() {
+        try {
+            android.view.View v = sSizeBtn;
+            sSizeBtn = null;
+            if (v != null && v.getParent() instanceof android.view.ViewGroup) {
+                ((android.view.ViewGroup) v.getParent()).removeView(v);
+                XposedBridge.log(TAG + "出片尺寸按钮已摘掉");
+            }
         } catch (Throwable ignored) {
         }
     }
