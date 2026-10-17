@@ -192,6 +192,7 @@ public class XpanHook implements IXposedHookLoadPackage {
         installXpanZoomPointFix(lp);
         installXpanZoomLabelFix(lp);
         installXpanShotZoomWatch(lp);
+        installToneEnable(lp);          // 影调引擎开关（哈苏色彩/影调）
         installXpanFeatureInject(lp);
         installXpanSwitchFix(lp);
         installXpanPanelFix(lp);
@@ -211,6 +212,7 @@ public class XpanHook implements IXposedHookLoadPackage {
             installXpanContainerTrace(lp, "dh.w");
             installZoomTrace(lp);
             installFilterTrace(lp);
+            installToneDiag(lp);      // 影调（BasicTone）链路诊断：只打日志，不改行为
             // 看 FeatureFactory 到底为 X-Pan 模式请求了哪些 feature name
             // （工厂按 featureName.equals("com.oplus.camera.feature.xpan") 才创建 XPanPresenter）
             try {
@@ -1009,6 +1011,183 @@ public class XpanHook implements IXposedHookLoadPackage {
         float r = Math.round(f * 10f) / 10f;
         if (Math.abs(r - Math.round(r)) < 1e-3f) return String.valueOf(Math.round(r));
         return String.valueOf(r);
+    }
+
+    /* ---------------- 影调引擎开关（哈苏色彩/影调，BasicTone） ----------------
+     * 调研 + 实测实锤（2026-10-17）：
+     *   影调链的总闸门是 com.oplus.natural.tone.support —— 判定在 wh.t2.K1()
+     *   （needBasicToneLutTexture）与 wh.t2.c7()（开时返回 0x4），LUT 由
+     *   Lut3dDataManager 从 /odm/etc/camera/basictone/{lmt,odt,vig} 加载，
+     *   预览用 GL 的 uBasicToneLut3dTexture 应用。
+     *   ★ 本机这个键在任何配置文件里都不存在（一加13 也没有）→ 应用取默认 false
+     *     → 影调链全程不生效。这是"缺哈苏影调"的直接原因。
+     *   ★ 实测：把它写进 /odm/etc/camera/config/oplus_camera_config **无效** ——
+     *     把同文件里另一个被查询的键（watermark.guide.support）从 0 改成 1，
+     *     应用照样读 false（见 12_验证/），说明该文件不是这些开关的数据源。
+     *   ★ APS 侧那两条 tag（aps.basictone.version / aps.params.basictone.use.8bit）
+     *     更不能加：本机 APS 的 JSON 解析器直接 abort（tombstone 实锤，
+     *     libAlgoProcess.so APSJsonParser::parseJsonFileParams ← camApsInitEnv），
+     *     即本机 APS 不认识它们（硬件/版本差异，与已判死的路线同性质）。
+     *   → 唯一可行口子：应用侧把这个键的取值接过来（CameraConfig.b 是它的唯一查询口）。
+     * 开关：debug.xpan.tone（默认开；置 0 即回到原厂行为，需重启相机）。
+     */
+    private static final String TONE_KEY = "com.oplus.natural.tone.support";
+
+    private void installToneEnable(XC_LoadPackage.LoadPackageParam lp) {
+        if ("0".equals(prop("debug.xpan.tone"))) {
+            XposedBridge.log(TAG + "note: 影调开关已关闭（debug.xpan.tone=0），保持原厂行为");
+            return;
+        }
+        try {
+            Class<?> cc = Class.forName("com.oplus.camera.configure.CameraConfig",
+                    false, lp.classLoader);
+            int n = 0;
+            for (Method m : cc.getDeclaredMethods()) {
+                Class<?>[] pt = m.getParameterTypes();
+                if (!"b".equals(m.getName()) || pt.length != 2
+                        || !pt[0].equals(String.class) || !pt[1].equals(boolean.class)) continue;
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        try {
+                            if (!TONE_KEY.equals(param.args[0])) return;
+                            if (Boolean.TRUE.equals(param.getResult())) return;
+                            param.setResult(Boolean.TRUE);
+                            if ("1".equals(prop("debug.xpan.diag"))) {
+                                XposedBridge.log(TAG + "影调开关：natural.tone.support -> true（已接管）");
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                });
+                n++;
+            }
+            XposedBridge.log(TAG + "hook installed OK (影调开关接管 x" + n + ")");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "!! 影调开关接管失败: " + t);
+        }
+
+        // ⚠️ 2026-10-17 实测后**撤掉**了对 u6.o0.D() 的接管（X-Pan 的档位判定）：
+        //   接管后 X-Pan 出片与不接管**毫无差异**（同场景各 2 张，亮度差 -0.54、
+        //   对比度 +0.58、暗部 0.44 vs 0.46）—— 说明 X-Pan 的成像链走它自己的 APS 通路，
+        //   应用侧判定打开也没用；而预览反而可能变化（截到亮度 -19），会造成
+        //   "预览和成片不一致"。所以 X-Pan 不加影调，保持所见即所得。
+        //   （真要让 X-Pan 吃影调，得在 APS 侧开 basictone —— 本机 APS 解析器
+        //    不接受那两个 tag：加进去 camApsInitEnv 直接 abort，见 12_验证/，已判死。）
+    }
+
+    /* ---------------- Phase 0 诊断：影调（BasicTone）链路 ----------------
+     * 背景（2026-10-17 调研实锤）：影调与滤镜是两条独立通道 —— 影调走 basictone
+     *   （/odm/etc/camera/basictone/{lmt,odt,setting,vig}，Lut3dDataManager 加载，
+     *   预览 GL 用 uBasicToneLut3dTexture 应用）；开关判定在 wh.t2.K1()
+     *   （读 com.oplus.natural.tone.support，默认 false）与 wh.t2.c7()（开时返回 0x4）。
+     * 本钩子只打日志，不改行为。setprop debug.xpan.diag 1 后重启相机生效。
+     * 目的：看清"应用到底查了哪些影调键、拿到什么值、决策是什么"，再决定加哪条配置。
+     */
+    private static volatile Object sToneK1Last = null;
+    private static volatile Object sToneC7Last = null;
+
+    private void installToneDiag(XC_LoadPackage.LoadPackageParam lp) {
+        // 1) CameraConfig.b(String, boolean)：只记影调/哈苏相关键的查询与结果
+        try {
+            Class<?> cc = Class.forName("com.oplus.camera.configure.CameraConfig", false, lp.classLoader);
+            int n = 0;
+            for (Method m : cc.getDeclaredMethods()) {
+                Class<?>[] pt = m.getParameterTypes();
+                if (!"b".equals(m.getName()) || pt.length != 2
+                        || !pt[0].equals(String.class) || !pt[1].equals(boolean.class)) continue;
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        try {
+                            String k = String.valueOf(param.args[0]).toLowerCase();
+                            if (!k.contains("tone") && !k.contains("hasselblad")
+                                    && !k.contains("basictone")) return;
+                            XposedBridge.log(TAG + "影调配置查询 " + param.args[0]
+                                    + " -> " + param.getResult() + "（默认 " + param.args[1] + "）");
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                });
+                n++;
+            }
+            XposedBridge.log(TAG + "hook installed OK (tone config query x" + n + ")");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "!! tone config query failed: " + t);
+        }
+
+        // 2) wh.t2.K1()Z / c7()I：影调决策（只在值变化时打日志，避免刷屏）
+        try {
+            Class<?> c = Class.forName("wh.t2", false, lp.classLoader);
+            int n = 0;
+            for (Method m : c.getDeclaredMethods()) {
+                if (m.getParameterTypes().length != 0) continue;
+                if ("K1".equals(m.getName())) {
+                    XposedBridge.hookMethod(m, new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                Object r = param.getResult();
+                                if (sToneK1Last != null && sToneK1Last.equals(r)) return;
+                                sToneK1Last = r;
+                                XposedBridge.log(TAG + "影调决策 K1(needBasicToneLutTexture) = " + r
+                                        + " | mode=" + param.thisObject.getClass().getName());
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    });
+                    n++;
+                } else if ("c7".equals(m.getName())) {
+                    XposedBridge.hookMethod(m, new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                Object r = param.getResult();
+                                if (sToneC7Last != null && sToneC7Last.equals(r)) return;
+                                sToneC7Last = r;
+                                XposedBridge.log(TAG + "影调决策 c7() = " + r
+                                        + " | mode=" + param.thisObject.getClass().getName());
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    });
+                    n++;
+                }
+            }
+            XposedBridge.log(TAG + "hook installed OK (tone decision x" + n + ")");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "!! tone decision failed: " + t);
+        }
+
+        // 3) Lut3dDataManager：影调 LUT 环境是否初始化（构造 + 含 initializeBasicToneEnv 日志的方法）
+        try {
+            Class<?> c = Class.forName("com.oplus.camera.common.utils.Lut3dDataManager",
+                    false, lp.classLoader);
+            for (java.lang.reflect.Constructor<?> ctor : c.getDeclaredConstructors()) {
+                XposedBridge.hookMethod(ctor, new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        XposedBridge.log(TAG + "影调：Lut3dDataManager 已实例化");
+                    }
+                });
+            }
+            int n = 0;
+            for (Method m : c.getDeclaredMethods()) {
+                Class<?>[] pt = m.getParameterTypes();
+                if (pt.length != 2 || !pt[0].equals(int.class) || !pt[1].equals(int.class)) continue;
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        XposedBridge.log(TAG + "影调：Lut3dDataManager.e(" + param.args[0] + ","
+                                + param.args[1] + ") = " + param.getResult());
+                    }
+                });
+                n++;
+            }
+            XposedBridge.log(TAG + "hook installed OK (tone lut manager x" + n + ")");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "!! tone lut manager failed: " + t);
+        }
     }
 
     /* ---------------- 实验：把 feature.xpan 注入功能生成列表 ----------------
