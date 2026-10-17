@@ -2873,6 +2873,140 @@ public class XpanHook implements IXposedHookLoadPackage {
         return (Math.sin(px) / px) * (Math.sin(px / 3.0) / (px / 3.0));
     }
 
+    /* ---------------- 画框水印样式下的裁剪（"画框重建"） ----------------
+     * 应用在"X-Pan 画框"样式下出图 = 白框卡片（内嵌照片 + 四角 logo + 底部文字）。
+     * 做法：① 按画框几何算出内嵌照片矩形；② 在内嵌矩形里按倍率做中心裁；
+     *      ③ 用系统 API 把裁出的区域缩回内嵌尺寸；④ 贴回原图同一位置 ——
+     *      白框 / logo / 文字**全部用应用官方渲染的那份像素**，我们只替换框内照片。
+     *  → "画框"与"倍率"互不影响，也不需要反解水印 alpha。
+     * 几何来源：官方样式文件 /data/data/com.oplus.camera/files/photo_watermark/hassel_style_xpan_1.json
+     *   （baseImageSize=291、条带 height=95 → 95/291=32.6% 与实测 32.7% 吻合）。
+     *   当前用实测比例兜底：卡片宽 = 内嵌宽×1.0381、卡片高 = 内嵌高×1.6534、内嵌居中。
+     * 内存保护：任一步失败（含 OOM）返回 false，调用方跳过处理、保留应用原图。
+     */
+    private static final float FRAME_W_RATIO = 1.0381f;   // 卡片宽 / 内嵌宽
+    private static final float FRAME_H_RATIO = 1.6534f;   // 卡片高 / 内嵌高
+
+    private static boolean frameCropInPlace(java.io.File f, float z, java.io.File tmp) {
+        android.graphics.Bitmap full = null, inner = null, innerFull = null, cut2 = null;
+        try {
+            android.graphics.BitmapFactory.Options b = new android.graphics.BitmapFactory.Options();
+            b.inJustDecodeBounds = true;
+            android.graphics.BitmapFactory.decodeFile(f.getAbsolutePath(), b);
+            final int SW = b.outWidth, SH = b.outHeight;
+            if (SW < 64 || SH < 64) return false;
+
+            // ① 低分辨率解码 → 按几何算内嵌矩形（按轴分别除；横竖屏都成立）
+            int sample = 1;
+            while (SW / (sample * 2) >= 1600) sample *= 2;
+            android.graphics.BitmapFactory.Options o = new android.graphics.BitmapFactory.Options();
+            o.inSampleSize = sample;
+            android.graphics.Bitmap small = android.graphics.BitmapFactory.decodeFile(f.getAbsolutePath(), o);
+            if (small == null) return false;
+            final int W0 = small.getWidth(), H0 = small.getHeight();
+            int[] px = new int[W0 * H0];
+            small.getPixels(px, 0, W0, 0, 0, W0, H0);
+            small.recycle();
+
+            int iW0 = Math.round(W0 / FRAME_W_RATIO);
+            int iH0 = Math.round(H0 / FRAME_H_RATIO);
+            int iL0 = (W0 - iW0) / 2, iT0 = (H0 - iH0) / 2;
+            if (!marginLooksWhite(px, W0, H0, iL0, iT0, iW0, iH0)) {
+                XposedBridge.log(TAG + "画框几何校验未通过（内嵌 " + iW0 + "x" + iH0 + "）→ 放弃");
+                return false;
+            }
+            final float kx = SW / (float) W0, ky = SH / (float) H0;
+            final int iL = Math.round(iL0 * kx), iT = Math.round(iT0 * ky);
+            final int iW = Math.round(iW0 * kx), iH = Math.round(iH0 * ky);
+
+            // ②③ 内嵌区域：解出来 → 中心 1/z 裁 → 系统缩放回内嵌尺寸
+            int sample2 = 1;
+            while (iW / (sample2 * 2) >= SOFT_CROP_DECODE_WIDTH) sample2 *= 2;
+            android.graphics.BitmapFactory.Options o3 = new android.graphics.BitmapFactory.Options();
+            o3.inSampleSize = sample2;
+            o3.inPreferredConfig = android.graphics.Bitmap.Config.ARGB_8888;
+            android.graphics.BitmapRegionDecoder rd =
+                    android.graphics.BitmapRegionDecoder.newInstance(f.getAbsolutePath(), false);
+            innerFull = rd.decodeRegion(new android.graphics.Rect(iL, iT, iL + iW, iT + iH), o3);
+            rd.recycle();
+            if (innerFull == null) return false;
+            final int w2 = innerFull.getWidth(), h2 = innerFull.getHeight();
+            final int cw2 = Math.max(16, Math.round(w2 / z)), ch2 = Math.max(16, Math.round(h2 / z));
+            cut2 = android.graphics.Bitmap.createBitmap(innerFull, (w2 - cw2) / 2, (h2 - ch2) / 2, cw2, ch2);
+            innerFull.recycle();
+            innerFull = null;
+            inner = android.graphics.Bitmap.createScaledBitmap(cut2, iW, iH, true);
+            cut2.recycle();
+            cut2 = null;
+            if (inner == null) return false;
+
+            // ④ 原图（可变）上把新内嵌画回去 —— 画框部分保持官方像素不变
+            full = android.graphics.ImageDecoder.decodeBitmap(
+                    android.graphics.ImageDecoder.createSource(f),
+                    new android.graphics.ImageDecoder.OnHeaderDecodedListener() {
+                        @Override
+                        public void onHeaderDecoded(android.graphics.ImageDecoder d,
+                                                    android.graphics.ImageDecoder.ImageInfo info,
+                                                    android.graphics.ImageDecoder.Source src) {
+                            d.setAllocator(android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE);
+                            d.setMutableRequired(true);
+                        }
+                    });
+            if (full == null) return false;
+            android.graphics.Paint pt = new android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG);
+            new android.graphics.Canvas(full).drawBitmap(inner, iL, iT, pt);
+            inner.recycle();
+            inner = null;
+
+            java.io.FileOutputStream fos = new java.io.FileOutputStream(tmp);
+            boolean ok = full.compress(android.graphics.Bitmap.CompressFormat.JPEG, 95, fos);
+            fos.close();
+            full.recycle();
+            full = null;
+            if (!ok || tmp.length() < 20000) return false;
+            XposedBridge.log(TAG + "画框重建完成：内嵌 " + iW + "x" + iH + "（原图 " + SW + "x" + SH
+                    + "，裁切区 " + cw2 + "x" + ch2 + " @ " + iL + "," + iT + "）");
+            return true;
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "画框重建失败（保留应用原图）: " + t);
+            return false;
+        } finally {
+            if (inner != null) inner.recycle();
+            if (innerFull != null) innerFull.recycle();
+            if (cut2 != null) cut2.recycle();
+            if (full != null) full.recycle();
+        }
+    }
+
+    /** 该行是否"几乎全白"（≥99.5% 像素三通道 ≥245）。画框里的 logo/文字只占极小面积，
+     *  所以它们所在的行仍算"白"，不会把照片边界判错。 */
+    private static boolean rowAlmostWhite(int[] px, int W, int y) {
+        int base = y * W, nw = 0;
+        for (int x = 0; x < W; x++) {
+            int p = px[base + x];
+            if (((p >> 16) & 0xFF) < 245 || ((p >> 8) & 0xFF) < 245 || (p & 0xFF) < 245) nw++;
+        }
+        return nw * 1000 <= W * 5;
+    }
+
+    private static boolean colAlmostWhite(int[] px, int W, int H, int x) {
+        int nw = 0;
+        for (int y = 0; y < H; y++) {
+            int p = px[y * W + x];
+            if (((p >> 16) & 0xFF) < 245 || ((p >> 8) & 0xFF) < 245 || (p & 0xFF) < 245) nw++;
+        }
+        return nw * 1000 <= H * 5;
+    }
+
+    /** 画框几何校验：内嵌矩形外侧应几乎全白、内侧应有内容（防几何不匹配时瞎裁）。 */
+    private static boolean marginLooksWhite(int[] px, int W, int H, int iL, int iT, int iW, int iH) {
+        if (iL < 2 || iT < 2 || iW < 64 || iH < 32) return false;
+        if (iL + iW > W - 2 || iT + iH > H - 2) return false;
+        if (!rowAlmostWhite(px, W, iT - 2) || !rowAlmostWhite(px, W, iT + iH + 1)) return false;
+        if (!colAlmostWhite(px, W, H, iL - 2) || !colAlmostWhite(px, W, H, iL + iW + 1)) return false;
+        return !rowAlmostWhite(px, W, iT + iH / 2);
+    }
+
     private static int clamp255(int v) {
         return v < 0 ? 0 : (v > 255 ? 255 : v);
     }
@@ -2903,8 +3037,29 @@ public class XpanHook implements IXposedHookLoadPackage {
             //   所以比例不对就**整张不处理**，保留应用原图（画框样式照样是好的）。
             float aspect = sw / (float) sh;
             if (Math.abs(aspect - 65f / 24f) / (65f / 24f) > 0.03f) {
+                // 不是 65:24：多半是"X-Pan 画框"水印样式（白框卡片）→ 走画框重建：
+                // 在官方画框的内嵌照片里按倍率裁、缩回内嵌尺寸、贴回原图，画框部分保持官方像素。
+                if (z > 1.05f && !"0".equals(prop("debug.xpan.frame"))
+                        && frameCropInPlace(f, z, tmp)) {
+                    String fn = f.getName();
+                    java.io.File dstF = fn.toLowerCase().endsWith(".heic")
+                            ? new java.io.File(f.getParentFile(), fn.substring(0, fn.length() - 5) + ".jpg")
+                            : f;
+                    if (f.exists() && !f.delete()) {
+                        XposedBridge.log(TAG + "画框重建：删原图失败");
+                        return;
+                    }
+                    forgetMediaStoreEntry(f.getAbsolutePath());
+                    if (!tmp.renameTo(dstF)) {
+                        XposedBridge.log(TAG + "画框重建：改名失败");
+                        return;
+                    }
+                    scanFile(dstF.getAbsolutePath());
+                    XposedBridge.log(TAG + "画框重建出片 " + dstF.getName() + "（倍率 " + z + "）");
+                    return;
+                }
                 XposedBridge.log(TAG + "画幅不是 65:24（" + sw + "x" + sh + " = " + aspect
-                        + "，多半是画框水印样式）→ 跳过裁剪，保留应用原图");
+                        + "）→ 跳过裁剪，保留应用原图");
                 return;
             }
             if (z < 1.05f && sw == tw) return;      // 无需处理：原生出片已符合档位
