@@ -97,8 +97,8 @@ public class XpanHook implements IXposedHookLoadPackage {
     /** X-Pan 会话内最近的变焦请求值（fh.g.f 钳制钩子记录；进模式时复位 1.0）。
      *  ★ v1.2 实测：拍照流 8192 宽超出传感器活动阵列(4096x3072)时，HAL 不理变焦裁剪
      *  —— 2× 预览正常(预览流 2304 在阵列内)但拍出来只有 ~1.12× 视野(CamX currentZoom
-     *  实锤，无 2.0)。所以变焦 ≠1× 时拍照流回退 4096x1512（v1.1 验证过 2× 正常；
-     *  2× 下真实细节本来就只有 ~2048 宽，不吃亏），1× 才用 8192x3024 大图。 */
+     *  实锤，无 2.0)。v1.3 起 2× 不再回退拍照流（构图反正相同，统一出大图），
+     *  此字段仅作诊断记录，不再参与尺寸决策。 */
     private static volatile float sXpanZoomReq = 1.0f;
 
     /** XPanPresenter(bh.c) 实例 —— FeatureFactory.b 的返回值，滤镜重新装配必须用它 */
@@ -1977,18 +1977,9 @@ public class XpanHook implements IXposedHookLoadPackage {
                     : (isPreview ? previewSize() : captureSize());
             if (want == null) return null;
 
-            // ★ 变焦 ≠1× 时拍照流回退 4096x1512：8192 宽大流超出活动阵列，HAL 不理
-            //   变焦裁剪（2× 实拍只有 ~1.12× 视野，见 sXpanZoomReq 注释）。prop 显式
-            //   指定时尊重 prop（老语义，自行承担）。
-            //   注：2026-10-11 实验过"改发显式 SCALER_CROP_REGION"的替代方案 ——
-            //   HAL 直接崩进程（拍照请求带 crop 就 SIGSEGV），此路不通，勿再试。
-            if (!isPreview && forced == null && sXpanZoomReq > 1.05f) {
-                Size real = parseSize(DEFAULT_CAPTURE);
-                if (real != null) {
-                    want = real;
-                    XposedBridge.log(TAG + "变焦档回退: " + sXpanZoomReq + "x -> " + real);
-                }
-            }
+            // v1.3：变焦不再回退拍照流。2× 与 1× 构图相同（HAL 对 65:24 流不裁剪，
+            //   2026-10-16 定论），既然视野一样，2× 也出 24.8MP 大图（用户选的 C 方案）。
+            //   勿再试注入裁剪矩形：4:3 矩形崩 HAL，65:24 矩形出图退 4:3（都实测过）。
 
             // 超广角的 HAL 流必须用它自己支持的宽度（imx355 流表最大 3200/3216），
             // 否则绿帧/噪声；JPEG 输出仍由应用侧的 4096x1512 负责（APS 缩放）。
