@@ -74,6 +74,26 @@ public class XpanHook implements IXposedHookLoadPackage {
      *  1×/2× 主摄不受影响，仍是 4096x1512 的 65:24。可用 debug.xpan.uwcap 覆盖。 */
     private static final String DEFAULT_UW_CAPTURE = "2780x1264";
 
+    /** ★ v1.3-b：HAL 侧拍照流尺寸。
+     *  实测（2026-10-16 定论）：HAL 的变焦裁剪**只对宽度 ≤4096 的流生效** ——
+     *  8192 宽的流超出传感器活动阵列(4096x3072)，HAL 走"放大"通路、直接不理变焦矩形。
+     *  所以要让 28/35/48/85mm 这些焦段**真裁切**，HAL 就必须收 4096x1512 的流。
+     *  出片文件大小另由"应用侧尺寸"决定（见 captureSize()）：APS 把 4096x1512 的
+     *  HAL 缓冲放大到 8192x3024 —— 这正是系统"高像素"模式 appSurfaceSize 8192x6144 /
+     *  halSurfaceSize 4096x3072 的同一套机制（日志实锤）。
+     *  两者合起来 = 真裁切 + 24.8MP 文件。可用 debug.xpan.halcap 覆盖。 */
+    private static final String DEFAULT_HAL_CAPTURE = "4096x1512";
+
+    /** X-Pan 变焦档（倍率；24mm 主摄 = 1×）。
+     *  24 / 28 / 35 / 48mm —— 对应 1 / 1.1667 / 1.4583 / 2 倍，全部实测可用（真裁切）。
+     *  ⚠️ 85mm（3.5417×）暂时做不了：这个模式在应用内部有 **2.0× 硬上限**
+     *  （实测请求 2.5 / 3.5417 都被钳回 2.0，钳制点在 z1.m 内部、比 fh.g.f 更早），
+     *  要突破得再挖那处钳制。变焦条那个 List<Float> 就是这些值。
+     *  可用 debug.xpan.zooms 覆盖（逗号分隔的倍率，注意 2.0 以上无效）。 */
+    private static final float[] XPAN_ZOOM_POINTS = {1.0f, 1.1667f, 1.4583f, 2.0f};
+    /** 1× 的等效焦距（水印实测：2× 出片写 48mm）—— 用来把倍率换算成变焦条上的 mm 文字 */
+    private static final float XPAN_BASE_FOCAL = 24.0f;
+
     /** rear_main=主摄；rear_wide=超广角（本机命名，实测日志里 0.6× 时出现） */
     private static boolean isUltraWide(String cameraType) {
         String c = cameraType.toLowerCase();
@@ -112,6 +132,8 @@ public class XpanHook implements IXposedHookLoadPackage {
 
     private static volatile Size sPreviewSize = null;
     private static volatile Size sCaptureSize = null;
+    /** HAL 侧拍照流尺寸（见 DEFAULT_HAL_CAPTURE 注释） */
+    private static volatile Size sHalCaptureSize = null;
     private static volatile Size[] sAvail = null;
 
     @Override
@@ -129,6 +151,8 @@ public class XpanHook implements IXposedHookLoadPackage {
         installXpanUiRestore(lp);
         installXpanZoomUnlock(lp);
         installXpanZoomPointFix(lp);
+        installXpanZoomUnitMm(lp);
+        installXpanShotZoomWatch(lp);
         installXpanFeatureInject(lp);
         installXpanSwitchFix(lp);
         installXpanPanelFix(lp);
@@ -761,7 +785,7 @@ public class XpanHook implements IXposedHookLoadPackage {
      *   小于 1× 的请求不动 —— 0.6× 靠切换超广角镜头实现，不经过这个函数；
      *   变焦条上那个值为 0.0 的坏档位也落在这边，会保持原来的 1.0，不会把画面搞黑。
      */
-    private static final float XPAN_MAX_ZOOM = 3.0f;
+    private static final float XPAN_MAX_ZOOM = 4.0f;
 
     private void installXpanZoomUnlock(XC_LoadPackage.LoadPackageParam lp) {
         try {
@@ -833,7 +857,7 @@ public class XpanHook implements IXposedHookLoadPackage {
                             for (Object a : param.args) {
                                 if (!(a instanceof List)) continue;
                                 List<?> list = (List<?>) a;
-                                if (hasBadZoomPoint(list)) filterBadZoomPoints(list);
+                                if (looksLikeZoomPointList(list)) applyXpanZoomPoints(list);
                             }
                         } catch (Throwable ignored) {
                         }
@@ -841,30 +865,118 @@ public class XpanHook implements IXposedHookLoadPackage {
                 });
                 n++;
             }
-            XposedBridge.log(TAG + "hook installed OK (xpan zoom point fix x" + n + ")");
+            XposedBridge.log(TAG + "hook installed OK (xpan zoom points x" + n + ")");
         } catch (Throwable t) {
             XposedBridge.log(TAG + "!! xpan zoom point fix failed: " + t);
         }
     }
 
-    /** 档位列表里是否还有需要剔除的档位（≤0 非法 / <1.0 的 0.6× 超广角） */
-    private static boolean hasBadZoomPoint(List<?> list) {
-        for (int i = list.size() - 1; i >= 0; i--) {
-            Object v = list.get(i);
-            if (v instanceof Float && ((Float) v) < 1.0f) return true;
+    /** 这个 List 是不是"变焦档位表"（元素全是 Float）——R8 里还有别的 ArrayList 参数，
+     *  靠"元素类型"识别，避免误改 IconType 列表之类的。 */
+    private static boolean looksLikeZoomPointList(List<?> list) {
+        if (list == null || list.isEmpty()) return false;
+        for (Object o : list) {
+            if (!(o instanceof Float)) return false;
         }
-        return false;
+        return true;
     }
 
-    private static void filterBadZoomPoints(List<?> list) {
-        for (int i = list.size() - 1; i >= 0; i--) {
-            Object v = list.get(i);
-            if (!(v instanceof Float)) continue;
-            float f = (Float) v;
-            if (f >= 1.0f) continue;   // 保留 1× 及以上
-            list.remove(i);
-            XposedBridge.log(TAG + "xpan 变焦条剔掉档位 " + v
-                    + (f <= 0f ? "（非法）" : "（0.6× 超广角，按要求删除）"));
+    /**
+     * 把 X-Pan 的变焦档位表换成我们要的焦段（24/28/35/48/85mm）。
+     * 实测档位表的元素是 Float（倍率），按顺序对应 IconType[ULTRA_WIDE,WIDE,DUAL,TELE,MORE]；
+     * 应用自己那份是 [0.6, 1.0, 0.0, 2.0]（0.6 超广角本机成像不可靠、0.0 是坏档位）。
+     * 这里整体替换：值变了、数量也变了（4→5），档位文字跟值走。
+     * 可用 debug.xpan.zooms=1,2,3 覆盖。
+     */
+    private static void applyXpanZoomPoints(List<?> list) {
+        float[] pts = xpanZoomPoints();
+        if (list.size() == pts.length) {
+            boolean same = true;
+            for (int i = 0; i < pts.length; i++) {
+                Object o = list.get(i);
+                if (!(o instanceof Float) || Math.abs((Float) o - pts[i]) > 1e-4f) { same = false; break; }
+            }
+            if (same) return;               // 幂等：已经是我们要的档位就不动
+        }
+        @SuppressWarnings("unchecked")
+        List<Object> l = (List<Object>) list;
+        l.clear();
+        for (float f : pts) l.add(f);
+        XposedBridge.log(TAG + "xpan 变焦档位 = " + describe(list));
+    }
+
+    /** X-Pan 的焦段倍率表：debug.xpan.zooms（逗号分隔）优先，否则用内置 XPAN_ZOOM_POINTS */
+    private static float[] xpanZoomPoints() {
+        String p = prop("debug.xpan.zooms");
+        if (p != null && !p.isEmpty()) {
+            String[] parts = p.split(",");
+            float[] out = new float[parts.length];
+            int n = 0;
+            for (String s : parts) {
+                try {
+                    float f = Float.parseFloat(s.trim());
+                    if (f >= 1.0f) out[n++] = f;
+                } catch (Throwable ignored) {
+                }
+            }
+            if (n > 0) {
+                float[] r = new float[n];
+                System.arraycopy(out, 0, r, 0, n);
+                return r;
+            }
+        }
+        return XPAN_ZOOM_POINTS;
+    }
+
+    /* ---------------- 变焦条按 mm 显示（应用原生支持，默认单位是 ×） ----------------
+     * 反编译实锤（2026-10-16）：
+     *   ZoomSeekBar.K8(IconType, LinkedHashMap) 生成档位文字：
+     *     单位字段 u4 == "mm" → 走 hh.f.b(倍率) 换算成焦距，再格式化；
+     *     否则直接显示倍率（所以现在是 "1x / 2"）。
+     *   u4 由 pb() 从 m5 拷贝，m5 由 z1.b0(String, boolean) 设置（相机设置里的变焦单位）。
+     * 做法：X-Pan 内 ① 把 b0 的参数强制成 "mm"；② 把 hh.f.b 的换算改成"倍率 × 24"
+     *   （应用那张换算表是按它自己的档位配的，我们的 28/35/85mm 不在表里，直接自己算最稳）。
+     */
+    private void installXpanZoomUnitMm(XC_LoadPackage.LoadPackageParam lp) {
+        try {
+            Class<?> z1 = Class.forName("com.oplus.camera.feature.zoom.ui.z1", false, lp.classLoader);
+            Method b0 = z1.getDeclaredMethod("b0", String.class, boolean.class);
+            XposedBridge.hookMethod(b0, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        if (!sXpanActive || param.args == null || param.args.length < 1) return;
+                        if (!"mm".equals(param.args[0])) {
+                            param.args[0] = "mm";
+                            XposedBridge.log(TAG + "xpan 变焦单位 -> mm");
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+            XposedBridge.log(TAG + "hook installed OK (xpan zoom unit mm)");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "!! xpan zoom unit mm failed: " + t);
+        }
+
+        try {
+            Class<?> hf = Class.forName("hh.f", false, lp.classLoader);
+            Method b = hf.getDeclaredMethod("b", float.class);
+            XposedBridge.hookMethod(b, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    try {
+                        if (!sXpanActive || param.args == null) return;
+                        float ratio = (Float) param.args[0];
+                        if (ratio < 1.0f) return;
+                        param.setResult(ratio * XPAN_BASE_FOCAL);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+            XposedBridge.log(TAG + "hook installed OK (xpan focal mm convert)");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "!! xpan focal mm convert failed: " + t);
         }
     }
 
@@ -1891,29 +2003,34 @@ public class XpanHook implements IXposedHookLoadPackage {
             Class<?> sw = Class.forName(CLS_SURFACE_WRAPPER, false, lp.classLoader);
             Method setHal = sw.getDeclaredMethod("setHalSurfaceSize", Size.class);
             Method setApp = sw.getDeclaredMethod("setAppSurfaceSize", Size.class);
-            XC_MethodHook fix = new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    try {
-                        if (param.args == null || param.args.length < 1) return;
-                        Object o = param.args[0];
-                        if (!(o instanceof Size)) return;
-                        Size want = targetFor((Size) o, param.thisObject);
-                        if (want != null && !want.equals(o)) {
-                            XposedBridge.log(TAG + "  size fix " + o + " -> " + want);
-                            param.args[0] = want;
-                        }
-                    } catch (Throwable t) {
-                        XposedBridge.log(TAG + "size fix error: " + t);
-                    }
-                }
-            };
-            XposedBridge.hookMethod(setHal, fix);
-            XposedBridge.hookMethod(setApp, fix);
+            // 两侧要分别给：HAL 侧小（变焦才裁）、应用侧大（出片才大）
+            XposedBridge.hookMethod(setHal, sizeSetterHook(false));
+            XposedBridge.hookMethod(setApp, sizeSetterHook(true));
             XposedBridge.log(TAG + "hook installed OK (SurfaceWrapper setters)");
         } catch (Throwable t) {
             XposedBridge.log(TAG + "!! surface wrapper setter hook failed: " + t);
         }
+    }
+
+    private static XC_MethodHook sizeSetterHook(final boolean appSide) {
+        return new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) {
+                try {
+                    if (param.args == null || param.args.length < 1) return;
+                    Object o = param.args[0];
+                    if (!(o instanceof Size)) return;
+                    Size want = targetFor((Size) o, param.thisObject, appSide);
+                    if (want != null && !want.equals(o)) {
+                        XposedBridge.log(TAG + "  size fix (" + (appSide ? "app" : "hal")
+                                + ") " + o + " -> " + want);
+                        param.args[0] = want;
+                    }
+                } catch (Throwable t) {
+                    XposedBridge.log(TAG + "size fix error: " + t);
+                }
+            }
+        };
     }
 
     /* ---------------- XpanMode.getSurfaceSize（可选，装不上也不影响上面两个） ---------------- */
@@ -1950,15 +2067,19 @@ public class XpanHook implements IXposedHookLoadPackage {
     /**
      * 算出这个面该用哪个尺寸；**返回 null 表示不要动**。
      * 预览 → previewSize()（2304x1048，可被 debug.xpan.preview 覆盖）
-     * 拍照 → captureSize()（默认 8192x3024；建 .xpan_smallpic 回 4096x1512；prop 可显式覆盖）
-     *   app/HAL 两侧同尺寸 —— 大图档就是让 HAL 出 8192x3024 的放大流
-     *   （2026-10-10 实测：HAL 收下 >4096 宽的流，内部从 12.5MP 读出放大，连拍稳定）。
-     *   曾试过"app 侧大图 + HAL 侧真读出、借 APS mfll/upscale 放大"的 C 路线：
-     *   本机 APS 没有 xpan 的放大算法组件，algo 配置开启后 APS 初始化卡死、快门被禁
-     *   （isApsCaptureAlgoInitializing=true, not allow take picture），已判死，勿再试。
+     * 拍照 → 分两侧（v1.3-b 起）：
+     *   HAL 侧 = halCaptureSize()（默认 4096x1512）—— 只有 ≤4096 宽的流 HAL 才执行变焦裁剪，
+     *     所以焦段真裁切靠它；
+     *   应用侧 = captureSize()（默认 8192x3024）—— 决定出片文件大小，APS 负责放大。
+     *   建 .xpan_smallpic 或 debug.xpan.split=0 → 两侧同尺寸（回 v1.2 行为）。
      * 认不出来 / 是视频、缩略图、metadata 等 → 原样不动
      */
     private static Size targetFor(Size s, Object wrapper) {
+        return targetFor(s, wrapper, false);
+    }
+
+    /** @param appSide true = 应用侧（出片大小）；false = HAL 侧（流尺寸，决定变焦能否裁剪） */
+    private static Size targetFor(Size s, Object wrapper, boolean appSide) {
         try {
             if (!sXpanActive) return null;                 // 边界 1：非 X-Pan 模式一律不动
             if (s == null) return null;
@@ -1974,12 +2095,15 @@ public class XpanHook implements IXposedHookLoadPackage {
 
             String forced = isPreview ? prop("debug.xpan.preview") : prop("debug.xpan.capture");
             Size want = (forced != null) ? parseSize(forced)
-                    : (isPreview ? previewSize() : captureSize());
+                    : (isPreview ? previewSize()
+                                 : (appSide ? captureSize() : halCaptureSize()));
             if (want == null) return null;
 
             // v1.3：变焦不再回退拍照流。2× 与 1× 构图相同（HAL 对 65:24 流不裁剪，
             //   2026-10-16 定论），既然视野一样，2× 也出 24.8MP 大图（用户选的 C 方案）。
             //   勿再试注入裁剪矩形：4:3 矩形崩 HAL，65:24 矩形出图退 4:3（都实测过）。
+            // v1.3-b：改走"HAL 小流 + 应用侧大图"后构图恢复正常（HAL 在 4096 流上会裁），
+            //   上面那段"构图相同"的历史结论仅适用于两侧同为大流的旧配置。
 
             // 超广角的 HAL 流必须用它自己支持的宽度（imx355 流表最大 3200/3216），
             // 否则绿帧/噪声；JPEG 输出仍由应用侧的 4096x1512 负责（APS 缩放）。
@@ -2012,6 +2136,8 @@ public class XpanHook implements IXposedHookLoadPackage {
      * XpanMode.getSurfaceSize 的兜底修正。
      * 注意：保留原列表结构，只替换里面的尺寸 —— 之前直接 new 一个单元素列表，
      * 万一 X-Pan 需要多流就会把其余流丢掉。
+     * v1.3-b：拍照面按 (HAL 尺寸, 应用尺寸) 分开给 —— 实测 Pair 语义就是
+     *   (halSurfaceSize, appSurfaceSize)，出片大小跟第二个元素走。
      */
     @SuppressWarnings({"unchecked", "rawtypes"})
     private void onSurfaceSize(XC_MethodHook.MethodHookParam param) {
@@ -2028,32 +2154,38 @@ public class XpanHook implements IXposedHookLoadPackage {
         if (list.isEmpty()) return;
 
         String st = surfaceType.toLowerCase();
-        Size want;
+        Size halWant;
+        Size appWant;
         if (st.contains("preview")) {
-            want = previewSize();
+            halWant = previewSize();
+            appWant = halWant;
         } else if (st.startsWith("capture") || st.equals("raw_output") || st.equals("raw12_output")) {
-            want = captureSize();
-            // 注：超广角的 HAL 流尺寸在 targetFor 里单独处理（getHalSurfaceSize 那层），
-            // 应用侧尺寸（这里）保持 4096x1512 不变，APS 负责最终输出。
+            boolean uw = isUltraWide(cameraType);
+            halWant = uw ? parseSize(prop("debug.xpan.uwcap") != null
+                    ? prop("debug.xpan.uwcap") : DEFAULT_UW_CAPTURE) : halCaptureSize();
+            if (halWant == null) halWant = halCaptureSize();
+            appWant = captureSize();
+            if (uw) appWant = halWant;      // 超广角不拆：两侧都按它自己的流尺寸
         } else {
             return;
         }
-        if (want == null) return;
+        if (halWant == null || appWant == null) return;
 
         List<Object> out = new ArrayList<>(list.size());
         boolean changed = false;
         for (Object o : list) {
             if (o instanceof Pair) {
                 Pair p = (Pair) o;
-                if (!want.equals(p.first) || !want.equals(p.second)) changed = true;
-                out.add(new Pair<>(want, want));
+                if (!halWant.equals(p.first) || !appWant.equals(p.second)) changed = true;
+                out.add(new Pair<>(halWant, appWant));
             } else {
                 out.add(o);
             }
         }
         if (changed) {
             param.setResult(out);
-            XposedBridge.log(TAG + "  -> override [" + surfaceType + "] = " + want);
+            XposedBridge.log(TAG + "  -> override [" + surfaceType + "] hal=" + halWant
+                    + " app=" + appWant);
         }
     }
 
@@ -2113,6 +2245,220 @@ public class XpanHook implements IXposedHookLoadPackage {
             return new File("/storage/emulated/0/Android/media/com.oneplus.camera/.xpan_smallpic").exists();
         } catch (Throwable t) {
             return false;
+        }
+    }
+
+    /**
+     * ★ HAL 侧拍照流尺寸（默认 4096x1512）。
+     * 只有 ≤4096 宽的流 HAL 才执行变焦裁剪 → 这是"焦段真裁切"的前提。
+     * debug.xpan.halcap 可覆盖；debug.xpan.split=0 或 .xpan_smallpic 存在时退回 captureSize()
+     * （即 v1.2 的"两侧同尺寸"行为）。
+     */
+    private static Size halCaptureSize() {
+        if (sHalCaptureSize != null) return sHalCaptureSize;
+        Size s;
+        if (!splitEnabled()) {
+            s = captureSize();
+        } else {
+            s = parseSize(prop("debug.xpan.halcap"));
+            if (s == null) s = parseSize(DEFAULT_HAL_CAPTURE);
+            if (s == null) s = new Size(4096, 1512);
+        }
+        sHalCaptureSize = s;
+        XposedBridge.log(TAG + "halCaptureSize resolved = " + s
+                + (splitEnabled() ? "（HAL 小流：变焦裁剪才生效）" : "（split 关闭，与出片同尺寸）"));
+        return s;
+    }
+
+    /** 是否启用"HAL 小流 + 应用侧大图"拆分。
+     *  ⚠️ 2026-10-17 实测结论：**这个方向没用** —— 把 HAL 流改成 4096x1512 后
+     *  应用照样下发 zoomRatio=1.4583，出图构图仍与 1× 相同（NCC 0.99），
+     *  说明 HAL 对 X-Pan 的 65:24 拍照流**无论宽窄都不裁**（真正原因是应用同时下发
+     *  固定的 com.oplus.opx.CropInfo=[0,780,4096,1512]，HAL 只认它）。
+     *  所以默认关闭，留着 debug.xpan.split=1 供以后复验。 */
+    private static boolean splitEnabled() {
+        return "1".equals(prop("debug.xpan.split"));
+    }
+
+    /* ---------------- 软件裁切：X-Pan 的"真焦段"就靠这里 ----------------
+     * 背景（2026-10-17 实锤，两次独立验证）：
+     *   HAL 对 X-Pan 的 65:24 拍照流**不执行变焦裁剪** —— 应用确实下发了
+     *   android.control.zoomRatio=1.4583（takePicture 探针），但同一个请求里还带着
+     *   固定的 com.oplus.opx.CropInfo=[0,780,4096,1512]，HAL 只认后者。
+     *   流宽 4096 / 8192 都试过，构图都不变；改 CropInfo 会让应用退回 4:3（有校验）。
+     *   → 想要"28/35/85mm 真的是那个视野"，只能在成片上自己裁。
+     * 做法：拍照时记下变焦值；监听 DCIM/Camera 新文件；按中心 1/z 裁剪，
+     *   再放大回原尺寸（保住"高像素"档的文件大小），重新编码写回原文件。
+     * 代价（如实写在 README）：裁完的真实细节 = 6.2MP / z²，放大是插值。
+     * 开关：debug.xpan.swcrop=0 关（默认开）。
+     */
+    private static volatile float sShotZoom = 1.0f;
+    private static volatile long sShotAt = 0L;
+    /** 裁完是否还要放大回原尺寸（关掉就是"裁多大存多大"的真实像素档） */
+    private static final int SOFT_CROP_DECODE_WIDTH = 4096;   // 源图真细节宽度上限
+
+    private void installXpanShotZoomWatch(XC_LoadPackage.LoadPackageParam lp) {
+        try {
+            Class<?> c = Class.forName("com.oplus.ocs.camera.producer.device.Camera2Impl",
+                    false, lp.classLoader);
+            int n = 0;
+            for (Method m : c.getDeclaredMethods()) {
+                if (!"takePicture".equals(m.getName()) || m.getParameterTypes().length != 5) continue;
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        try {
+                            if (!sXpanActive) return;
+                            Object z = field(param.args[0], "mZoomRatio");
+                            if (z instanceof Number) sShotZoom = ((Number) z).floatValue();
+                            sShotAt = android.os.SystemClock.elapsedRealtime();
+                            // 变焦了才需要软件裁切：起一个短命线程轮询目录等新文件
+                            if (sShotZoom >= 1.05f && !"0".equals(prop("debug.xpan.swcrop"))) {
+                                final java.io.File dir = new java.io.File(DCIM_CAMERA);
+                                final java.util.Set<String> before = listNames(dir);
+                                final float z2 = sShotZoom;
+                                new Thread(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        watchNewFile(dir, before, z2);
+                                    }
+                                }, "xpan-softcrop").start();
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                });
+                n++;
+            }
+            XposedBridge.log(TAG + "hook installed OK (shot zoom watch x" + n + ")");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "!! shot zoom watch failed: " + t);
+        }
+    }
+
+    private static final String DCIM_CAMERA = "/storage/emulated/0/DCIM/Camera";
+
+    private static java.util.Set<String> listNames(java.io.File d) {
+        java.util.Set<String> s = new java.util.HashSet<>();
+        try {
+            String[] a = d.list();
+            if (a != null) {
+                for (String x : a) s.add(x);
+            }
+        } catch (Throwable ignored) {
+        }
+        return s;
+    }
+
+    /** 轮询等新照片落盘（FileObserver 在 /sdcard 这种 FUSE 路径上收不到事件，实测无效），
+     *  等文件大小连续两次不变（= 写完了）再动手。 */
+    private static void watchNewFile(java.io.File dir, java.util.Set<String> before, float zoom) {
+        try {
+            for (int i = 0; i < 60; i++) {          // 最多约 30 秒
+                Thread.sleep(500);
+                String[] a = dir.list();
+                if (a == null) continue;
+                for (String n : a) {
+                    if (before.contains(n)) continue;
+                    String low = n.toLowerCase();
+                    if (!low.endsWith(".heic") && !low.endsWith(".jpg")
+                            && !low.endsWith(".jpeg")) continue;
+                    java.io.File f = new java.io.File(dir, n);
+                    long s1 = f.length();
+                    if (s1 < 20000) continue;
+                    Thread.sleep(800);
+                    if (f.length() != s1) continue;  // 还在写，下一轮再看
+                    softCropInPlace(f, zoom);
+                    return;
+                }
+            }
+            XposedBridge.log(TAG + "softcrop: 没等到新文件（zoom=" + zoom + "）");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "watchNewFile failed: " + t);
+        }
+    }
+
+    /** 按中心 1/zoom 裁切 → 放大回原尺寸 → 重编码写回原文件 */
+    private static void softCropInPlace(java.io.File f, float zoom) {
+        android.graphics.Bitmap src = null;
+        android.graphics.Bitmap cut = null;
+        android.graphics.Bitmap out = null;
+        java.io.File tmp = new java.io.File(f.getParentFile(), f.getName() + ".crop.tmp");
+        try {
+            if (!f.exists() || f.length() < 20000) return;
+            android.graphics.BitmapFactory.Options b = new android.graphics.BitmapFactory.Options();
+            b.inJustDecodeBounds = true;
+            android.graphics.BitmapFactory.decodeFile(f.getAbsolutePath(), b);
+            final int sw = b.outWidth, sh = b.outHeight;
+            if (sw <= 0 || sh <= 0) return;
+
+            // 源图本身就是"算法放大"的，解到真细节那一档就够，省内存也更快
+            int sample = 1;
+            while (sw / (sample * 2) >= SOFT_CROP_DECODE_WIDTH) sample *= 2;
+            android.graphics.BitmapFactory.Options o = new android.graphics.BitmapFactory.Options();
+            o.inSampleSize = sample;
+            o.inPreferredConfig = android.graphics.Bitmap.Config.ARGB_8888;
+            src = android.graphics.BitmapFactory.decodeFile(f.getAbsolutePath(), o);
+            if (src == null) return;
+
+            int w = src.getWidth(), h = src.getHeight();
+            int cw = Math.max(16, Math.round(w / zoom)), ch = Math.max(16, Math.round(h / zoom));
+            cut = android.graphics.Bitmap.createBitmap(src, (w - cw) / 2, (h - ch) / 2, cw, ch);
+            src.recycle();
+            src = null;
+
+            out = (cw == sw && ch == sh) ? cut
+                    : android.graphics.Bitmap.createScaledBitmap(cut, sw, sh, true);
+            if (out != cut) { cut.recycle(); cut = null; }
+
+            boolean ok;
+            java.io.FileOutputStream fos = new java.io.FileOutputStream(tmp);
+            ok = out.compress(android.graphics.Bitmap.CompressFormat.JPEG, 95, fos);
+            fos.close();
+            out.recycle();
+            out = null;
+
+            if (!ok || tmp.length() < 20000) {
+                XposedBridge.log(TAG + "softcrop 编码失败，保留原图 " + f.getName());
+                return;
+            }
+            // 存的是 JPEG（HEIC 编码器是隐藏 API，应用进程里调不动），所以文件名也跟着改成 .jpg
+            String name = f.getName();
+            java.io.File dst = f;
+            if (name.toLowerCase().endsWith(".heic")) {
+                dst = new java.io.File(f.getParentFile(),
+                        name.substring(0, name.length() - 5) + ".jpg");
+            }
+            if (f.exists() && !f.delete()) {
+                XposedBridge.log(TAG + "softcrop 删原图失败 " + name);
+                return;
+            }
+            if (!tmp.renameTo(dst)) {
+                XposedBridge.log(TAG + "softcrop 改名失败 " + name);
+                return;
+            }
+            XposedBridge.log(TAG + "softcrop OK " + dst.getName() + " zoom=" + zoom
+                    + " " + sw + "x" + sh + " -> 裁 " + cw + "x" + ch + " -> " + sw + "x" + sh);
+            scanFile(dst.getAbsolutePath());
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "softCropInPlace failed: " + t);
+        } finally {
+            if (src != null) src.recycle();
+            if (cut != null) cut.recycle();
+            if (out != null) out.recycle();
+            if (tmp.exists()) tmp.delete();
+        }
+    }
+
+    /** 改完文件通知媒体库重扫（否则图库里尺寸/缩略图还是旧的） */
+    private static void scanFile(String path) {
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            Object app = at.getMethod("currentApplication").invoke(null);
+            if (app == null) return;
+            android.media.MediaScannerConnection.scanFile(
+                    (android.content.Context) app, new String[]{path}, null, null);
+        } catch (Throwable ignored) {
         }
     }
 
