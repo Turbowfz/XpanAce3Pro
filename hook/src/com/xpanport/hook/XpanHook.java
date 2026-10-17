@@ -85,14 +85,14 @@ public class XpanHook implements IXposedHookLoadPackage {
     private static final String DEFAULT_HAL_CAPTURE = "4096x1512";
 
     /** X-Pan 变焦档（倍率；24mm 主摄 = 1×）。
-     *  24 / 28 / 35 / 48mm —— 对应 1 / 1.1667 / 1.4583 / 2 倍，全部实测可用（真裁切）。
+     *  1 / 1.1667 / 1.4583 / 2 倍 —— 后两个就是 **28mm / 35mm 的等效倍率**
+     *  （1.1667 ≈ 28/24、1.4583 ≈ 35/24），倍率档全部实测可用（真裁切）。
+     *  变焦条按应用原样显示 ×（不改成 mm）。
      *  ⚠️ 85mm（3.5417×）暂时做不了：这个模式在应用内部有 **2.0× 硬上限**
      *  （实测请求 2.5 / 3.5417 都被钳回 2.0，钳制点在 z1.m 内部、比 fh.g.f 更早），
      *  要突破得再挖那处钳制。变焦条那个 List<Float> 就是这些值。
      *  可用 debug.xpan.zooms 覆盖（逗号分隔的倍率，注意 2.0 以上无效）。 */
     private static final float[] XPAN_ZOOM_POINTS = {1.0f, 1.1667f, 1.4583f, 2.0f};
-    /** 1× 的等效焦距（水印实测：2× 出片写 48mm）—— 用来把倍率换算成变焦条上的 mm 文字 */
-    private static final float XPAN_BASE_FOCAL = 24.0f;
 
     /** rear_main=主摄；rear_wide=超广角（本机命名，实测日志里 0.6× 时出现） */
     private static boolean isUltraWide(String cameraType) {
@@ -190,7 +190,7 @@ public class XpanHook implements IXposedHookLoadPackage {
         installXpanUiRestore(lp);
         installXpanZoomUnlock(lp);
         installXpanZoomPointFix(lp);
-        installXpanZoomUnitMm(lp);
+        installXpanZoomLabelFix(lp);
         installXpanShotZoomWatch(lp);
         installXpanFeatureInject(lp);
         installXpanSwitchFix(lp);
@@ -967,56 +967,48 @@ public class XpanHook implements IXposedHookLoadPackage {
         return XPAN_ZOOM_POINTS;
     }
 
-    /* ---------------- 变焦条按 mm 显示（应用原生支持，默认单位是 ×） ----------------
-     * 反编译实锤（2026-10-16）：
-     *   ZoomSeekBar.K8(IconType, LinkedHashMap) 生成档位文字：
-     *     单位字段 u4 == "mm" → 走 hh.f.b(倍率) 换算成焦距，再格式化；
-     *     否则直接显示倍率（所以现在是 "1x / 2"）。
-     *   u4 由 pb() 从 m5 拷贝，m5 由 z1.b0(String, boolean) 设置（相机设置里的变焦单位）。
-     * 做法：X-Pan 内 ① 把 b0 的参数强制成 "mm"；② 把 hh.f.b 的换算改成"倍率 × 24"
-     *   （应用那张换算表是按它自己的档位配的，我们的 28/35/85mm 不在表里，直接自己算最稳）。
+    /* ---------------- 变焦档位的文字：应用是"截断"，我们改成四舍五入 ----------------
+     * 反编译实锤：档位文字由 ZoomSeekBar.K8(IconType, LinkedHashMap) 生成，
+     * 值取自 map.get(iconType)，最后交给 im.m0.b(F) 格式化 —— 那个函数是**截断**的，
+     * 所以 1.1667 会显示成 "1.1"、1.4583 显示成 "1.4"（之前的 34.9mm 也是同一原因）。
+     * 这里只改变焦条的档位文字（K8 的返回值），不动全局格式化函数：
+     * 1.0 → "1x"，其余四舍五入到 1 位小数、整数不带小数（1.1667→1.2、1.4583→1.5、2.0→2）。
      */
-    private void installXpanZoomUnitMm(XC_LoadPackage.LoadPackageParam lp) {
+    private void installXpanZoomLabelFix(XC_LoadPackage.LoadPackageParam lp) {
         try {
-            Class<?> z1 = Class.forName("com.oplus.camera.feature.zoom.ui.z1", false, lp.classLoader);
-            Method b0 = z1.getDeclaredMethod("b0", String.class, boolean.class);
-            XposedBridge.hookMethod(b0, new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    try {
-                        if (!sXpanActive || param.args == null || param.args.length < 1) return;
-                        if (!"mm".equals(param.args[0])) {
-                            param.args[0] = "mm";
-                            XposedBridge.log(TAG + "xpan 变焦单位 -> mm");
+            Class<?> c = Class.forName("com.oplus.camera.feature.zoom.view.ZoomSeekBar",
+                    false, lp.classLoader);
+            int n = 0;
+            for (Method m : c.getDeclaredMethods()) {
+                if (!"K8".equals(m.getName()) || m.getParameterTypes().length != 2) continue;
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        try {
+                            if (!sXpanActive || param.args == null) return;
+                            Object map = param.args[1];
+                            if (!(map instanceof java.util.Map)) return;
+                            Object v = ((java.util.Map<?, ?>) map).get(param.args[0]);
+                            if (!(v instanceof Float)) return;
+                            param.setResult(fmtZoomRatio((Float) v));
+                        } catch (Throwable ignored) {
                         }
-                    } catch (Throwable ignored) {
                     }
-                }
-            });
-            XposedBridge.log(TAG + "hook installed OK (xpan zoom unit mm)");
+                });
+                n++;
+            }
+            XposedBridge.log(TAG + "hook installed OK (xpan zoom label x" + n + ")");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "!! xpan zoom unit mm failed: " + t);
+            XposedBridge.log(TAG + "!! xpan zoom label fix failed: " + t);
         }
+    }
 
-        try {
-            Class<?> hf = Class.forName("hh.f", false, lp.classLoader);
-            Method b = hf.getDeclaredMethod("b", float.class);
-            XposedBridge.hookMethod(b, new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    try {
-                        if (!sXpanActive || param.args == null) return;
-                        float ratio = (Float) param.args[0];
-                        if (ratio < 1.0f) return;
-                        param.setResult(ratio * XPAN_BASE_FOCAL);
-                    } catch (Throwable ignored) {
-                    }
-                }
-            });
-            XposedBridge.log(TAG + "hook installed OK (xpan focal mm convert)");
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "!! xpan focal mm convert failed: " + t);
-        }
+    /** 变焦档位文字：1× 写 "1x"，其余四舍五入到 1 位小数、整数不带小数 */
+    private static String fmtZoomRatio(float f) {
+        if (Math.abs(f - 1.0f) < 1e-3f) return "1x";
+        float r = Math.round(f * 10f) / 10f;
+        if (Math.abs(r - Math.round(r)) < 1e-3f) return String.valueOf(Math.round(r));
+        return String.valueOf(r);
     }
 
     /* ---------------- 实验：把 feature.xpan 注入功能生成列表 ----------------
@@ -1978,19 +1970,13 @@ public class XpanHook implements IXposedHookLoadPackage {
                                         driveXpanContainer();
                                     }
                                 }, 1800);
-                                // 出片尺寸切换按钮（挂在窗口右上角空白处）
-                                h.postDelayed(new Runnable() {
+                                // 自愈：清掉相册里那些指向已删文件的空图（应用此时已完全起来）
+                                new Thread(new Runnable() {
                                     @Override
                                     public void run() {
-                                        attachSizeButton();
+                                        cleanupZombieMediaRows();
                                     }
-                                }, 1500);
-                                h.postDelayed(new Runnable() {
-                                    @Override
-                                    public void run() {
-                                        attachSizeButton();
-                                    }
-                                }, 3500);
+                                }, "xpan-zombie-clean").start();
                             } else {
                                 // 退出 X-Pan：卸掉可能残留的容器视图 + 尺寸按钮，防止与其他模式界面重叠
                                 android.os.Handler h = new android.os.Handler(
@@ -1998,7 +1984,6 @@ public class XpanHook implements IXposedHookLoadPackage {
                                 h.postDelayed(new Runnable() {
                                     @Override
                                     public void run() {
-                                        removeSizeButton();
                                         cleanupXpanContainer();
                                     }
                                 }, 300);
@@ -2503,6 +2488,10 @@ public class XpanHook implements IXposedHookLoadPackage {
                 XposedBridge.log(TAG + "softcrop 删原图失败 " + name);
                 return;
             }
+            // ★ 关键：原文件（.heic）在媒体库里的记录要一起删掉。
+            //   不然相册里会多一张指向"已被删文件"的空图（用户看到的"0B 图片"就是它）——
+            //   实测：处理过的照片如果媒体库记录先建立，就会留这么一条僵尸记录。
+            forgetMediaStoreEntry(f.getAbsolutePath());
             if (!tmp.renameTo(dst)) {
                 XposedBridge.log(TAG + "softcrop 改名失败 " + name);
                 return;
@@ -2520,105 +2509,75 @@ public class XpanHook implements IXposedHookLoadPackage {
         }
     }
 
+    /** 删掉"指向已不存在文件"的媒体库记录（原文件被我们替换掉时用）。
+     *  ★ 不删的话相册里会留一张空图 —— 这就是"拍一次多一张 0B 图片"的来源：
+     *  我们把 .heic 删掉改成 .jpg，媒体库里那条 .heic 记录就成了僵尸。
+     *  （是否出现取决于时序：媒体库记录先建立就留僵尸，后建立就没有。） */
+    private static void forgetMediaStoreEntry(String path) {
+        try {
+            Context ctx = currentContext();
+            if (ctx == null) return;
+            android.content.ContentResolver cr = ctx.getContentResolver();
+            android.database.Cursor c = cr.query(
+                    android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    new String[]{"_id"}, "_data=?", new String[]{path}, null);
+            if (c != null) {
+                while (c.moveToNext()) {
+                    long id = c.getLong(0);
+                    int n = cr.delete(android.content.ContentUris.withAppendedId(
+                            android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id),
+                            null, null);
+                    XposedBridge.log(TAG + "清理媒体库记录 id=" + id + "（" + n + " 行）" + path);
+                }
+                c.close();
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "forgetMediaStoreEntry failed: " + t);
+        }
+    }
+
+    /** 启动时自愈：清掉 DCIM/Camera 里"文件已不在"的媒体库记录（老版本留下的空图）。
+     *  只动这一个目录、且只删文件确实不存在的记录，避免误伤。 */
+    private void cleanupZombieMediaRows() {
+        try {
+            Context ctx = currentContext();
+            if (ctx == null) {
+                XposedBridge.log(TAG + "自愈跳过：拿不到 Context");
+                return;
+            }
+            android.content.ContentResolver cr = ctx.getContentResolver();
+            android.database.Cursor c = cr.query(
+                    android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    new String[]{"_id", "_data"},
+                    "_data LIKE ?", new String[]{DCIM_CAMERA + "/%"}, null);
+            if (c == null) return;
+            java.util.List<Long> gone = new java.util.ArrayList<>();
+            while (c.moveToNext()) {
+                long id = c.getLong(0);
+                String p = c.getString(1);
+                if (p == null || p.contains(".trashed")) continue;
+                if (!new java.io.File(p).exists()) gone.add(id);
+            }
+            c.close();
+            for (long id : gone) {
+                cr.delete(android.content.ContentUris.withAppendedId(
+                        android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id),
+                        null, null);
+            }
+            if (!gone.isEmpty()) {
+                XposedBridge.log(TAG + "自愈：清理了 " + gone.size() + " 条失效的媒体库记录");
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "cleanupZombieMediaRows failed: " + t);
+        }
+    }
+
     /** 改完文件通知媒体库重扫（否则图库里尺寸/缩略图还是旧的） */
     private static void scanFile(String path) {
         try {
-            Class<?> at = Class.forName("android.app.ActivityThread");
-            Object app = at.getMethod("currentApplication").invoke(null);
-            if (app == null) return;
-            android.media.MediaScannerConnection.scanFile(
-                    (android.content.Context) app, new String[]{path}, null, null);
-        } catch (Throwable ignored) {
-        }
-    }
-
-    /* ---------------- X-Pan 界面上的"出片尺寸"切换按钮 ----------------
-     * 为什么做成模块自己画的按钮：相机应用里没有对应的设置项可挂，而改 HAL 流尺寸
-     * 要重建会话（必须重启相机）。所以按钮只改档位，尺寸由存盘后处理兜底 → 点一下
-     * 下张照片就生效，不用重启。按钮很小、挂在窗口 content 的右上角空白处，
-     * 进出 X-Pan 时跟着挂上/摘掉（避免残留到别的模式）。
-     */
-    private static volatile android.view.View sSizeBtn = null;
-
-    private void attachSizeButton() {
-        try {
-            if (!sXpanActive) return;
-            if (sSizeBtn != null && sSizeBtn.getParent() != null) {
-                updateSizeBtnLabel();
-                return;
-            }
-            android.view.ViewGroup host = null;
-            if (sAct instanceof android.app.Activity) {
-                android.view.View decor = ((android.app.Activity) sAct).getWindow().getDecorView();
-                android.view.View content = decor.findViewById(android.R.id.content);
-                if (content instanceof android.view.ViewGroup) host = (android.view.ViewGroup) content;
-            }
-            if (host == null) return;
-
-            android.widget.TextView tv = new android.widget.TextView(host.getContext());
-            tv.setTextColor(0xFFFFFFFF);
-            tv.setTextSize(13f);
-            tv.setPadding(30, 16, 30, 16);
-            android.graphics.drawable.GradientDrawable bg =
-                    new android.graphics.drawable.GradientDrawable();
-            bg.setColor(0x88000000);
-            bg.setCornerRadius(30);
-            bg.setStroke(2, 0xAAFFFFFF);
-            tv.setBackground(bg);
-            tv.setClickable(true);
-            tv.setOnClickListener(new android.view.View.OnClickListener() {
-                @Override
-                public void onClick(android.view.View v) {
-                    try {
-                        boolean on = !smallPicMode();
-                        setSmallPicMode(on);
-                        updateSizeBtnLabel();
-                        android.widget.Toast.makeText(v.getContext(),
-                                on ? "X-Pan 出片：4096×1512（6.2MP 小文件）"
-                                   : "X-Pan 出片：8192×3024（24.8MP 大图）",
-                                android.widget.Toast.LENGTH_SHORT).show();
-                        XposedBridge.log(TAG + "出片档位切换 -> " + (on ? "4096" : "8192"));
-                    } catch (Throwable t) {
-                        XposedBridge.log(TAG + "size button click failed: " + t);
-                    }
-                }
-            });
-            updateSizeBtnLabel();
-            android.widget.FrameLayout.LayoutParams lp =
-                    new android.widget.FrameLayout.LayoutParams(
-                            android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
-                            android.view.ViewGroup.LayoutParams.WRAP_CONTENT);
-            lp.gravity = android.view.Gravity.TOP | android.view.Gravity.END;
-            lp.topMargin = 20;
-            lp.rightMargin = 24;
-            tv.setLayoutParams(lp);
-            host.addView(tv);
-            tv.bringToFront();
-            sSizeBtn = tv;
-            XposedBridge.log(TAG + "出片尺寸按钮已挂上（" + (smallPicMode() ? "4096" : "8192") + "）");
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "attachSizeButton failed: " + t);
-        }
-    }
-
-    private static void updateSizeBtnLabel() {
-        try {
-            android.view.View v = sSizeBtn;
-            if (v instanceof android.widget.TextView) {
-                ((android.widget.TextView) v).setText(targetWidth() + "px");
-            }
-        } catch (Throwable ignored) {
-        }
-    }
-
-    private static void removeSizeButton() {
-        try {
-            android.view.View v = sSizeBtn;
-            sSizeBtn = null;
-            if (v != null && v.getParent() instanceof android.view.ViewGroup) {
-                ((android.view.ViewGroup) v.getParent()).removeView(v);
-                XposedBridge.log(TAG + "出片尺寸按钮已摘掉");
-            }
+            Context ctx = currentContext();
+            if (ctx == null) return;
+            android.media.MediaScannerConnection.scanFile(ctx, new String[]{path}, null, null);
         } catch (Throwable ignored) {
         }
     }
