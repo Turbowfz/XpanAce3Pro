@@ -2758,21 +2758,23 @@ public class XpanHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** 水印"重画"（近似方案）。
-     *  为什么不用应用的 WatermarkProcessUnit 重放：实测在裁剪线程里调
-     *  init+processImage 拿到的结果位图是 **null**（它依赖应用自己的 GL/IPU 上下文，
-     *  连复用应用实例也一样）→ 走不通，别在这上面再花时间。
-     *  近似做法：水印是画面最底部的**白色细笔画（高频）**，底下场景是低频渐变。
-     *  从原图底部按**全分辨率**抠出这一条带、做高通（减去自身大半径均值）+ 阈值，
-     *  只留下笔画，再加到成片底部 —— 场景低频不会跟过来，所以不会出现"方块接缝"。
-     *  代价（如实说明）：笔画边缘是阈值切出来的，比应用原生水印略"硬"一点；
-     *  如果原图那一带本身有强高频纹理（比如密集文字），可能带出轻微鬼影。
+    /** 水印重画：**反解白色水印的 alpha，再用 alpha 合成**（不是"高通加回去"）。
+     *  背景：水印由应用烘焙在画面最底部（约 93%~99%），中心裁剪会整条裁掉。
+     *  模型：应用是"白色半透明字"叠在画面上 —— px = base*(1-a) + 255*a，
+     *  所以只要估出 base（背景亮度），就能反解 a = (px-base)/(255-base)，
+     *  再用同一个 a 叠到成片底部 → 字的浓淡/清晰度跟原生一致。
+     *  ★ 关键坑（踩过）：估 base 的窗口半径**必须明显大于笔画宽度**。
+     *    原生水印笔画在 8192 宽下约 40px；一开始我用半径 5px，等于把字自己当背景
+     *    扣掉了 → 又淡又糊（用户报"水印不清晰"就是这个）。现在用 ~90px。
+     *  仍走不通的路（已判死）：用应用 WatermarkProcessUnit 重放 → 结果位图 null
+     *    （依赖应用自己的 GL/IPU 上下文，新建/复用实例都试过）。
+     *  开关：debug.xpan.rewatermark=0 关。
      */
     private static void stampWatermark(android.graphics.Bitmap dst, String origPath, int origW, int origH) {
         if ("0".equals(prop("debug.xpan.rewatermark"))) return;
         try {
             final int W = dst.getWidth(), H = dst.getHeight();
-            int bandH = Math.round(origH * 0.16f);            // 底部 16%（水印两行都在这条带里）
+            int bandH = Math.round(origH * 0.16f);        // 底部 16%：水印两行都在这条带里
             if (bandH < 8 || origW < 16) return;
             android.graphics.BitmapRegionDecoder dec =
                     android.graphics.BitmapRegionDecoder.newInstance(origPath, false);
@@ -2785,87 +2787,77 @@ public class XpanHook implements IXposedHookLoadPackage {
             band.getPixels(src, 0, bw, 0, 0, bw, bh);
             band.recycle();
 
-            // 竖直方向的滑动均值（半径 r）当"背景"，用 src - 背景 得高频层
-            final int r = Math.max(2, bh / 100);          // 半径要小：太大把笔画本身的低频也抹掉
-            int[] bg = new int[bw * bh];
-            long[] acc = new long[bw * 3];
-            for (int y = 0; y < bh; y++) {
-                int y0 = Math.max(0, y - r), y1 = Math.min(bh - 1, y + r);
-                if (y == 0) {
-                    java.util.Arrays.fill(acc, 0);
-                    for (int yy = y0; yy <= y1; yy++) {
-                        for (int x = 0; x < bw; x++) {
-                            int p = src[yy * bw + x];
-                            acc[x * 3] += (p >> 16) & 0xFF;
-                            acc[x * 3 + 1] += (p >> 8) & 0xFF;
-                            acc[x * 3 + 2] += p & 0xFF;
-                        }
-                    }
-                } else {
-                    int yOut = y - r - 1, yIn = y + r;
-                    if (yOut >= 0) {
-                        for (int x = 0; x < bw; x++) {
-                            int p = src[yOut * bw + x];
-                            acc[x * 3] -= (p >> 16) & 0xFF;
-                            acc[x * 3 + 1] -= (p >> 8) & 0xFF;
-                            acc[x * 3 + 2] -= p & 0xFF;
-                        }
-                    }
-                    if (yIn < bh) {
-                        for (int x = 0; x < bw; x++) {
-                            int p = src[yIn * bw + x];
-                            acc[x * 3] += (p >> 16) & 0xFF;
-                            acc[x * 3 + 1] += (p >> 8) & 0xFF;
-                            acc[x * 3 + 2] += p & 0xFF;
-                        }
-                    }
-                }
-                int n = y1 - y0 + 1;
+            int[] lum = new int[bw * bh];
+            for (int i = 0; i < lum.length; i++) {
+                int p = src[i];
+                lum[i] = (((p >> 16) & 0xFF) * 77 + ((p >> 8) & 0xFF) * 150 + (p & 0xFF) * 29) >> 8;
+            }
+            // 半径要远大于笔画宽（8192 宽下笔画 ~40px）→ 取 1.1% 宽 ≈ 90px
+            final int R = Math.max(24, Math.round(origW * 0.011f));
+            float[] tmp = new float[lum.length];
+            float[] base = new float[lum.length];
+            for (int y = 0; y < bh; y++) {                 // 横向滑动均值
+                int off = y * bw;
+                long sum = 0;
+                int lim = Math.min(bw - 1, R);
+                for (int x = 0; x <= lim; x++) sum += lum[off + x];
+                int cnt = lim + 1;
                 for (int x = 0; x < bw; x++) {
-                    int p = src[y * bw + x];
-                    int rr = (p >> 16) & 0xFF, gg = (p >> 8) & 0xFF, bb = p & 0xFF;
-                    int dr = rr - (int) (acc[x * 3] / n);
-                    int dg = gg - (int) (acc[x * 3 + 1] / n);
-                    int db = bb - (int) (acc[x * 3 + 2] / n);
-                    // 只保留"明显更亮"的笔画（水印是白字），阈值以下当背景丢掉
-                    if (dr < 18 && dg < 18 && db < 18) {
-                        bg[y * bw + x] = 0;
-                    } else {
-                        // 笔画略提亮一点（高通会让细笔画变淡）
-                        bg[y * bw + x] = 0xFF000000
-                                | (Math.min(255, Math.max(0, (int) (dr * 1.25f))) << 16)
-                                | (Math.min(255, Math.max(0, (int) (dg * 1.25f))) << 8)
-                                | Math.min(255, Math.max(0, (int) (db * 1.25f)));
-                    }
+                    tmp[off + x] = sum / (float) cnt;
+                    int add = x + R + 1, rem = x - R;
+                    if (add < bw) { sum += lum[off + add]; cnt++; }
+                    if (rem >= 0) { sum -= lum[off + rem]; cnt--; }
                 }
             }
-
-            // 贴到成片底部（等比对齐：成片宽 W，原图宽 origW）
+            for (int x = 0; x < bw; x++) {                 // 纵向滑动均值
+                long sum = 0;
+                int lim = Math.min(bh - 1, R);
+                for (int y = 0; y <= lim; y++) sum += tmp[y * bw + x];
+                int cnt = lim + 1;
+                for (int y = 0; y < bh; y++) {
+                    base[y * bw + x] = sum / (float) cnt;
+                    int add = y + R + 1, rem = y - R;
+                    if (add < bh) { sum += tmp[add * bw + x]; cnt++; }
+                    if (rem >= 0) { sum -= tmp[rem * bw + x]; cnt--; }
+                }
+            }
+            // 反解 alpha（白色水印模型）；背景本身很亮的地方（255-base 太小）无法分辨，跳过
+            float[] alpha = new float[lum.length];
+            int kept = 0;
+            for (int i = 0; i < lum.length; i++) {
+                float b = base[i];
+                float denom = 255f - b;
+                if (denom < 45f) continue;
+                float a = (lum[i] - b) / denom;
+                if (a < 0.12f) continue;                    // 低于阈值当背景噪声
+                alpha[i] = a > 1f ? 1f : a;
+                kept++;
+            }
+            // 贴回成片底部（两侧同尺寸，1:1 对齐）
             float sx = W / (float) bw, sy = H / (float) origH;
-            int dstY0 = H - Math.round(bh * sy);
+            int outH = Math.round(bh * sy);
+            int dstY0 = H - outH;
             int[] row = new int[W];
-            int[] bandRow = new int[bw];
-            for (int y = 0; y < Math.round(bh * sy); y++) {
+            for (int y = 0; y < outH; y++) {
                 int oy = Math.min(bh - 1, (int) (y / sy));
-                int[] line = new int[bw];
-                System.arraycopy(bg, oy * bw, line, 0, bw);
                 dst.getPixels(row, 0, W, 0, dstY0 + y, W, 1);
                 for (int x = 0; x < W; x++) {
                     int ox = Math.min(bw - 1, (int) (x / sx));
-                    int d = line[ox];
-                    if ((d & 0xFF000000) == 0) continue;
+                    float a = alpha[oy * bw + ox];
+                    if (a <= 0f) continue;
                     int p = row[x];
-                    int rr = Math.min(255, ((p >> 16) & 0xFF) + ((d >> 16) & 0xFF));
-                    int gg = Math.min(255, ((p >> 8) & 0xFF) + ((d >> 8) & 0xFF));
-                    int bb = Math.min(255, (p & 0xFF) + (d & 0xFF));
-                    row[x] = 0xFF000000 | (rr << 16) | (gg << 8) | bb;
+                    int r = (p >> 16) & 0xFF, g = (p >> 8) & 0xFF, b2 = p & 0xFF;
+                    r = (int) (r * (1 - a) + 255 * a);
+                    g = (int) (g * (1 - a) + 255 * a);
+                    b2 = (int) (b2 * (1 - a) + 255 * a);
+                    row[x] = 0xFF000000 | (r << 16) | (g << 8) | b2;
                 }
                 dst.setPixels(row, 0, W, 0, dstY0 + y, W, 1);
-                bandRow = line;
             }
-            XposedBridge.log(TAG + "水印笔画已贴回成片底部（band " + bw + "x" + bh + " -> y" + dstY0 + "）");
+            XposedBridge.log(TAG + "水印已按 alpha 重合成（band " + bw + "x" + bh + " R=" + R
+                    + " 有效像素 " + kept + " → y" + dstY0 + "）");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "贴水印失败（跳过）: " + t);
+            XposedBridge.log(TAG + "水印合成失败（跳过）: " + t);
         }
     }
 
