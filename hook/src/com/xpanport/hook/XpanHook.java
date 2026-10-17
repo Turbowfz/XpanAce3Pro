@@ -2908,13 +2908,23 @@ public class XpanHook implements IXposedHookLoadPackage {
             small.getPixels(px, 0, W0, 0, 0, W0, H0);
             small.recycle();
 
-            int iW0 = Math.round(W0 / FRAME_W_RATIO);
-            int iH0 = Math.round(H0 / FRAME_H_RATIO);
-            int iL0 = (W0 - iW0) / 2, iT0 = (H0 - iH0) / 2;
-            if (!marginLooksWhite(px, W0, H0, iL0, iT0, iW0, iH0)) {
-                XposedBridge.log(TAG + "画框几何校验未通过（内嵌 " + iW0 + "x" + iH0 + "）→ 放弃");
+            // ① 内嵌矩形：优先按**官方样式 JSON** 的边距参数算；横竖屏各试一种轴分配，
+            //    取通过"65:24 + 采样校验"的那个（竖屏不用手量）。
+            android.graphics.Rect innerRect = officialInnerRect(px, W0, H0);
+            if (innerRect == null) {
+                // 兜底：实测比例（卡片宽 = 内嵌宽×1.0381、卡片高 = 内嵌高×1.6534、居中）
+                int w = Math.round(W0 / FRAME_W_RATIO), h = Math.round(H0 / FRAME_H_RATIO);
+                android.graphics.Rect r = new android.graphics.Rect((W0 - w) / 2, (H0 - h) / 2,
+                        (W0 - w) / 2 + w, (H0 - h) / 2 + h);
+                if (marginLooksWhite(px, W0, H0, r.left, r.top, r.width(), r.height())) innerRect = r;
+            }
+            if (innerRect == null) {
+                XposedBridge.log(TAG + "画框几何识别失败 → 放弃（保留应用原图）");
                 return false;
             }
+            final int iW0 = innerRect.width(), iH0 = innerRect.height();
+            final int iL0 = innerRect.left, iT0 = innerRect.top;
+            XposedBridge.log(TAG + "画框内嵌识别（低分辨率）：" + iW0 + "x" + iH0 + " @ " + iL0 + "," + iT0);
             final float kx = SW / (float) W0, ky = SH / (float) H0;
             final int iL = Math.round(iL0 * kx), iT = Math.round(iT0 * ky);
             final int iW = Math.round(iW0 * kx), iH = Math.round(iH0 * ky);
@@ -2975,6 +2985,91 @@ public class XpanHook implements IXposedHookLoadPackage {
             if (innerFull != null) innerFull.recycle();
             if (cut2 != null) cut2.recycle();
             if (full != null) full.recycle();
+        }
+    }
+
+    /** 按官方画框样式 JSON 的边距参数算内嵌矩形。
+     *  官方 hassel_style_xpan_1.json：baseImageSize=291、left/rightMargin=15、top/bottomMargin=95
+     *  （实测验算：15/291×3024=155.9 ≈ 实测 156；95/291×3024=987 ≈ 实测 988 ✓）。
+     *  横竖屏各试一种轴分配（95 在垂直 / 95 在水平），取通过校验的那个 → 竖屏不用手量。 */
+    private static android.graphics.Rect officialInnerRect(int[] px, int W0, int H0) {
+        int base = 291, ml = 15, mr = 15, mt = 95, mb = 95;
+        try {
+            java.io.File f = new java.io.File(
+                    "/data/data/com.oplus.camera/files/photo_watermark/hassel_style_xpan_1.json");
+            if (f.exists() && f.length() < 1 << 20) {
+                byte[] buf = new byte[(int) f.length()];
+                java.io.FileInputStream in = new java.io.FileInputStream(f);
+                int n = 0;
+                while (n < buf.length) {
+                    int r = in.read(buf, n, buf.length - n);
+                    if (r <= 0) break;
+                    n += r;
+                }
+                in.close();
+                String js = new String(buf, 0, n, "UTF-8");
+                base = jsonNum(js, "baseImageSize", base);
+                // size 对象里的四个边距（注意别误取 elements 里的 leftMargin/rightMargin）
+                int si = js.indexOf("\"size\"");
+                if (si > 0) {
+                    String seg = js.substring(si, Math.min(js.length(), si + 300));
+                    ml = jsonNum(seg, "leftMargin", ml);
+                    mr = jsonNum(seg, "rightMargin", mr);
+                    mt = jsonNum(seg, "topMargin", mt);
+                    mb = jsonNum(seg, "bottomMargin", mb);
+                }
+                XposedBridge.log(TAG + "官方画框参数：base=" + base + " l/r=" + ml + "/" + mr
+                        + " t/b=" + mt + "/" + mb);
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "读官方画框 JSON 失败，用内置默认参数: " + t);
+        }
+        android.graphics.Rect a = innerFrom(W0, H0, base, ml, mr, mt, mb);   // 横屏语义
+        if (a != null && validInner(px, W0, H0, a)) return a;
+        android.graphics.Rect b = innerFrom(W0, H0, base, mt, mb, ml, mr);   // 竖屏语义（轴交换）
+        if (b != null && validInner(px, W0, H0, b)) return b;
+        return null;
+    }
+
+    /** 由"卡片尺寸 + 官方边距参数"推内嵌矩形：内嵌高 h 满足 H0 = h×(1+(mT+mB)/base)，
+     *  水平边距按 h 折算；位置用 (mL, mT) 折算出。 */
+    private static android.graphics.Rect innerFrom(int W0, int H0, int base,
+                                                   int mL, int mR, int mT, int mB) {
+        try {
+            if (base <= 0) return null;
+            float h = H0 / (1f + (mT + mB) / (float) base);
+            float w = W0 - (mL + mR) / (float) base * h;
+            int iw = Math.round(w), ih = Math.round(h);
+            int il = Math.round(mL / (float) base * h), it = Math.round(mT / (float) base * h);
+            if (iw < 64 || ih < 32 || il < 0 || it < 0 || il + iw > W0 || it + ih > H0) return null;
+            return new android.graphics.Rect(il, it, il + iw, it + ih);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 内嵌矩形校验：比例须是 65:24（横竖都认）+ 外侧几乎全白 + 中间有内容 */
+    private static boolean validInner(int[] px, int W0, int H0, android.graphics.Rect r) {
+        float a = r.width() / (float) r.height();
+        boolean ok65 = Math.abs(a - 65f / 24f) / (65f / 24f) <= 0.03f
+                || Math.abs(a - 24f / 65f) / (24f / 65f) <= 0.03f;
+        return ok65 && marginLooksWhite(px, W0, H0, r.left, r.top, r.width(), r.height());
+    }
+
+    /** 从 JSON 文本里取 "key":<number> 的整数值 */
+    private static int jsonNum(String js, String key, int def) {
+        try {
+            int i = js.indexOf("\"" + key + "\"");
+            if (i < 0) return def;
+            int c = js.indexOf(':', i);
+            if (c < 0) return def;
+            int e = c + 1;
+            while (e < js.length() && (Character.isDigit(js.charAt(e)) || js.charAt(e) == '-'
+                    || js.charAt(e) == '.')) e++;
+            if (e == c + 1) return def;
+            return Math.round(Float.parseFloat(js.substring(c + 1, e)));
+        } catch (Throwable t) {
+            return def;
         }
     }
 
