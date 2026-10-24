@@ -10,6 +10,7 @@ import android.util.Pair;
 
 import java.io.File;
 import java.lang.reflect.Method;
+import java.io.FileOutputStream;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -52,13 +53,16 @@ public class XpanHook implements IXposedHookLoadPackage {
     private static final String TAG = "XpanPort: ";
 
     /** ★ 热路径日志开关（性能）：每帧/每次请求都打的那种日志是实打实的开销
-     *  （logcat 写入 + 字符串拼接，实测能刷出几十万行、明显拖慢预览）。
-     *  这些一律走 dlog()，默认不打；排查时 setprop debug.xpan.diag 1 再开。 */
+     *  （logcat 写入 + 字符串拼接，实测一次拍照会话能刷几千行）。一律走 dlog()，
+     *  默认不打；排查时 setprop debug.xpan.diag 1 再开。 */
     private static volatile boolean sDiag = false;
 
     private static void dlog(String msg) {
         if (sDiag) XposedBridge.log(TAG + msg);
     }
+
+    /** 2× 真放大（配置换带）总开关，默认开；debug.xpan.configzoom=0 退回 v1.2 原始行为 */
+    private static volatile boolean sCfgZoom = true;
     private static final String PKG = "com.oplus.camera";
 
     private static final String CLS_XPAN_MODE = "com.oplus.ocs.camera.producer.mode.XpanMode";
@@ -109,7 +113,6 @@ public class XpanHook implements IXposedHookLoadPackage {
      *  实锤，无 2.0)。所以变焦 ≠1× 时拍照流回退 4096x1512（v1.1 验证过 2× 正常；
      *  2× 下真实细节本来就只有 ~2048 宽，不吃亏），1× 才用 8192x3024 大图。 */
     private static volatile float sXpanZoomReq = 1.0f;
-    /** 进模式后的这段毫秒内忽略倍率请求（那是应用恢复上次倍率，不是用户点的） */
 
     /** XPanPresenter(bh.c) 实例 —— FeatureFactory.b 的返回值，滤镜重新装配必须用它 */
     private static volatile Object sPresenter = null;
@@ -135,6 +138,7 @@ public class XpanHook implements IXposedHookLoadPackage {
         installHalSizeFix(lp);
         installSurfaceSetters(lp);
         installXpanSurfaceSize(lp);
+        installTakePictureProbe(lp);
         installXpanUiRestore(lp);
         installXpanZoomUnlock(lp);
         installXpanZoomPointFix(lp);
@@ -142,11 +146,10 @@ public class XpanHook implements IXposedHookLoadPackage {
         installXpanSwitchFix(lp);
         installXpanPanelFix(lp);
         installWatermarkIsolation(lp);
-        installModeSwitchHelper(lp);
-        installAlgoQueryTrace(lp);
-        installRequestTraceAll(lp);
+
+        // 开关一次性读好（热路径里不再反射 SystemProperties）
         sDiag = "1".equals(prop("debug.xpan.diag"));
-        installProxdrPost(lp);
+        sCfgZoom = !"0".equals(prop("debug.xpan.configzoom"));
 
         // 下面两个是排查用的取证 hook，日志量大，默认关闭。
         // 需要复现问题时：setprop debug.xpan.diag 1，重启相机即可。
@@ -250,6 +253,42 @@ public class XpanHook implements IXposedHookLoadPackage {
      *  用途：确认 2× 时拍照请求里 SCALER_CROP_REGION / com.oplus.original.zoomRatio 的真实值。 */
     private static final java.util.Set<String> sProbeSeen = new java.util.HashSet<>();
 
+    /** 诊断: 拍照时刻的 CameraRequestTag.mZoomRatio(拍照链路真正用的变焦值)。 */
+    private void installTakePictureProbe(XC_LoadPackage.LoadPackageParam lp) {
+        try {
+            Class<?> c = Class.forName("com.oplus.ocs.camera.producer.device.Camera2Impl",
+                    false, lp.classLoader);
+            int n = 0;
+            for (Method m : c.getDeclaredMethods()) {
+                if (!"takePicture".equals(m.getName()) || m.getParameterTypes().length != 5) continue;
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        try {
+                            if (!sXpanActive) return;
+                            Object tag = param.args[0];
+                            XposedBridge.log(TAG + "takePicture tag.mZoomRatio="
+                                    + field(tag, "mZoomRatio") + " sXpanZoomReq=" + sXpanZoomReq
+                                    + " tag.mXpanMfllOutputSize=" + field(tag, "mXpanMfllOutputSize"));
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                });
+                n++;
+            }
+            XposedBridge.log(TAG + "hook installed OK (takePicture probe x" + n + ")");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "!! takePicture probe failed: " + t);
+        }
+    }
+
+    private static String fmtValue(Object v) {
+        if (v == null) return "null";
+        if (v instanceof int[]) return java.util.Arrays.toString((int[]) v);
+        if (v instanceof android.graphics.Rect) return "Rect" + v;
+        return String.valueOf(v);
+    }
+
     private void installRequestProbe(XC_LoadPackage.LoadPackageParam lp) {
         try {
             Class<?> cls = Class.forName("android.hardware.camera2.CaptureRequest$Builder",
@@ -264,14 +303,43 @@ public class XpanHook implements IXposedHookLoadPackage {
                         String name = String.valueOf(param.args[0]);
                         String ln = name.toLowerCase();
                         if (!ln.contains("crop") && !ln.contains("zoom")
-                                && !ln.contains("jpeg") && !ln.contains("raw")) return;
-                        Object v = param.args[1];
-                        String sig = name + " = " + (v instanceof android.graphics.Rect
-                                ? "Rect" + v : String.valueOf(v));
+                                && !ln.contains("only.") && !ln.contains("bpc")) return;
+                        String sig = name + " = " + fmtValue(param.args[1]);
                         synchronized (sProbeSeen) {
-                            if (sProbeSeen.size() >= 200 || !sProbeSeen.add(sig)) return;
+                            if (sProbeSeen.size() >= 300 || !sProbeSeen.add(sig)) return;
                         }
                         XposedBridge.log(TAG + "req.set " + sig);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+            // build() 之后把请求里所有变焦/裁剪相关的最终值打出来（含框架补的 SCALER_CROP_REGION）
+            Method build = cls.getDeclaredMethod("build");
+            XposedBridge.hookMethod(build, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    try {
+                        if (!sXpanActive) return;
+                        Object req = param.getResult();
+                        if (req == null) return;
+                        Method getKeys = req.getClass().getMethod("getKeys");
+                        Object keys = getKeys.invoke(req);
+                        if (!(keys instanceof java.util.Set)) return;
+                        StringBuilder sb = new StringBuilder();
+                        for (Object k : (java.util.Set<?>) keys) {
+                            String kn = String.valueOf(k).toLowerCase();
+                            if (!kn.contains("crop") && !kn.contains("zoom")) continue;
+                            Method get = req.getClass().getMethod("get",
+                                    android.hardware.camera2.CaptureRequest.Key.class);
+                            Object v = get.invoke(req, k);
+                            sb.append(String.valueOf(k)).append('=').append(fmtValue(v)).append(" | ");
+                        }
+                        if (sb.length() == 0) return;
+                        String sig = "BUILT " + sb;
+                        synchronized (sProbeSeen) {
+                            if (sProbeSeen.size() >= 400 || !sProbeSeen.add(sig)) return;
+                        }
+                        XposedBridge.log(TAG + "req.build " + sig);
                     } catch (Throwable ignored) {
                     }
                 }
@@ -358,20 +426,6 @@ public class XpanHook implements IXposedHookLoadPackage {
         }
         return null;
     }
-
-    /** 沿继承链写字段 */
-    private static void setField(Object o, String name, Object v) {
-        for (Class<?> c = o.getClass(); c != null; c = c.getSuperclass()) {
-            try {
-                java.lang.reflect.Field f = c.getDeclaredField(name);
-                f.setAccessible(true);
-                f.set(o, v);
-                return;
-            } catch (Throwable ignored) {
-            }
-        }
-    }
-
 
     /* ---------------- 修复：拍完一张后把 X-Pan 界面状态机推回常态 ----------------
      * 病因（实机取证，2026-10-05）：
@@ -725,114 +779,6 @@ public class XpanHook implements IXposedHookLoadPackage {
      *   小于 1× 的请求不动 —— 0.6× 靠切换超广角镜头实现，不经过这个函数；
      *   变焦条上那个值为 0.0 的坏档位也落在这边，会保持原来的 1.0，不会把画面搞黑。
      */
-    private static final float XPAN_MAX_ZOOM = 3.0f;
-
-    private void installXpanZoomUnlock(XC_LoadPackage.LoadPackageParam lp) {
-        try {
-            Class<?> c = Class.forName("fh.g", false, lp.classLoader);
-            int n = 0;
-            for (Method m : c.getDeclaredMethods()) {
-                Class<?>[] pt = m.getParameterTypes();
-                if (!"f".equals(m.getName()) || pt.length != 1 || !float.class.equals(pt[0])) continue;
-                XposedBridge.hookMethod(m, new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
-                    try {
-                        if (!sXpanActive) return;
-                        if (param.getResult() == null) return;
-                        float want = (Float) param.args[0];
-                        if (want < 1.0f) return;                 // 0.6× / 坏档位 0.0 都保持原样
-                        // ★ 应用自己的倍率**钉在 1×**。为什么：放开让它变 2× 会被应用持久化，
-                        //   而且 X-Pan 的变焦条点 "1×"/拖条都退不回来（实测卡在 2× 出不来）。
-                        //   用户意图从**请求值**读：点 2× 当开关（在 1×/2× 之间切），点 1× 回 1×。
-                        //   出片尺寸（2× 时 4096）跟的是 sXpanZoomReq，不是应用的倍率。
-                        if (want >= 1.0f) sXpanZoomReq = want;   // 记录当前变焦档（拍照流尺寸/出片尺寸用）
-                            float got = (Float) param.getResult();
-                            if (got >= want) return;                 // 没被钳制，不用管
-                            float fixed = Math.min(want, XPAN_MAX_ZOOM);
-                            param.setResult(fixed);
-                        } catch (Throwable ignored) {
-                        }
-                    }
-                });
-                n++;
-            }
-            XposedBridge.log(TAG + "hook installed OK (xpan zoom unlock x" + n + ")");
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "!! xpan zoom unlock failed: " + t);
-        }
-    }
-
-    /* ---------------- 修复：X-Pan 变焦条多出来的坏档位（显示成 "0"） ----------------
-     * 病因（实机取证 2026-10-06）：
-     *   变焦条日志 initZoomPointMap clickValues: [0.6, 1.0, 0.0, 2.0]
-     *   → mZoomPointMap {ULTRA_WIDE=0.6, WIDE=1.0, DUAL=0.0, TELE=2.0}
-     *   第 3 档 DUAL 的值来自 y5.a$b 的静态初始化：
-     *       CameraConfig.e("com.oplus.dual.zoom.value")
-     *   而这个键在本机任何相机配置里都不存在（只在 APK 里作为字符串出现），
-     *   于是取到默认 0.0 → 按钮文字渲染成 "0"、点了也不生效。
-     *   普通照片模式的档位列表只有 3 项（0.6/1/2），所以那边正常。
-     *
-     * 做法：在档位列表交给变焦条之前，把不要的档位剔掉 ——
-     *   1) ≤0 的非法档位（DUAL=0.0 那个渲染成 "0" 的按钮）；
-     *   2) <1.0 的档位 = 0.6× 超广角，按用户要求删掉（2026-10-06）：本机超广角的 X-Pan 成像
-     *      通路没被 OPPO 调过，出片绿帧/噪声不可靠，X-Pan 只留 1×/2×。
-     *   只动值列表、不动 IconType 顺序 —— 按钮文字取的是"值"，
-     *   所以剔掉后是 1 | 2，点按映射也不会错位。
-     */
-    private void installXpanZoomPointFix(XC_LoadPackage.LoadPackageParam lp) {
-        try {
-            Class<?> c = Class.forName("com.oplus.camera.feature.zoom.view.ZoomSeekBar",
-                    false, lp.classLoader);
-            int n = 0;
-            for (Method m : c.getDeclaredMethods()) {
-                if (!"R8".equals(m.getName()) || m.getParameterTypes().length != 18) continue;
-                XposedBridge.hookMethod(m, new XC_MethodHook() {
-                    @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
-                        try {
-                            if (!sXpanActive || param.args == null) return;
-                            // 注：实测 R8 每次 X-Pan 会话只被调 6 次左右，不是热路径，
-                            // 所以这里老实扫一遍参数即可 —— 曾经想"缓存参数下标"提速，
-                            // 结果参数顺序不稳定、下标指错列表，0.6× 又冒出来了。
-                            for (Object a : param.args) {
-                                if (!(a instanceof List)) continue;
-                                List<?> list = (List<?>) a;
-                                if (hasBadZoomPoint(list)) filterBadZoomPoints(list);
-                            }
-                        } catch (Throwable ignored) {
-                        }
-                    }
-                });
-                n++;
-            }
-            XposedBridge.log(TAG + "hook installed OK (xpan zoom point fix x" + n + ")");
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "!! xpan zoom point fix failed: " + t);
-        }
-    }
-
-    /** 档位列表里是否还有需要剔除的档位（≤0 非法 / <1.0 的 0.6× 超广角） */
-    private static boolean hasBadZoomPoint(List<?> list) {
-        for (int i = list.size() - 1; i >= 0; i--) {
-            Object v = list.get(i);
-            if (v instanceof Float && ((Float) v) < 1.0f) return true;
-        }
-        return false;
-    }
-
-    private static void filterBadZoomPoints(List<?> list) {
-        for (int i = list.size() - 1; i >= 0; i--) {
-            Object v = list.get(i);
-            if (!(v instanceof Float)) continue;
-            float f = (Float) v;
-            if (f >= 1.0f) continue;   // 保留 1× 及以上
-            list.remove(i);
-            XposedBridge.log(TAG + "xpan 变焦条剔掉档位 " + v
-                    + (f <= 0f ? "（非法）" : "（0.6× 超广角，按要求删除）"));
-        }
-    }
-
     /* ==================================================================================
      *  水印按模式隔离：X-Pan 的水印设置与拍照等其他模式各记各的
      * ----------------------------------------------------------------------------------
@@ -1090,893 +1036,172 @@ public class XpanHook implements IXposedHookLoadPackage {
         }
     }
 
-    /* ==================================================================================
-     *  X-Pan 出片后处理：ProXDR 增益图调整（2026-10-18，用户要求）
-     * ----------------------------------------------------------------------------------
-     * ① ratioMax 提到 8 倍 → ProXDR 高光更亮
-     * ② 修"水印条 ProXDR 不均匀"：增益图在水印条上是"白底有提升、文字笔画没有"（导出增益图
-     *    看过，白底被赋了很高的值 → 发光；文字是 0）→ 把水印条那几行的增益图图块引用
-     *    全部改成指向增益图里最平最暗的一块，整条水印就均匀了。
-     *
-     * 做法：**纯元数据 / 引用改写，不重编码、不动像素**（SDR 底图、EXIF、ICC 一个字节都不动）——
-     *   ① 增益图强度参数在 HEIF 的 `tmap` 项载荷里（62 字节）：ratio 是 log2 值，
-     *      定点编码 = log2 × 2^21，大端 4 字节；同文件 XMP 里还有 GainMapMax / HDRCapacityMax
-     *      两个定宽字符串，一起改保持一致。
-     *   ② 增益图网格的载荷在 meta/idat 里（iloc 的 construction_method=1），内容是
-     *      "行数-1, 列数-1, 输出宽, 输出高, 图块id×N" —— 长度不变，可以纯原位改。
-     * 开关：debug.xpan.proxdr=0 关闭；debug.xpan.proxdr.ratio=8 指定目标倍率（默认 8）
-     */
-    private static final String PX_TMAP_TYPE = "tmap";
+    /* ---------------- 2× 真放大：配置换带 + 会话重建（方案A） ----------------
+     * 原理（2026-10-18 实测定论）：X-Pan 的裁剪窗口取自配置 tag
+     *   com.oplus.xpan.crop.region.main.{landscape,portrait}，应用在**会话建立时**读一次就定死；
+     *   每次拍照改请求参数完全无效（日志确认应用收到正确窗口、出片视野仍 1.00×），
+     *   唯一有效的杠杆是**换配置 + 让会话重建**（实测 FOV 尺度 0.50 = 真 2×）。
+     * 分工：本 hook 只负责识别用户意图写请求文件 + 把应用自身倍率钉在 1×
+     *   （否则预览会在已裁窄的流上再放大一次 = 4×）；换配置和模式往返由模块里的
+     *   root 脚本 crop_watch.sh 做（应用进程 setprop debug.* 会被拒，只能走文件）。 */
+    private static final String CROP_REQ_FILE =
+            "/sdcard/Android/data/com.oplus.camera/files/xpan_cropzoom";
+    private static final String CROP_BUSY_FILE =
+            "/sdcard/Android/data/com.oplus.camera/files/xpan_cropzoom_busy";
+    /** 当前档位：1 = 1×，2 = 2×（点 "2" chip 当开关：点一下切 2×、再点回 1×） */
+    private static volatile int sCropZoom = 1;
+    /** 换配置/重建会话期间及冷却期：忽略"应用把倍率复位成 1×"那种请求（防打架） */
+    private static volatile long sZoomIgnoreUntil = 0L;
 
-    /** 解析出来的 HEIF 结构（只读，够用就行） */
-    private static final class Hx {
-        byte[] d;
-        java.util.HashMap<Integer, String> types = new java.util.HashMap<>();
-        java.util.HashMap<Integer, int[]> ext = new java.util.HashMap<>();   // id -> {cm, off, len}
-        java.util.HashMap<Integer, int[]> extField = new java.util.HashMap<>(); // id -> {offPos, offSz, lenPos, lenSz}
-        java.util.HashMap<Integer, int[]> dimg = new java.util.HashMap<>();  // from -> ids
-        java.util.HashMap<Integer, int[]> dimgPos = new java.util.HashMap<>(); // from -> {idsPos, count}
-        int pitm = -1;
-        int idatData = -1;                                                   // idat 载荷起点
-    }
-
-    /** 基图网格声明的输出宽高（水印条不算在内；解码高度比它大 = 有水印条）。
-     *  宽高比还能认模式：65:24 宽幅（≈2.71）就是 X-Pan 出片。 */
-    private static int[] hxBaseGridOutWH(Hx h) {
+    private static boolean cropBusy() {
         try {
-            int[] gex = h.ext.get(h.pitm);
-            if (gex == null || gex[0] != 1 || h.idatData < 0) return new int[]{-1, -1};
-            int pay = h.idatData + gex[1];
-            return new int[]{hxBe16(h.d, pay + 4), hxBe16(h.d, pay + 6)};
+            if (System.currentTimeMillis() < sZoomIgnoreUntil) return true;
+            return new File(CROP_BUSY_FILE).exists();
         } catch (Throwable t) {
-            return new int[]{-1, -1};
-        }
-    }
-
-    private static void hxBe32Put(byte[] b, int o, int v) {
-        b[o] = (byte) (v >>> 24);
-        b[o + 1] = (byte) (v >>> 16);
-        b[o + 2] = (byte) (v >>> 8);
-        b[o + 3] = (byte) v;
-    }
-
-    /** 找 iprp/ipco 里"面积最大"的 ispe（= 主图的声明输出尺寸），返回 {盒位置, 宽, 高}。
-     *  用途：应用把 X-Pan 的声明尺寸虚标成 8192x3528，而实际编码只有 4096x1764（网格真实尺寸）
-     *  —— 2× 出片时把声明尺寸改回真实值，出片就是原生 4096 像素（不是放大出来的）。 */
-    private static int[] hxMainIspe(Hx h) {
-        try {
-            byte[] d = h.d;
-            int[] meta = null;
-            for (int[] b : hxKids(d, 0, d.length)) {
-                if (hxType(d, b[0]).equals("meta")) {
-                    meta = b;
-                    break;
-                }
-            }
-            if (meta == null) return null;
-            int ms = meta[0] + meta[2] + 4, me = meta[0] + meta[1];
-            int[] iprp = hxFind(d, ms, me, "iprp");      // iprp/ipco 都是普通盒（子盒从 +8 起）
-            if (iprp == null) return null;
-            int[] ipco = hxFind(d, iprp[0] + 8, iprp[0] + iprp[1], "ipco");
-            if (ipco == null) return null;
-            int best = -1;
-            long bestArea = -1;
-            for (int[] b : hxKids(d, ipco[0] + 8, ipco[0] + ipco[1])) {
-                if (!hxType(d, b[0]).equals("ispe")) continue;
-                int w = hxBe32(d, b[0] + 12), hh = hxBe32(d, b[0] + 16);
-                long area = (long) w * hh;
-                if (area > bestArea) {
-                    bestArea = area;
-                    best = b[0];
-                }
-            }
-            if (best < 0) return null;
-            return new int[]{best, hxBe32(d, best + 12), hxBe32(d, best + 16)};
-        } catch (Throwable t) {
-            return null;
-        }
-    }
-
-    /** 找**与主图网格尺寸一致**的那个 ispe —— 解码器实际用的就是它。
-     *  ⚠️ 文件里往往有两个尺寸 ispe：一个是应用写的"目标尺寸"（例如 8192x3024），
-     *  另一个才是主图项真正关联的（= 网格的编码尺寸，例如 4096x1512）。
-     *  实测：改"最大那个"没用（解码器不认），必须改跟网格尺寸一致的那个。 */
-    private static int[] hxIspeOfSize(Hx h, int w, int hh) {
-        try {
-            byte[] d = h.d;
-            int[] meta = null;
-            for (int[] b : hxKids(d, 0, d.length)) {
-                if (hxType(d, b[0]).equals("meta")) {
-                    meta = b;
-                    break;
-                }
-            }
-            if (meta == null) return null;
-            int ms = meta[0] + meta[2] + 4, me = meta[0] + meta[1];
-            int[] iprp = hxFind(d, ms, me, "iprp");
-            if (iprp == null) return null;
-            int[] ipco = hxFind(d, iprp[0] + 8, iprp[0] + iprp[1], "ipco");
-            if (ipco == null) return null;
-            for (int[] b : hxKids(d, ipco[0] + 8, ipco[0] + ipco[1])) {
-                if (!hxType(d, b[0]).equals("ispe")) continue;
-                int ww = hxBe32(d, b[0] + 12), hh2 = hxBe32(d, b[0] + 16);
-                if (ww == w && hh2 == hh) return new int[]{b[0], ww, hh2};
-            }
-            return hxMainIspe(h);      // 兜底：找不到就退回"最大那个"
-        } catch (Throwable t) {
-            return null;
-        }
-    }
-
-    private static int hxBe32(byte[] b, int o) {
-        return ((b[o] & 255) << 24) | ((b[o + 1] & 255) << 16) | ((b[o + 2] & 255) << 8) | (b[o + 3] & 255);
-    }
-
-    private static int hxBe16(byte[] b, int o) {
-        return ((b[o] & 255) << 8) | (b[o + 1] & 255);
-    }
-
-    /** 在 [start,end) 里遍历直接子 box，回填到 list：{off, size, hdr}；name 为 null 表示全都要 */
-    private static java.util.List<int[]> hxKids(byte[] d, int start, int end) {
-        java.util.List<int[]> out = new java.util.ArrayList<>();
-        int o = start;
-        while (o + 8 <= end) {
-            long sz = hxBe32(d, o) & 0xFFFFFFFFL;
-            int hdr = 8;
-            if (sz == 1) {
-                sz = 0;
-                for (int i = 0; i < 8; i++) sz = (sz << 8) | (d[o + 8 + i] & 255);
-                hdr = 16;
-            } else if (sz == 0) {
-                sz = end - o;
-            }
-            if (sz < hdr || o + sz > end) break;
-            out.add(new int[]{o, (int) sz, hdr});
-            o += (int) sz;
-        }
-        return out;
-    }
-
-    private static int[] hxFind(byte[] d, int start, int end, String name) {
-        for (int[] b : hxKids(d, start, end)) {
-            String t = new String(d, b[0] + 4, 4, java.nio.charset.StandardCharsets.ISO_8859_1);
-            if (t.equals(name)) return b;
-        }
-        return null;
-    }
-
-    private static String hxType(byte[] d, int off) {
-        return new String(d, off + 4, 4, java.nio.charset.StandardCharsets.ISO_8859_1);
-    }
-
-    private static Hx hxParse(byte[] d) {
-        try {
-            Hx h = new Hx();
-            h.d = d;
-            int[] meta = null, mdat = null;
-            for (int[] b : hxKids(d, 0, d.length)) {
-                String t = hxType(d, b[0]);
-                if (t.equals("meta")) meta = b;
-                else if (t.equals("mdat")) mdat = b;
-            }
-            if (meta == null || mdat == null) return null;
-            int ms = meta[0] + meta[2] + 4, me = meta[0] + meta[1];
-            int[] iinf = hxFind(d, ms, me, "iinf");
-            int[] iloc = hxFind(d, ms, me, "iloc");
-            int[] iref = hxFind(d, ms, me, "iref");
-            int[] pitm = hxFind(d, ms, me, "pitm");
-            int[] idat = hxFind(d, ms, me, "idat");
-            if (iinf == null || iloc == null || pitm == null) return null;
-            if (idat != null) h.idatData = idat[0] + idat[2];
-            // iinf: id -> type
-            int p = iinf[0] + 12;
-            int cnt = hxBe16(d, p);
-            p += 2;
-            for (int i = 0; i < cnt; i++) {
-                int isz = hxBe32(d, p);
-                h.types.put(hxBe16(d, p + 12), new String(d, p + 16, 4,
-                        java.nio.charset.StandardCharsets.ISO_8859_1));
-                p += isz;
-            }
-            // pitm
-            h.pitm = (d[pitm[0] + 8] == 0) ? hxBe16(d, pitm[0] + 12) : hxBe32(d, pitm[0] + 12);
-            // iref dimg
-            if (iref != null) {
-                for (int[] b : hxKids(d, iref[0] + iref[2] + 4, iref[0] + iref[1])) {
-                    if (!hxType(d, b[0]).equals("dimg")) continue;
-                    int frm = hxBe16(d, b[0] + 8), n = hxBe16(d, b[0] + 10);
-                    int[] ids = new int[n];
-                    for (int i = 0; i < n; i++) ids[i] = hxBe16(d, b[0] + 12 + 2 * i);
-                    h.dimg.put(frm, ids);
-                    h.dimgPos.put(frm, new int[]{b[0] + 12, n});
-                }
-            }
-            // iloc
-            int ver = d[iloc[0] + 8];
-            int q = iloc[0] + 12;
-            int b1 = d[q] & 255, b2 = d[q + 1] & 255;
-            q += 2;
-            int n2 = (ver < 2) ? hxBe16(d, q) : hxBe32(d, q);
-            q += (ver < 2) ? 2 : 4;
-            int offsz = b1 >> 4, lensz = b1 & 15, basesz = b2 >> 4, idxsz = b2 & 15;
-            for (int i = 0; i < n2; i++) {
-                int id = (ver < 2) ? hxBe16(d, q) : hxBe32(d, q);
-                q += (ver < 2) ? 2 : 4;
-                int cm = 0;
-                if (ver == 1 || ver == 2) {
-                    cm = hxBe16(d, q);
-                    q += 2;
-                }
-                q += 2;
-                int base = 0;
-                for (int k = 0; k < basesz; k++) base = (base << 8) | (d[q + k] & 255);
-                q += basesz;
-                int ec = hxBe16(d, q);
-                q += 2;
-                int off = 0, len = 0;
-                for (int e = 0; e < ec; e++) {
-                    if (idxsz > 0) q += idxsz;
-                    int opos = q, o1 = 0;
-                    for (int k = 0; k < offsz; k++) o1 = (o1 << 8) | (d[q + k] & 255);
-                    q += offsz;
-                    int lpos = q, l1 = 0;
-                    for (int k = 0; k < lensz; k++) l1 = (l1 << 8) | (d[q + k] & 255);
-                    q += lensz;
-                    if (e == 0) {
-                        off = base + o1;
-                        len = l1;
-                        if (cm == 0 && offsz > 0 && lensz > 0) {
-                            h.extField.put(id, new int[]{opos, offsz, lpos, lensz});
-                        }
-                    }
-                }
-                h.ext.put(id, new int[]{cm, off, len});
-            }
-            return h;
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "HEIF 解析失败: " + t);
-            return null;
-        }
-    }
-
-    /** ① 改 ratioMax：tmap 项载荷里的定点值 + XMP 里的同名字符串。
-     *  值 = log2(ratio) 的定点编码（×2^21），大端 4 字节；载荷里出现两处（base/alt）。
-     *  不硬编码偏移：用解码器读到的当前 ratioMax 算出字节，在载荷里精确匹配替换。 */
-    private static boolean pxPatchRatioMax(Hx h, float ratio, float curRatio, StringBuilder log) {
-        try {
-            int[] ex = null;
-            for (java.util.Map.Entry<Integer, String> e : h.types.entrySet()) {
-                if (PX_TMAP_TYPE.equals(e.getValue())) {
-                    ex = h.ext.get(e.getKey());
-                    break;
-                }
-            }
-            if (ex == null || ex[0] != 0) {
-                log.append("没找到 tmap 项载荷; ");
-                return false;
-            }
-            int off = ex[1], len = ex[2];
-            if (len < 20 || len > 4096) {
-                log.append("tmap 载荷长度异常 ").append(len).append("; ");
-                return false;
-            }
-            double log2Now = Math.log(curRatio > 1.0f ? curRatio : 4.956563f) / Math.log(2.0);
-            double log2New = Math.log(ratio) / Math.log(2.0);
-            // 定点标度按文件自己探测：实测同一台相机 X-Pan 出片是 ×2^21、拍照模式出片是 ×2^23
-            // （设备上跑两个变体验证过：×2^23 那版解码器读出来正好 8.0，×2^21 那版读出来 1.68）
-            int scaleBits = 0, nowFixed = 0;
-            for (int k : new int[]{21, 23, 22}) {
-                int v = (int) Math.round(log2Now * (1 << k));
-                if (v <= 0) continue;
-                byte[] p = new byte[]{(byte) (v >> 24), (byte) (v >> 16), (byte) (v >> 8), (byte) v};
-                int at = hxIndexOfFrom(h.d, p, off);
-                if (at >= 0 && at + 4 <= off + len) {
-                    scaleBits = k;
-                    nowFixed = v;
-                    break;
-                }
-            }
-            if (scaleBits == 0) {
-                log.append("tmap 里没匹配到 ratioMax 字节（当前 ").append(curRatio).append("）; ");
-                return false;
-            }
-            int newFixed = (int) Math.round(log2New * (1 << scaleBits));
-            byte[] pat = new byte[]{(byte) (nowFixed >> 24), (byte) (nowFixed >> 16),
-                    (byte) (nowFixed >> 8), (byte) nowFixed};
-            byte[] rep = new byte[]{(byte) (newFixed >> 24), (byte) (newFixed >> 16),
-                    (byte) (newFixed >> 8), (byte) newFixed};
-            int patched = 0;
-            for (int i = 0; i + 4 <= len; i++) {
-                boolean hit = true;
-                for (int k = 0; k < 4; k++) {
-                    if (h.d[off + i + k] != pat[k]) {
-                        hit = false;
-                        break;
-                    }
-                }
-                if (!hit) continue;
-                System.arraycopy(rep, 0, h.d, off + i, 4);
-                patched++;
-            }
-            if (patched == 0) {
-                log.append("tmap 里没匹配到 ratioMax 字节（当前 ").append(curRatio).append("）; ");
-                return false;
-            }
-            log.append("ratioMax ").append(curRatio).append("→").append(ratio)
-                    .append("（定点 ×2^").append(scaleBits).append("，改了 ").append(patched)
-                    .append(" 处）; ");
-            // XMP 里的两个同名字符串（"%.6f" 定宽，只在长度一致时原位替换，宁可不改也不写坏）
-            String val = String.format(java.util.Locale.US, "%.6f", log2New);
-            String valOld = String.format(java.util.Locale.US, "%.6f", log2Now);
-            int xmpChanged = 0;
-            for (String key : new String[]{"GainMapMax=\"", "HDRCapacityMax=\""}) {
-                byte[] kb = key.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
-                byte[] ob = valOld.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
-                byte[] nb = val.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
-                int i = hxIndexOf(h.d, kb);
-                while (i >= 0) {
-                    int q = i + kb.length;
-                    if (ob.length == nb.length && q + ob.length <= h.d.length) {
-                        boolean same = true;
-                        for (int k = 0; k < ob.length; k++) if (h.d[q + k] != ob[k]) same = false;
-                        if (same) {
-                            System.arraycopy(nb, 0, h.d, q, nb.length);
-                            xmpChanged++;
-                        }
-                    }
-                    i = hxIndexOfFrom(h.d, kb, q);
-                }
-            }
-            if (xmpChanged > 0) log.append("XMP 字符串改了 ").append(xmpChanged).append(" 处; ");
             return true;
-        } catch (Throwable t) {
-            log.append("改 ratioMax 失败: ").append(t).append("; ");
-            return false;
         }
     }
 
-    private static int hxIndexOf(byte[] d, byte[] pat) {
-        return hxIndexOfFrom(d, pat, 0);
-    }
-
-    private static int hxIndexOfFrom(byte[] d, byte[] pat, int from) {
-        outer:
-        for (int i = Math.max(0, from); i + pat.length <= d.length; i++) {
-            for (int k = 0; k < pat.length; k++) {
-                if (d[i + k] != pat[k]) continue outer;
-            }
-            return i;
-        }
-        return -1;
-    }
-
-    /** 出片后处理（读文件 → 打补丁 → 写回）。返回 true = 已经写回。
-     *  ⚠️ 相机是"先写一版 SDR、过一会儿整份重写成带增益图的最终版"的：
-     *  抓到第一版时容器里**没有 tmap 项**，这时不能动它（返回 false，等它重写）。 */
-    private static boolean pxPostProcess(java.io.File f, float zoom) {
-        StringBuilder log = new StringBuilder();
+    /** 把"用户要哪一档"写给 root 脚本（脚本负责换配置 + 模式往返重建会话） */
+    private static void writeCropRequest(int zoom) {
         try {
-            if (f == null || !f.exists() || f.length() < 20000) return true;   // 没得处理，别再重试
-            if (!isHeifLike(f)) {
-                log.append("不是 HEIF，跳过; ");
-                return true;
-            }
-            byte[] data = pxReadAll(f);
-            long len0 = (data != null) ? data.length : -1;
-            Hx h = (data != null) ? hxParse(data) : null;
-            if (h == null) {
-                XposedBridge.log(TAG + "ProXDR 后处理：容器读不全（可能还在写），稍后重试");
-                return false;
-            }
-            boolean hasTmap = false;
-            for (String t : h.types.values()) if (PX_TMAP_TYPE.equals(t)) { hasTmap = true; break; }
-            if (!hasTmap) {
-                XposedBridge.log(TAG + "ProXDR 后处理：这一版还没有增益图（相机第一版），等它重写");
-                return false;
-            }
-            float ratio = 8.0f;
-            try {
-                String p = prop("debug.xpan.proxdr.ratio");
-                if (p != null && p.length() > 0) ratio = Float.parseFloat(p.trim());
-            } catch (Throwable ignored) {
-            }
-            // ★ 不再解 getGainmapContents()：那张 bitmap 是 4096x1512(≈24MB)，而它的唯一用途
-            //   （压平增益图）已经删掉了 —— 现在只需要 Gainmap 对象上的 ratioMax。省内存也省时间。
-            int decHeight = 0;
-            float curRatio = 4.956563f;
-            final int[] realH = new int[1];
-            try {
-                android.graphics.Bitmap b = android.graphics.ImageDecoder.decodeBitmap(
-                        android.graphics.ImageDecoder.createSource(f),
-                        new android.graphics.ImageDecoder.OnHeaderDecodedListener() {
-                            @Override
-                            public void onHeaderDecoded(android.graphics.ImageDecoder d,
-                                                        android.graphics.ImageDecoder.ImageInfo info,
-                                                        android.graphics.ImageDecoder.Source src) {
-                                d.setAllocator(android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE);
-                                // 全尺寸解码 8192x3528 要 ~100MB，相机进程吃不消；
-                                // 主体图缩到 1/4，尺寸从 header 拿，增益图按自己的尺寸解
-                                try {
-                                    android.util.Size sz = info.getSize();
-                                    if (sz != null && sz.getWidth() > 0) {
-                                        realH[0] = sz.getHeight();
-                                        if (sz.getWidth() > 2048) {
-                                            d.setTargetSize(sz.getWidth() / 4, sz.getHeight() / 4);
-                                        }
-                                    }
-                                } catch (Throwable ignored) {
-                                }
-                            }
-                        });
-                if (b != null) {
-                    decHeight = realH[0] > 0 ? realH[0] : b.getHeight();
-                    android.graphics.Gainmap gm = b.getGainmap();
-                    if (gm != null) {
-                        float[] rm = gm.getRatioMax();
-                        if (rm != null && rm.length > 0 && rm[0] > 1.0f) curRatio = rm[0];
-                    }
-                }
-            } catch (Throwable t) {
-                log.append("读增益图失败: ").append(t).append("; ");
-            }
-            int[] gwh0 = hxBaseGridOutWH(h);
-            boolean xpanShot0 = gwh0[0] > 0 && gwh0[1] > 0 && gwh0[0] >= gwh0[1] * 2;
-            // ★ 出片尺寸（用户要求：1× = 8192、2× = 4096），自己写"声明尺寸"。
-            //   背景：X-Pan 拍照流默认 4096x1512（干净通路，见 captureSize 注释 —— 8192 那条
-            //   全分辨率 remosaic 通路自带 2~3 像素双线重影）。而应用会把"声明尺寸"跟着拍照流走，
-            //   于是 1× 也变成 4096。这里改回来：
-            //     1× → 网格的 2 倍（8192 宽，等同应用原来的口径，解码器放大 2 倍输出）
-            //     2× → 网格本身（4096 宽，原生像素，不放大）
-            //   网格真实尺寸 gwh0 就是编码尺寸（4096x1512 或 4096x1764），所以两者都不损失真实细节。
-            if (xpanShot0 && gwh0[0] > 0 && gwh0[1] > 0) {
-                int[] ispe = hxIspeOfSize(h, gwh0[0], gwh0[1]);
-                if (ispe != null && ispe[1] > 0 && ispe[2] > 0 && zoom > 1.5f) {
-                    boolean x2 = true;
-                    int wantW = gwh0[0];
-                    int wantH = gwh0[1];
-                    if (ispe[1] != wantW || ispe[2] != wantH) {
-                        hxBe32Put(h.d, ispe[0] + 12, wantW);
-                        hxBe32Put(h.d, ispe[0] + 16, wantH);
-                        log.append("出片尺寸 ").append(ispe[1]).append("x").append(ispe[2])
-                                .append(" → ").append(wantW).append("x").append(wantH)
-                                .append(x2 ? "（2× 原生像素）; " : "（1× 网格×2）; ");
-                    }
-                }
-            }
-            // ★ ratioMax：**X-Pan 用系统默认值**（用户 2026-10-18 明确要求，不提 8 倍）；
-            //   其它模式按用户之前的要求提到 8 倍（只升不降）。
-            if (xpanShot0) {
-                log.append("X-Pan：ratioMax 保持系统默认 ").append(curRatio).append("; ");
-            } else if (ratio > curRatio + 0.01f) {
-                pxPatchRatioMax(h, ratio, curRatio, log);
-            } else {
-                log.append("ratioMax 已是 ").append(curRatio).append("，不降; ");
-            }
-            int[] gwh = hxBaseGridOutWH(h);
-            int outW = gwh[0], outH = gwh[1];
-            long lenNow = f.length();
-            if (lenNow != len0) {
-                log.append("文件长度变了（").append(len0).append("→").append(lenNow).append("），放弃写回; ");
-                XposedBridge.log(TAG + "ProXDR 后处理（未写回）: " + log);
-                return false;
-            }
-            boolean ok = pxWriteBack(f, data, log);
-            XposedBridge.log(TAG + "ProXDR 后处理" + (ok ? "完成" : "未写回")
-                    + "（倍率 " + zoom + "）: " + log);
-            return ok;
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "ProXDR 后处理失败（保留原图）: " + t);
-            return false;
-        }
-    }
-
-    private static byte[] pxReadAll(java.io.File f) {
-        try {
-            int len = (int) f.length();
-            if (len <= 0 || len > (1 << 28)) return null;
-            byte[] b = new byte[len];
-            java.io.FileInputStream in = new java.io.FileInputStream(f);
-            int n = 0;
-            while (n < len) {
-                int r = in.read(b, n, len - n);
-                if (r <= 0) break;
-                n += r;
-            }
-            in.close();
-            return (n == len) ? b : null;
-        } catch (Throwable t) {
-            return null;
-        }
-    }
-
-    /** 写回：先写一份临时文件把数据落全，再**就地覆盖**原文件。返回 true = 已写回。
-     *  ⚠️ 不用"改名替换"：相机可能还握着原文件的句柄继续写，改名会让它的后续写入落到
-     *  已删除的 inode 上，成片就丢掉后半段（实测踩过，一张 13MB 的照片变成 2.9MB）。
-     *  就地写最坏情况是相机随后自己重写、我们的改动被覆盖 —— 照片本身还是完好的。 */
-    private static boolean pxWriteBack(java.io.File f, byte[] data, StringBuilder log) {
-        java.io.File tmp = new java.io.File(f.getParentFile(), f.getName() + ".xptmp");
-        try {
-            java.io.FileOutputStream fos = new java.io.FileOutputStream(tmp);
-            fos.write(data);
-            fos.flush();
+            File f = new File(CROP_REQ_FILE);
+            File dir = f.getParentFile();
+            if (dir != null && !dir.exists()) dir.mkdirs();
+            FileOutputStream fos = new FileOutputStream(f);
+            fos.write(String.valueOf(zoom).getBytes(java.nio.charset.StandardCharsets.US_ASCII));
             fos.close();
-            if (tmp.length() != data.length) {
-                log.append("临时文件长度不对，放弃写回; ");
-                tmp.delete();
-                return false;
-            }
-        } catch (Throwable t) {
-            log.append("写临时文件失败（").append(t).append("），放弃写回; ");
-            try {
-                tmp.delete();
-            } catch (Throwable ignored) {
-            }
-            return false;
-        }
-        try {
-            java.io.FileOutputStream fos = new java.io.FileOutputStream(f);
-            fos.write(data);
-            fos.flush();
-            fos.close();
-        } catch (Throwable t) {
-            log.append("就地写回失败: ").append(t).append("; ");
-            try {
-                tmp.delete();
-            } catch (Throwable ignored) {
-            }
-            return false;
-        }
-        try {
-            tmp.delete();
         } catch (Throwable ignored) {
         }
-        return true;
     }
 
-    private static boolean isHeifLike(java.io.File f) {
+    private static final float XPAN_MAX_ZOOM = 3.0f;
+
+    private void installXpanZoomUnlock(XC_LoadPackage.LoadPackageParam lp) {
         try {
-            byte[] b = new byte[12];
-            java.io.FileInputStream in = new java.io.FileInputStream(f);
-            int n = in.read(b);
-            in.close();
-            return n == 12 && b[4] == 'f' && b[5] == 't' && b[6] == 'y' && b[7] == 'p';
+            Class<?> c = Class.forName("fh.g", false, lp.classLoader);
+            int n = 0;
+            for (Method m : c.getDeclaredMethods()) {
+                Class<?>[] pt = m.getParameterTypes();
+                if (!"f".equals(m.getName()) || pt.length != 1 || !float.class.equals(pt[0])) continue;
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                    try {
+                        if (!sXpanActive) return;
+                        if (param.getResult() == null) return;
+                        float want = (Float) param.args[0];
+                        if (want < 1.0f) return;                 // 0.6× / 坏档位 0.0 都保持原样
+                        if (sCfgZoom) {
+                            // ★ 配置换带模式（默认）：真放大靠 root 脚本换裁剪窗口配置+重建会话，
+                            //   应用自己的倍率必须钉在 1×。用户意图从请求值读：点 2×（>=1.5）
+                            //   当开关在 1×/2× 之间切；busy/冷却期间只忽略"应用复位成 1×"那种
+                            //   请求（否则会话重建后应用的复位会反过来把配置切回去，来回打架），
+                            //   用户主动点 2× 随时受理（否则手感跟不上）。
+                            boolean userTap = want >= 1.5f;
+                            if (userTap || !cropBusy()) {
+                                if (userTap) {
+                                    sCropZoom = (sCropZoom >= 2) ? 1 : 2;
+                                    sXpanZoomReq = (sCropZoom >= 2) ? 2.0f : 1.0f;
+                                    sZoomIgnoreUntil = System.currentTimeMillis() + 15000L;
+                                    writeCropRequest(sCropZoom);
+                                    XposedBridge.log(TAG + "X-Pan 倍率开关 → " + sCropZoom + "×");
+                                } else if (want <= 1.2f) {
+                                    sXpanZoomReq = 1.0f;
+                                }
+                            }
+                            if (param.getResult() != null && ((Float) param.getResult()) != 1.0f) {
+                                param.setResult(1.0f);
+                            }
+                            return;
+                        }
+                        if (want >= 1.0f) sXpanZoomReq = want;   // 记录当前变焦档（大图回退判断用）
+                            float got = (Float) param.getResult();
+                            if (got >= want) return;                 // 没被钳制，不用管
+                            float fixed = Math.min(want, XPAN_MAX_ZOOM);
+                            param.setResult(fixed);
+                            if ("1".equals(prop("debug.xpan.diag"))) {
+                                XposedBridge.log(TAG + "xpan zoom 解锁 " + want + " -> " + fixed);
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                });
+                n++;
+            }
+            XposedBridge.log(TAG + "hook installed OK (xpan zoom unlock x" + n + ")");
         } catch (Throwable t) {
-            return false;
+            XposedBridge.log(TAG + "!! xpan zoom unlock failed: " + t);
         }
     }
 
-    /* ---------------- 出片后处理触发：hook 拍照 + 轮询 DCIM 找新文件 ----------------
-     * 全局生效（所有模式）：ratioMax 提升对每一张出片都做；
-     * 水印条压平只在宽幅（X-Pan 65:24）出片上做，普通照片不动它的图块引用。 */
-    private static final String DCIM_CAMERA = "/storage/emulated/0/DCIM/Camera";
-
-    private void installProxdrPost(XC_LoadPackage.LoadPackageParam lp) {
+    /* ---------------- 修复：X-Pan 变焦条多出来的坏档位（显示成 "0"） ----------------
+     * 病因（实机取证 2026-10-06）：
+     *   变焦条日志 initZoomPointMap clickValues: [0.6, 1.0, 0.0, 2.0]
+     *   → mZoomPointMap {ULTRA_WIDE=0.6, WIDE=1.0, DUAL=0.0, TELE=2.0}
+     *   第 3 档 DUAL 的值来自 y5.a$b 的静态初始化：
+     *       CameraConfig.e("com.oplus.dual.zoom.value")
+     *   而这个键在本机任何相机配置里都不存在（只在 APK 里作为字符串出现），
+     *   于是取到默认 0.0 → 按钮文字渲染成 "0"、点了也不生效。
+     *   普通照片模式的档位列表只有 3 项（0.6/1/2），所以那边正常。
+     *
+     * 做法：在档位列表交给变焦条之前，把不要的档位剔掉 ——
+     *   1) ≤0 的非法档位（DUAL=0.0 那个渲染成 "0" 的按钮）；
+     *   2) <1.0 的档位 = 0.6× 超广角，按用户要求删掉（2026-10-06）：本机超广角的 X-Pan 成像
+     *      通路没被 OPPO 调过，出片绿帧/噪声不可靠，X-Pan 只留 1×/2×。
+     *   只动值列表、不动 IconType 顺序 —— 按钮文字取的是"值"，
+     *   所以剔掉后是 1 | 2，点按映射也不会错位。
+     */
+    private void installXpanZoomPointFix(XC_LoadPackage.LoadPackageParam lp) {
         try {
-            Class<?> c = Class.forName("com.oplus.ocs.camera.producer.device.Camera2Impl",
+            Class<?> c = Class.forName("com.oplus.camera.feature.zoom.view.ZoomSeekBar",
                     false, lp.classLoader);
             int n = 0;
             for (Method m : c.getDeclaredMethods()) {
-                if (!"takePicture".equals(m.getName()) || m.getParameterTypes().length != 5) continue;
+                if (!"R8".equals(m.getName()) || m.getParameterTypes().length != 18) continue;
                 XposedBridge.hookMethod(m, new XC_MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         try {
-                            if ("0".equals(prop("debug.xpan.proxdr"))) return;
-                            float z = 1.0f;
-                            Object zz = field(param.args[0], "mZoomRatio");
-                            if (zz instanceof Number) z = ((Number) zz).floatValue();
-                            final float zf = z;
-                            final java.io.File dir = new java.io.File(DCIM_CAMERA);
-                            final java.util.Set<String> before = pxListNames(dir);
-                            new Thread(new Runnable() {
-                                @Override
-                                public void run() {
-                                    pxWatch(dir, before, zf);
-                                }
-                            }, "xpan-proxdr").start();
+                            if (!sXpanActive || param.args == null) return;
+                            // 注：实测 R8 每次 X-Pan 会话只被调 6 次左右，不是热路径，
+                            // 所以这里老实扫一遍参数即可 —— 曾经想"缓存参数下标"提速，
+                            // 结果参数顺序不稳定、下标指错列表，0.6× 又冒出来了。
+                            for (Object a : param.args) {
+                                if (!(a instanceof List)) continue;
+                                List<?> list = (List<?>) a;
+                                if (hasBadZoomPoint(list)) filterBadZoomPoints(list);
+                            }
                         } catch (Throwable ignored) {
                         }
                     }
                 });
                 n++;
             }
-            XposedBridge.log(TAG + "hook installed OK (ProXDR 后处理 x" + n + ")");
+            XposedBridge.log(TAG + "hook installed OK (xpan zoom point fix x" + n + ")");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "!! ProXDR 后处理安装失败: " + t);
+            XposedBridge.log(TAG + "!! xpan zoom point fix failed: " + t);
         }
     }
 
-    private static java.util.Set<String> pxListNames(java.io.File d) {
-        java.util.Set<String> s = new java.util.HashSet<>();
-        try {
-            String[] a = d.list();
-            if (a != null) java.util.Collections.addAll(s, a);
-        } catch (Throwable ignored) {
+    /** 档位列表里是否还有需要剔除的档位（≤0 非法 / <1.0 的 0.6× 超广角） */
+    private static boolean hasBadZoomPoint(List<?> list) {
+        for (int i = list.size() - 1; i >= 0; i--) {
+            Object v = list.get(i);
+            if (v instanceof Float && ((Float) v) < 1.0f) return true;
         }
-        return s;
+        return false;
     }
 
-    /** 每个新文件的处理状态：{上次看到的长度, 长度不变的次数, 是否已写回, 失败次数} */
-    private static final java.util.HashMap<String, long[]> sPxState = new java.util.HashMap<>();
-
-    /** 等新照片落盘（FileObserver 在 /sdcard 上收不到事件，只能轮询）。
-     *  相机是分阶段写同一个文件的（先写一版没增益图的、再整份重写成最终版），所以：
-     *  - 长度连续 2 秒不变才动手；
-     *  - 处理失败（还没写完 / 还没 tmap）就清零计数，过一会儿再来；
-     *  - 已经写回过的文件不再碰，但**长度又变了**说明相机重写了，就重新处理一遍。 */
-    private static void pxWatch(java.io.File dir, java.util.Set<String> before, float zoom) {
-        try {
-            int idle = 0;
-            for (int i = 0; i < 240; i++) {
-                Thread.sleep(500);
-                String[] a = dir.list();
-                if (a == null) continue;
-                boolean busy = false;
-                for (String nm : a) {
-                    if (before.contains(nm)) continue;
-                    String low = nm.toLowerCase();
-                    if (!low.endsWith(".heic") && !low.endsWith(".heif")) continue;
-                    java.io.File f = new java.io.File(dir, nm);
-                    long len = f.length();
-                    if (len < 20000) continue;
-                    busy = true;
-                    boolean go;
-                    synchronized (sPxState) {
-                        if (sPxState.size() > 200) sPxState.clear();   // 防慢性增长（一张照片一条）
-                        long[] st = sPxState.get(nm);
-                        if (st == null) {
-                            st = new long[]{len, 0, 0, 0};
-                            sPxState.put(nm, st);
-                        }
-                        if (st[0] != len) {                 // 长度又变了 → 相机在重写，重新计时
-                            st[0] = len;
-                            st[1] = 0;
-                            st[2] = 0;
-                            st[3] = 0;
-                        } else {
-                            st[1]++;
-                        }
-                        go = (st[1] >= 4 && st[2] == 0);
-                    }
-                    if (!go) continue;
-                    boolean ok = pxPostProcess(f, zoom);
-                    synchronized (sPxState) {
-                        long[] st = sPxState.get(nm);
-                        if (st != null) {
-                            st[0] = f.length();
-                            st[2] = ok ? 1 : 0;
-                            st[1] = ok ? st[1] : 0;         // 没写回就等下一轮稳定计数
-                        }
-                    }
-                }
-                if (busy) idle = 0;
-                else if (++idle >= 12) return;               // 连续 6 秒没新照片就收工
-            }
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "ProXDR 后处理轮询失败: " + t);
-        }
-    }
-
-    /* ---------------- 诊断：APS 算法支持查询（debug.xpan.algotrace=1 才装） ----------------
-     * 用途：看应用"认为"某个模式支持哪些 APS 算法 —— 比如 X-Pan 的 HDR 能力就是
-     *   yh/l2.getSupportFunction("pref_camera_hdr_mode_key") = w5.a.d("xpan",id,"aps_algo_hdr")
-     *   || w5.a.d("xpan",id,"aps_algo_merge_hdr")（反编译实锤）。
-     * 只记含 hdr 的查询（量极小），不刷屏。加自动 HDR 配置时用它验证"门"有没有翻转。
-     */
-    private void installAlgoQueryTrace(XC_LoadPackage.LoadPackageParam lp) {
-        if (!"1".equals(prop("debug.xpan.algotrace"))) return;
-        try {
-            Class<?> c = Class.forName("w5.a", false, lp.classLoader);
-            int n = 0;
-            for (Method m : c.getDeclaredMethods()) {
-                if (!"d".equals(m.getName())) continue;
-                Class<?>[] pt = m.getParameterTypes();
-                if (pt.length != 3 || pt[0] != String.class || pt[1] != int.class
-                        || pt[2] != String.class) continue;
-                XposedBridge.hookMethod(m, new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
-                        try {
-                            String algo = String.valueOf(param.args[2]);
-                            if (algo.toLowerCase().indexOf("hdr") < 0) return;
-                            XposedBridge.log(TAG + "algoQuery mode=" + param.args[0]
-                                    + " cam=" + param.args[1] + " algo=" + algo
-                                    + " -> " + param.getResult());
-                        } catch (Throwable ignored) {
-                        }
-                    }
-                });
-                n++;
-            }
-            XposedBridge.log(TAG + "hook installed OK (算法查询探针 x" + n + ")");
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "!! 算法查询探针失败: " + t);
-        }
-    }
-
-    /* ---------------- 自动 HDR：给 X-Pan 补上应用侧的两道闸 ----------------
-     * 背景（反编译 h9/m.b0 实锤，2026-10-18）：应用给 HAL 下发的
-     *   com.oplus.capture.hdr.support 由三道闸串起来 ——
-     *   ① v2(mode) → A2(mode)：模式能力链（W0() + n8.c.c(mode) …）
-     *   ② E2() = getSupportFunction("func_support_preview_hdr")：预览 HDR 能力
-     *   ③ CameraConfig.b("com.oplus.camera.capture.hdr.support", false)：配置开关
-     * X-Pan 不是本机发布的模式，APS 配置里也没有 HDR 算法 → 三道闸全 false。
-     * ★ 实测结论（2026-10-18）：**这条路走不通，默认关闭**（要试就 setprop debug.xpan.autohdr 1）。
-     *   ① 闸①(A2) 内部先看 W0()=UI 容器状态（EventMessageUIContainerContext.c==1），X-Pan 下为 false
-     *      → 整条 && 链短路，闸②③ 根本不被求值；
-     *   ② 强行接管 A2 后：闸②(func_support_preview_hdr) 仍未被调用，capture.hdr.support 仍是 false；
-     *      而且 auto.hdr.enable 从 [1] 变 [0]、出片亮度整体 +9（曝光也漂了）—— 说明这些接管
-     *      扰动了应用自己的拍照决策 ✗。
-     *   ③ 更关键：应用是通过请求里的 **com.oplus.aps.feature.type（int[] 位图）**告诉 APS 跑哪些算法；
-     *      X-Pan 下这个位图不含 HDR 位（能力链判定为"不支持"）→ 光在 APS 算法开关里加 HDR 条目
-     *      （实测能让应用的能力查询 aps_algo_turbo_hdr 翻成 true）也**不会真的触发 HDR** ✗。
-     *   → 要真给 X-Pan 上 HDR，得同时谎报一整套全局能力（UI 容器状态、模式能力、预览 HDR、配置开关）
-     *     并猜 APS 的 feature 位图，风险大、下游未验证；按"宁可如实记录也不硬凑"的原则不做。
-     *      开关：debug.xpan.autohdr=1 才启用（默认关，模块行为与 v1.2 完全一致）。
-     */
-    private static final String CFG_CAP_HDR = "com.oplus.camera.capture.hdr.support";
-    private static final String CFG_PREV_HDR = "com.oplus.camera.preview.hdr.support";
-    private static final String FUNC_PREV_HDR = "func_support_preview_hdr";
-    private static volatile boolean sHdrGateLogged = false;
-
-    /* ---------------- 诊断：拍照请求参数全量探针（debug.xpan.reqtrace=1） ----------------
-     * 用途：看应用到底往 HAL 下发了哪些参数（尤其 HDR 相关的厂商 tag），
-     *   用来判定"自动 HDR 没效果"是卡在应用侧没请求，还是 APS 侧没有对应管线。
-     * 只记每个 key 的第一次出现（去重），最多 200 条。
-     */
-    private static final java.util.HashSet<String> sReqSeen = new java.util.HashSet<>();
-
-    private static String fmtReqVal(Object v) {
-        if (v == null) return "null";
-        if (v instanceof android.graphics.Rect) return "Rect" + v;
-        if (v instanceof int[]) return java.util.Arrays.toString((int[]) v);
-        if (v instanceof long[]) return java.util.Arrays.toString((long[]) v);
-        if (v instanceof float[]) return java.util.Arrays.toString((float[]) v);
-        if (v instanceof byte[]) {
-            byte[] b = (byte[]) v;
-            StringBuilder sb = new StringBuilder("[");
-            for (int i = 0; i < Math.min(b.length, 16); i++) sb.append(b[i] & 255).append(i < Math.min(b.length,16)-1 ? "," : "");
-            return sb.append("]").toString();
-        }
-        return String.valueOf(v);
-    }
-
-    private void installRequestTraceAll(XC_LoadPackage.LoadPackageParam lp) {
-        if (!"1".equals(prop("debug.xpan.reqtrace"))) return;
-        try {
-            Class<?> cls = Class.forName("android.hardware.camera2.CaptureRequest$Builder",
-                    false, lp.classLoader);
-            Method set = cls.getDeclaredMethod("set",
-                    android.hardware.camera2.CaptureRequest.Key.class, Object.class);
-            XposedBridge.hookMethod(set, new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    try {
-                        if (!sXpanActive) return;
-                        String name = String.valueOf(param.args[0]);
-                        Object v = param.args[1];
-                        String sig = name + " = " + fmtReqVal(v);
-                        if (sig.length() > 160) sig = sig.substring(0, 160);
-                        synchronized (sReqSeen) {
-                            if (sReqSeen.size() >= 200 || !sReqSeen.add(sig)) return;
-                        }
-                        XposedBridge.log(TAG + "reqAll " + sig);
-                    } catch (Throwable ignored) {
-                    }
-                }
-            });
-            XposedBridge.log(TAG + "hook installed OK (请求全量探针)");
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "!! 请求全量探针失败: " + t);
-        }
-    }
-
-    /* ---------------- 测试辅助：用属性切模式（确定性，不依赖 UI 手势） ----------------
-     * 背景：模式条（"双指左右滑动切换模式"）用 input swipe 实测时灵时不灵，
-     *   自动化验证模式相关功能（比如水印按模式隔离）需要一条可靠通道。
-     * 做法：抓 ModeManager（wh.q3）实例，轮询属性 debug.xpan.mode，
-     *   有值就调它自己的 setCurrentMode —— wh.q3.d0(String, boolean, boolean)。
-     * 用法：setprop debug.xpan.mode xpan  （回拍照模式用 common —— 实测应用日志：
-     *   "setCurrentMode fail, the newMode: photo is not enabled"，拍照模式的内部名是 common；
-     *   值不变则不动）
-     * 只在属性非空时动作，平时开销就是 1.5 秒读一次属性。
-     */
-    private static volatile boolean sLastForceExit = false;
-    private static volatile Object sModeMgr;
-    private static volatile String sLastModeCmd = "";
-
-    private void installModeSwitchHelper(XC_LoadPackage.LoadPackageParam lp) {
-        try {
-            Class<?> c = Class.forName("wh.q3", false, lp.classLoader);
-            int n = 0;
-            for (java.lang.reflect.Constructor<?> ct : c.getDeclaredConstructors()) {
-                XposedBridge.hookMethod(ct, new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
-                        sModeMgr = param.thisObject;
-                    }
-                });
-                n++;
-            }
-            Thread t = new Thread(new Runnable() {
-                @Override
-                public void run() {
-                    while (true) {
-                        try {
-                            Thread.sleep(1500);
-                            // 调试：debug.xpan.forceexit=1 → 强制按"离开 X-Pan"清理皮肤/容器
-                            // （程序化切模式不会走应用的退出清理，会留残影把模式条挡住）
-                            if ("1".equals(prop("debug.xpan.forceexit"))) {
-                                sLastForceExit = true;
-                            } else if (sLastForceExit) {
-                                sLastForceExit = false;
-                                sXpanActive = false;
-                                sDriveDone = true;
-                                new android.os.Handler(android.os.Looper.getMainLooper()).post(
-                                        new Runnable() {
-                                            @Override
-                                            public void run() {
-                                                cleanupXpanContainer();
-                                            }
-                                        });
-                                XposedBridge.log(TAG + "debug.xpan.forceexit → 已强制清理 X-Pan 皮肤");
-                            }
-                            String want = prop("debug.xpan.mode");
-                            if (want == null || want.length() == 0 || want.equals(sLastModeCmd)) continue;
-                            sLastModeCmd = want;
-                            // 支持 "模式名[,flag1[,flag2]]" 便于实验 d0 的两个布尔（实测 false,false 有时切不过去）
-                            String modeName = want;
-                            boolean f1 = false, f2 = false;
-                            String[] parts = want.split(",");
-                            if (parts.length > 1) {
-                                modeName = parts[0].trim();
-                                if (parts.length > 2) f1 = "1".equals(parts[1].trim());
-                                if (parts.length > 3) f2 = "1".equals(parts[2].trim());
-                                else if (parts.length > 2) f2 = "1".equals(parts[2].trim());
-                            }
-                            Object mm = sModeMgr;
-                            if (mm == null) {
-                                XposedBridge.log(TAG + "属性切模式：ModeManager 还没抓到");
-                                sLastModeCmd = "";
-                                continue;
-                            }
-                            // ⚠️ 必须回主线程调：ModeManager 的切模式会碰 UI，
-                            //    在工作线程直接调实测抛 InvocationTargetException
-                            final Object mmF = mm;
-                            final String wantF = want;
-                            final String modeNameF = modeName;
-                            final boolean f1F = f1, f2F = f2;
-                            new android.os.Handler(android.os.Looper.getMainLooper()).post(
-                                    new Runnable() {
-                                        @Override
-                                        public void run() {
-                                            try {
-                                                // 切模式前先把水印那份换好（跟 UI 切模式时模式门的时序一致）
-                                                if (modeNameF.startsWith("xpan")) wmEnterXpan();
-                                                else wmExitXpan();
-                                                Method m = mmF.getClass().getDeclaredMethod(
-                                                        "d0", String.class, boolean.class, boolean.class);
-                                                m.setAccessible(true);
-                                                Object r = m.invoke(mmF, modeNameF, f1F, f2F);
-                                                XposedBridge.log(TAG + "属性切模式 -> " + modeNameF
-                                                        + " (" + f1F + "," + f2F + ")，结果=" + r);
-                                            } catch (Throwable t) {
-                                                Throwable c = (t.getCause() != null) ? t.getCause() : t;
-                                                XposedBridge.log(TAG + "属性切模式失败: " + c);
-                                            }
-                                        }
-                                    });
-                        } catch (Throwable t) {
-                            XposedBridge.log(TAG + "属性切模式轮询异常: " + t);
-                        }
-                    }
-                }
-            }, "xpan-mode-cmd");
-            t.setDaemon(true);
-            t.start();
-            XposedBridge.log(TAG + "hook installed OK (模式切换辅助 x" + n + ")");
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "!! 模式切换辅助失败: " + t);
+    private static void filterBadZoomPoints(List<?> list) {
+        for (int i = list.size() - 1; i >= 0; i--) {
+            Object v = list.get(i);
+            if (!(v instanceof Float)) continue;
+            float f = (Float) v;
+            if (f >= 1.0f) continue;   // 保留 1× 及以上
+            list.remove(i);
+            XposedBridge.log(TAG + "xpan 变焦条剔掉档位 " + v
+                    + (f <= 0f ? "（非法）" : "（0.6× 超广角，按要求删除）"));
         }
     }
 
@@ -2879,7 +2104,6 @@ public class XpanHook implements IXposedHookLoadPackage {
                             if ("xpan".equals(mode)) return;      // 还在 X-Pan
                             if (!sXpanActive) return;             // 本来就不在
                             sXpanActive = false;                  // 模式门没翻转也要清，这里直接置位
-                            wmExitXpan();                         // 水印隔离：把其他模式那份写回去
                             sDriveDone = true;                    // 别让 xa() 兜底再把它建回来
                             android.os.Handler h = new android.os.Handler(
                                     android.os.Looper.getMainLooper());
@@ -2921,7 +2145,10 @@ public class XpanHook implements IXposedHookLoadPackage {
                             sXpanActive = isXpan;
                             // 水印按模式隔离：进 X-Pan 换成 X-Pan 那份，出去换回其他模式那份
                             if (isXpan) wmEnterXpan(); else wmExitXpan();
-                            if (isXpan) sXpanZoomReq = 1.0f;     // 进模式复位变焦档
+                            if (isXpan) {
+                                sXpanZoomReq = 1.0f;             // 进模式复位变焦档
+                                sZoomIgnoreUntil = System.currentTimeMillis() + 4000L;
+                            }
                             XposedBridge.log(TAG + "xpan stream building = " + isXpan);
                             if (isXpan) {
                                 // 进入 X-Pan：复位会话级状态 + 快速补建（滤镜由 wireXpanFilter 负责接回）
@@ -3212,15 +2439,12 @@ public class XpanHook implements IXposedHookLoadPackage {
         if (sCaptureSize != null) return sCaptureSize;
         String p = prop("debug.xpan.capture");
         Size s = parseSize(p);
-        // ★ 默认仍是 8192x3024（用户要求"1× 出 8192"，而应用会把声明尺寸跟着拍照流走，
-        //   所以只有拍照流要 8192，出片才会是 8192）。
-        //   ⚠️ 已知代价：8192 宽走 HAL 全分辨率(remosaic)通路，实测**自带 2~3 像素错位重影**
-        //   （原生裁图看灯臂/窗框是双线）。想换成干净的 4096 通路（出片尺寸会变 4096）：
-        //   setprop debug.xpan.capture 4096x1512
-        if (s == null && !smallPicEnabled()) {
+        // ★ 默认 4096x1512（真实像素通路：最清晰、无重影）。8192x3024 是算法放大
+        //   （像素 ×4、细节不变）且走 remosaic 通路自带 2~3 像素错位重影 ——
+        //   想要大数字：setprop debug.xpan.capture 8192x3024 或建 /sdcard/DCIM/.xpan_bigpic
+        if (s == null && bigPicEnabled()) {
             s = parseSize(BIG_CAPTURE);
-            XposedBridge.log(TAG + "默认大图档: " + BIG_CAPTURE + "（1× 出片才会是 8192；"
-                    + "建 /sdcard/DCIM/.xpan_smallpic 或 debug.xpan.capture 可换 4096 干净通路）");
+            XposedBridge.log(TAG + "大图档标记存在 → " + BIG_CAPTURE + "（算法放大、带重影）");
         }
         if (s == null) s = parseSize(DEFAULT_CAPTURE);
         if (s == null) s = new Size(4096, 1512);
@@ -3229,17 +2453,12 @@ public class XpanHook implements IXposedHookLoadPackage {
         return s;
     }
 
-    /**
-     * ★ v1.3 退出开关：/sdcard/DCIM/.xpan_smallpic（空文件）存在 → 回 6.2MP（4096x1512）。
-     * 默认（无文件）= 8192x3024 大图档。改完重启相机生效。
-     * 注意大图档是"算法放大"：像素 ×4、细节不变（本机真细节上限 6.2MP，
-     * 见 12_验证/分辨率实验结论.md）。DCIM 为主选，相机的 Android/media 目录做备选
-     * （个别系统对 DCIM 的 File API 收紧时仍可用）。
-     */
-    private static boolean smallPicEnabled() {
+    /** 可选大图档开关：/sdcard/DCIM/.xpan_bigpic（空文件）存在 → 8192x3024（算法放大、
+     *  带 2~3 像素重影）。默认（无文件）= 4096x1512 真实像素。改完重启相机生效。 */
+    private static boolean bigPicEnabled() {
         try {
-            if (new File("/storage/emulated/0/DCIM/.xpan_smallpic").exists()) return true;
-            return new File("/storage/emulated/0/Android/media/com.oneplus.camera/.xpan_smallpic").exists();
+            if (new File("/storage/emulated/0/DCIM/.xpan_bigpic").exists()) return true;
+            return new File("/storage/emulated/0/Android/media/com.oneplus.camera/.xpan_bigpic").exists();
         } catch (Throwable t) {
             return false;
         }
