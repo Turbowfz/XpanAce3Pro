@@ -1081,7 +1081,11 @@ public class XpanHook implements IXposedHookLoadPackage {
     private static boolean cropBusy() {
         try {
             if (System.currentTimeMillis() < sZoomIgnoreUntil) return true;
-            return new File(CROP_BUSY_FILE).exists();
+            File b = new File(CROP_BUSY_FILE);
+            if (!b.exists()) return false;
+            // busy 残留超 30 秒 = watcher 中途死掉了，忽略它（否则功能会被一个
+            // 残留文件永久卡死 —— "点 2× 毫无反应"的硬故障模式，实测踩过）
+            return System.currentTimeMillis() - b.lastModified() < 30000L;
         } catch (Throwable t) {
             return true;
         }
@@ -1118,16 +1122,16 @@ public class XpanHook implements IXposedHookLoadPackage {
                         float want = (Float) param.args[0];
                         if (want < 1.0f) return;                 // 0.6× / 坏档位 0.0 都保持原样
                         if (sCfgZoom) {
-                            // ★ 按目标状态去重（别用"翻转"：拖动变焦条会连发多次请求，
-                            //   每次都翻转会让配置来回横跳）。≥1.5 → 目标 2×；≤1.2 → 目标 1×；
-                            //   中间值（拖动途中）不动。应用自身的 1.0 请求（初始化恢复/钉 1× 产生）
-                            //   落在冷却期内被跳过，不会写文件（否则会打架，实测）。
-                            int target = (want >= 1.5f) ? 2 : ((want <= 1.2f) ? 1 : sCropZoom);
-                            if (target != sCropZoom && !cropBusy()) {
-                                sCropZoom = target;
+                            // ★ 意图只认 ≥1.5 的请求（点 "2" chip）。应用自身被钉 1.0 后会周期性
+                            //   重发 1.0（会话重建/预览重启），对称目标逻辑会被它打回 1×——
+                            //   这就是"2× 自己失效"的根因（实测踩过）。回 1× = 再点一次 "2"。
+                            //   冷却期内连 ≥1.5 也忽略（往返刚做完，防抖）。
+                            if (want >= 1.5f && !cropBusy()) {
+                                int next = (sCropZoom >= 2) ? 1 : 2;
+                                sCropZoom = next;
                                 sZoomIgnoreUntil = System.currentTimeMillis() + 15000L;
-                                writeCropRequest(target);
-                                XposedBridge.log(TAG + "X-Pan 倍率 → " + target + "×（配置换带）");
+                                writeCropRequest(next);
+                                XposedBridge.log(TAG + "X-Pan 倍率开关 → " + next + "×");
                             }
                             sXpanZoomReq = (sCropZoom >= 2) ? 2.0f : 1.0f;
                             if (param.getResult() != null && ((Float) param.getResult()) != 1.0f) {

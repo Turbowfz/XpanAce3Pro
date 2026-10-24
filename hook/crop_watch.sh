@@ -9,6 +9,11 @@ REQ=/sdcard/Android/data/com.oplus.camera/files/xpan_cropzoom
 BUSY=/sdcard/Android/data/com.oplus.camera/files/xpan_cropzoom_busy
 cur=""
 
+# busy 残留清理（上次中途死掉会留这个，不清掉 hook 会认为一直在切换）
+rm -f "$BUSY" 2>/dev/null
+# 退出时也摘掉 busy，别把卡死状态留给下一次
+trap 'rm -f "$BUSY" 2>/dev/null; exit' INT TERM EXIT
+
 # 单实例保护：清掉旧实例（双实例会双重往返，模式跳两次）
 for p2 in $(ps -ef | grep crop_watch | grep -v grep | awk '{print $2}'); do
     [ "$p2" != "$$" ] && kill "$p2" 2>/dev/null
@@ -17,7 +22,7 @@ done
 while true; do
     v=$(cat "$REQ" 2>/dev/null | tr -d ' \r\n')
     case "$v" in
-        1|2) ;;
+        1|2|15|18|22) ;;
         *) sleep 1; continue ;;
     esac
     if [ "$v" != "$cur" ]; then
@@ -31,6 +36,18 @@ while true; do
             # 会话重建：模式往返一趟（X-Pan → 照片 → X-Pan），按屏幕方向选导航方式。
             # 竖屏：模式条在底部横排，直接点标签（实测可靠，划动会被吸附弹回）；
             # 横屏：模式列表在右侧竖排，慢速滑动往返（实测可靠）。
+            # ★ 前台守卫：相机不在前台绝不点屏幕（用户切去 QQ/浏览器时，
+            #   盲点坐标会点进别的应用 —— 实测差点往 QQ 里点消息）。最多等 30 秒。
+            fg=""
+            for w in 1 2 3 4 5 6; do
+                fg=$(dumpsys window 2>/dev/null | grep -m1 mCurrentFocus)
+                case "$fg" in *com.oplus.camera*) break ;; esac
+                sleep 5
+            done
+            case "$fg" in
+                *com.oplus.camera*) ;;
+                *) rm -f "$BUSY"; log -t XpanCrop "相机不在前台，放弃本次往返（配置已挂上，重进 X-Pan 生效）"; cur="$v"; continue ;;
+            esac
             ORIENT=$(dumpsys input 2>/dev/null | grep -m1 SurfaceOrientation | tr -d '\r' | awk '{print $2}')
             case "$ORIENT" in
                 1|3)
