@@ -939,6 +939,7 @@ public class XpanHook implements IXposedHookLoadPackage {
             // ★ 兜底复查：应用有可能是在"关设置页/切模式"之后才把水印值写下去，压过上面这次切换
             //   （用户反馈"水印控制没有隔离"）。延迟 1.5 秒再查一次，发现不是 X-Pan 那份就补写。
             final Object[] mine = sWmMine.clone();
+            final Object[] others = sWmOther.clone();
             new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(new Runnable() {
                 @Override
                 public void run() {
@@ -946,9 +947,12 @@ public class XpanHook implements IXposedHookLoadPackage {
                         if (!sWmInXpan) return;
                         for (int i = 0; i < WM_FIELD.length; i++) {
                             Object want = mine[i];
+                            Object clobber = others[i];
                             if (want == null) continue;
                             Object cur = wmRead(i);
-                            if (!want.equals(cur)) {
+                            // 只在"当前值 = 其他模式那份"（被覆盖特征）时补写；
+                            // 用户自己在 X-Pan 里改的新值不动
+                            if (!want.equals(cur) && (clobber == null || clobber.equals(cur))) {
                                 wmWrite(i, want);
                                 XposedBridge.log(TAG + "水印隔离复查：补写 " + WM_NAME[i] + " → " + want);
                             }
@@ -967,17 +971,21 @@ public class XpanHook implements IXposedHookLoadPackage {
         if (!sWmInXpan) return;
         sWmInXpan = false;
         try {
+            // ★ 快照必须在还原循环**之前**拿（循环里会把 sWmOther 清空，
+            //   之前在循环后 clone 拿到的是全 null，复查永远空转 —— bug 实录）
+            final Object[] other = sWmOther.clone();
+            final Object[] mine = sWmMine.clone();
             for (int i = 0; i < WM_FIELD.length; i++) {
                 Object cur = wmRead(i);
                 if (cur != null) sWmMine[i] = cur;
-                Object other = sWmOther[i];
-                if (other != null && !other.equals(cur)) wmWrite(i, other);
+                Object o = sWmOther[i];
+                if (o != null && !o.equals(cur)) wmWrite(i, o);
                 sWmOther[i] = null;
             }
             wmSave();
             XposedBridge.log(TAG + "水印隔离：出 X-Pan，X-Pan 存下=" + wmDump(sWmMine));
-            // 兜底复查：出模式后也延迟查一次，别让 X-Pan 那份漏到其他模式（用户反馈"没有隔离"）
-            final Object[] other = sWmOther.clone();
+            // 兜底复查：出模式后延迟查一次。只在"当前值 = X-Pan 那份"（泄漏特征）时补写回
+            //   其他模式的值 —— 用户后来自己改的不动。
             new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(new Runnable() {
                 @Override
                 public void run() {
@@ -985,9 +993,10 @@ public class XpanHook implements IXposedHookLoadPackage {
                         if (sWmInXpan) return;
                         for (int i = 0; i < WM_FIELD.length; i++) {
                             Object want = other[i];
-                            if (want == null) continue;
+                            Object leaked = mine[i];
+                            if (want == null || leaked == null) continue;
                             Object cur = wmRead(i);
-                            if (!want.equals(cur)) {
+                            if (leaked.equals(cur) && !want.equals(cur)) {
                                 wmWrite(i, want);
                                 XposedBridge.log(TAG + "水印隔离复查：补写回 " + WM_NAME[i] + " → " + want);
                             }
@@ -1000,6 +1009,8 @@ public class XpanHook implements IXposedHookLoadPackage {
             XposedBridge.log(TAG + "水印隔离出模式失败: " + t);
         }
     }
+
+
 
     private static String wmDump(Object[] a) {
         StringBuilder sb = new StringBuilder("[");
@@ -1107,13 +1118,16 @@ public class XpanHook implements IXposedHookLoadPackage {
                         float want = (Float) param.args[0];
                         if (want < 1.0f) return;                 // 0.6× / 坏档位 0.0 都保持原样
                         if (sCfgZoom) {
-                            // ★ "2" chip 是唯一开关：点一下切 2×、再点回 1×。应用自身的 1.0
-                            //   请求（初始化恢复/钉 1× 产生）**不写文件**，否则会打架（实测）。
-                            if (want >= 1.5f) {
-                                sCropZoom = (sCropZoom >= 2) ? 1 : 2;
+                            // ★ 按目标状态去重（别用"翻转"：拖动变焦条会连发多次请求，
+                            //   每次都翻转会让配置来回横跳）。≥1.5 → 目标 2×；≤1.2 → 目标 1×；
+                            //   中间值（拖动途中）不动。应用自身的 1.0 请求（初始化恢复/钉 1× 产生）
+                            //   落在冷却期内被跳过，不会写文件（否则会打架，实测）。
+                            int target = (want >= 1.5f) ? 2 : ((want <= 1.2f) ? 1 : sCropZoom);
+                            if (target != sCropZoom && !cropBusy()) {
+                                sCropZoom = target;
                                 sZoomIgnoreUntil = System.currentTimeMillis() + 15000L;
-                                writeCropRequest(sCropZoom);
-                                XposedBridge.log(TAG + "X-Pan 倍率开关 → " + sCropZoom + "×");
+                                writeCropRequest(target);
+                                XposedBridge.log(TAG + "X-Pan 倍率 → " + target + "×（配置换带）");
                             }
                             sXpanZoomReq = (sCropZoom >= 2) ? 2.0f : 1.0f;
                             if (param.getResult() != null && ((Float) param.getResult()) != 1.0f) {

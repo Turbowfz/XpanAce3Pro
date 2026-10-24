@@ -9,6 +9,11 @@ REQ=/sdcard/Android/data/com.oplus.camera/files/xpan_cropzoom
 BUSY=/sdcard/Android/data/com.oplus.camera/files/xpan_cropzoom_busy
 cur=""
 
+# 单实例保护：清掉旧实例（双实例会双重往返，模式跳两次）
+for p2 in $(ps -ef | grep crop_watch | grep -v grep | awk '{print $2}'); do
+    [ "$p2" != "$$" ] && kill "$p2" 2>/dev/null
+done
+
 while true; do
     v=$(cat "$REQ" 2>/dev/null | tr -d ' \r\n')
     case "$v" in
