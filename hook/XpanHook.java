@@ -10,6 +10,7 @@ import android.util.Pair;
 
 import java.io.File;
 import java.lang.reflect.Method;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.util.ArrayList;
 import java.util.List;
@@ -147,10 +148,25 @@ public class XpanHook implements IXposedHookLoadPackage {
         installXpanPanelFix(lp);
         installWatermarkIsolation(lp);
 
-        // 开关一次性读好（热路径里不再反射 SystemProperties）
         sDiag = "1".equals(prop("debug.xpan.diag"));
         sCfgZoom = !"0".equals(prop("debug.xpan.configzoom"));
-
+        // 相机进程重启后从请求文件恢复档位
+        try {
+            File rf = new File(CROP_REQ_FILE);
+            if (rf.exists()) {
+                FileInputStream rin = new FileInputStream(rf);
+                byte[] rb = new byte[8];
+                int rn = rin.read(rb);
+                rin.close();
+                if (rn > 0) {
+                    String rt = new String(rb, 0, rn, java.nio.charset.StandardCharsets.US_ASCII).trim();
+                    if (rt.equals("2")) sCropZoom = 2;
+                    else if (rt.equals("1")) sCropZoom = 1;
+                    sXpanZoomReq = (sCropZoom >= 2) ? 2.0f : 1.0f;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
         // 下面两个是排查用的取证 hook，日志量大，默认关闭。
         // 需要复现问题时：setprop debug.xpan.diag 1，重启相机即可。
         // installXpanContainerWake 也放这里：它只是把休眠的 XpanUIContainer 状态推回 0，
@@ -1036,14 +1052,12 @@ public class XpanHook implements IXposedHookLoadPackage {
         }
     }
 
-    /* ---------------- 2× 真放大：配置换带 + 会话重建（方案A） ----------------
-     * 原理（2026-10-18 实测定论）：X-Pan 的裁剪窗口取自配置 tag
-     *   com.oplus.xpan.crop.region.main.{landscape,portrait}，应用在**会话建立时**读一次就定死；
-     *   每次拍照改请求参数完全无效（日志确认应用收到正确窗口、出片视野仍 1.00×），
-     *   唯一有效的杠杆是**换配置 + 让会话重建**（实测 FOV 尺度 0.50 = 真 2×）。
-     * 分工：本 hook 只负责识别用户意图写请求文件 + 把应用自身倍率钉在 1×
-     *   （否则预览会在已裁窄的流上再放大一次 = 4×）；换配置和模式往返由模块里的
-     *   root 脚本 crop_watch.sh 做（应用进程 setprop debug.* 会被拒，只能走文件）。 */
+
+    /* ---------------- 2× 真变焦：配置换带 + 会话重建 ----------------
+     * 原理（实测）：裁剪窗口 tag 应用在会话建立时读一次定死；换配置后必须让会话
+     *   重建（模式往返一趟）才生效（实测 FOV 0.50~0.55 = 真 2×）。2.5×/3× 被 HAL 钳回 2×。
+     * 分工：本 hook 识别用户意图写请求文件 + 把应用倍率钉 1×（否则预览 4× 叠加）；
+     *   换配置与模式往返由 root 脚本 crop_watch.sh 做。 */
     private static final String CROP_REQ_FILE =
             "/sdcard/Android/data/com.oplus.camera/files/xpan_cropzoom";
     private static final String CROP_BUSY_FILE =
@@ -1093,23 +1107,15 @@ public class XpanHook implements IXposedHookLoadPackage {
                         float want = (Float) param.args[0];
                         if (want < 1.0f) return;                 // 0.6× / 坏档位 0.0 都保持原样
                         if (sCfgZoom) {
-                            // ★ 配置换带模式（默认）：真放大靠 root 脚本换裁剪窗口配置+重建会话，
-                            //   应用自己的倍率必须钉在 1×。用户意图从请求值读：点 2×（>=1.5）
-                            //   当开关在 1×/2× 之间切；busy/冷却期间只忽略"应用复位成 1×"那种
-                            //   请求（否则会话重建后应用的复位会反过来把配置切回去，来回打架），
-                            //   用户主动点 2× 随时受理（否则手感跟不上）。
-                            boolean userTap = want >= 1.5f;
-                            if (userTap || !cropBusy()) {
-                                if (userTap) {
-                                    sCropZoom = (sCropZoom >= 2) ? 1 : 2;
-                                    sXpanZoomReq = (sCropZoom >= 2) ? 2.0f : 1.0f;
-                                    sZoomIgnoreUntil = System.currentTimeMillis() + 15000L;
-                                    writeCropRequest(sCropZoom);
-                                    XposedBridge.log(TAG + "X-Pan 倍率开关 → " + sCropZoom + "×");
-                                } else if (want <= 1.2f) {
-                                    sXpanZoomReq = 1.0f;
-                                }
+                            // ★ "2" chip 是唯一开关：点一下切 2×、再点回 1×。应用自身的 1.0
+                            //   请求（初始化恢复/钉 1× 产生）**不写文件**，否则会打架（实测）。
+                            if (want >= 1.5f) {
+                                sCropZoom = (sCropZoom >= 2) ? 1 : 2;
+                                sZoomIgnoreUntil = System.currentTimeMillis() + 15000L;
+                                writeCropRequest(sCropZoom);
+                                XposedBridge.log(TAG + "X-Pan 倍率开关 → " + sCropZoom + "×");
                             }
+                            sXpanZoomReq = (sCropZoom >= 2) ? 2.0f : 1.0f;
                             if (param.getResult() != null && ((Float) param.getResult()) != 1.0f) {
                                 param.setResult(1.0f);
                             }
