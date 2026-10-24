@@ -149,7 +149,6 @@ public class XpanHook implements IXposedHookLoadPackage {
         installWatermarkIsolation(lp);
 
         sDiag = "1".equals(prop("debug.xpan.diag"));
-        sCfgZoom = !"0".equals(prop("debug.xpan.configzoom"));
         // 相机进程重启后从请求文件恢复档位
         try {
             File rf = new File(CROP_REQ_FILE);
@@ -1121,7 +1120,11 @@ public class XpanHook implements IXposedHookLoadPackage {
                         if (param.getResult() == null) return;
                         float want = (Float) param.args[0];
                         if (want < 1.0f) return;                 // 0.6× / 坏档位 0.0 都保持原样
-                        if (sCfgZoom) {
+                        // ★ 开关现读不缓存：相机进程可能跨属性修改长期存活（实测：测试时
+                        //   setprop configzoom=0，之后还原了属性但进程没重启，运行中的相机
+                        //   一直按"关"跑 → 用户点 2 只有预览放大、出片还是 1×）。变焦请求
+                        //   不频繁，每次读一次 prop 的开销可以忽略。
+                        if (!"0".equals(prop("debug.xpan.configzoom"))) {
                             // ★ 意图只认 ≥1.5 的请求（点 "2" chip）。应用自身被钉 1.0 后会周期性
                             //   重发 1.0（会话重建/预览重启），对称目标逻辑会被它打回 1×——
                             //   这就是"2× 自己失效"的根因（实测踩过）。回 1× = 再点一次 "2"。
