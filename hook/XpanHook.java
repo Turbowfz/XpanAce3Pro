@@ -1125,16 +1125,16 @@ public class XpanHook implements IXposedHookLoadPackage {
                         //   一直按"关"跑 → 用户点 2 只有预览放大、出片还是 1×）。变焦请求
                         //   不频繁，每次读一次 prop 的开销可以忽略。
                         if (!"0".equals(prop("debug.xpan.configzoom"))) {
-                            // ★ 意图只认 ≥1.5 的请求（点 "2" chip）。应用自身被钉 1.0 后会周期性
-                            //   重发 1.0（会话重建/预览重启），对称目标逻辑会被它打回 1×——
-                            //   这就是"2× 自己失效"的根因（实测踩过）。回 1× = 再点一次 "2"。
-                            //   冷却期内连 ≥1.5 也忽略（往返刚做完，防抖）。
-                            if (want >= 1.5f && !cropBusy()) {
-                                int next = (sCropZoom >= 2) ? 1 : 2;
-                                sCropZoom = next;
+                            // ★ 芯片直接映射（无翻转、无状态）：点 "2" 恒设 2×，点 "1×" 恒设 1×。
+                            //   翻转式设计在"请求文件/配置/用户预期"三者失步时会把 2× 翻成 1×
+                            //   （用户点 2 毫无反应 —— 实测踩过）。应用自身的 1.0 请求（初始化恢复）
+                            //   落在冷却期内被跳过（实测配置在连拍后仍保持 2×，无自发 1.0 重发）。
+                            int target = (want >= 1.5f) ? 2 : 1;
+                            if (target != sCropZoom && !cropBusy()) {
+                                sCropZoom = target;
                                 sZoomIgnoreUntil = System.currentTimeMillis() + 15000L;
-                                writeCropRequest(next);
-                                XposedBridge.log(TAG + "X-Pan 倍率开关 → " + next + "×");
+                                writeCropRequest(target);
+                                XposedBridge.log(TAG + "X-Pan 倍率 → " + target + "×（配置换带）");
                             }
                             sXpanZoomReq = (sCropZoom >= 2) ? 2.0f : 1.0f;
                             if (param.getResult() != null && ((Float) param.getResult()) != 1.0f) {
