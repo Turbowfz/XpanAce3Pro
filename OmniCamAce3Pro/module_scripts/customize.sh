@@ -1,4 +1,4 @@
-# Settings app and hooks: install the APK this module ships while the module is flashed, so LSPosed
+# Hooks app: install the single Muse APK this module ships while the module is flashed, so LSPosed
 # points at it before the reboot that activates the module. A failed install (e.g. a different
 # signing key) is left as it is and logged to install.log; the installed app is never uninstalled.
 
@@ -16,7 +16,7 @@ fi
 [ -f "$MODPATH/action.sh" ] && chmod 0755 "$MODPATH/action.sh"
 
 PACKAGE=local.jiege.camera
-APK=$(ls "$MODPATH"/omnicam-muse-*.apk 2>/dev/null | head -n 1)
+APK=$(ls "$MODPATH"/omnicam-muse*.apk 2>/dev/null | head -n 1)
 STAGED=/data/local/tmp/omnicam-muse-module.apk
 HAVE=$(dumpsys package "$PACKAGE" 2>/dev/null | sed -n 's/.*versionCode=\([0-9]*\).*/\1/p' | head -n 1)
 WANT=$(sed -n 's/^versionCode=//p' "$MODPATH/module.prop")
@@ -27,7 +27,14 @@ else
     RESULT="APK missing or not staged"
 fi
 printf 'installed %s -> %s: %s\n' "${HAVE:-none}" "$WANT" "$RESULT" > "$MODPATH/install.log"
-ui_print "- Settings app: $RESULT"
+ui_print "- Muse 应用: $RESULT"
+
+# Earlier test builds shipped a separate settings app (com.xpanport.omnicamset). This build is
+# single-APK: uninstall the old one if it is still around so it does not linger as a dead icon.
+if pm list packages 2>/dev/null | grep -q "^package:com.xpanport.omnicamset$"; then
+    pm uninstall --user 0 com.xpanport.omnicamset >> "$MODPATH/install.log" 2>&1 \
+        && ui_print "- 已移除旧版独立设置应用"
+fi
 
 # Builds up to 430 staged the config profile from this script with root and then ran restorecon on
 # it, which drops the app's SELinux categories: the camera could not read the file and every mode

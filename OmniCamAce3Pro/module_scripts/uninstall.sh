@@ -92,9 +92,12 @@ if [ -f "$GALLERY_PREF" ]; then
     say "gallery gr switch turned off"
 fi
 
-# 9. The settings app the module installed. Its data goes with it.
-if pm list packages 2>/dev/null | grep -q "^package:local.jiege.camera$"; then
-    pm uninstall --user 0 local.jiege.camera >> "$LOG" 2>&1 && say "settings app uninstalled"
-fi
+# 9. The hooks app the module installs, plus the separate settings app early test builds shipped.
+#    Their data goes with them.
+for PKG in local.jiege.camera com.xpanport.omnicamset; do
+    if pm list packages 2>/dev/null | grep -q "^package:$PKG$"; then
+        pm uninstall --user 0 "$PKG" >> "$LOG" 2>&1 && say "$PKG uninstalled"
+    fi
+done
 
 say "done"
