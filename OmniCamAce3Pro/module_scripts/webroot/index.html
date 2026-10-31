@@ -43,6 +43,15 @@
   <p class="desc">替换库缺 98 个本机原厂符号，<b>默认不替换</b>。要试 POP/GR 胶片滤镜的，到 KernelSU 模块卡片按「执行」按钮开启（可随时关回），重启手机生效。</p>
 </div>
 
+<div class="card">
+  <h2>OmniCam+ 钩子总开关（排查卡死用）</h2>
+  <p class="desc">关闭后我们自己的钩子（静音/闪光记忆/影调）全部不装，Muse 的钩子不受影响。重启手机生效。</p>
+  <div class="row">
+    <button class="off" onclick="bridgeOff(true)">关闭 OmniCam+</button>
+    <button class="on" onclick="bridgeOff(false)">开启 OmniCam+</button>
+  </div>
+</div>
+
 <div id="st">加载中…</div>
 <p class="note">没有 WebUI 按钮时（KernelSU 版本过旧），用 adb 等价操作：<br>
 开启静音：<code>su -c "touch /sdcard/DCIM/.omnicam_silent"</code><br>
@@ -66,11 +75,19 @@ function set(file, on) {
   });
 }
 function show(s) { document.getElementById('st').textContent = s; }
+function bridgeOff(off) {
+  var cmd = off ? 'touch /data/adb/omnicam_bridge_off' : 'rm -f /data/adb/omnicam_bridge_off';
+  exec(cmd, function(code, out, err) {
+    show((code === 0 ? '✓ OmniCam+ 钩子已' + (off ? '关闭' : '开启') + '，重启手机生效' : '✗ 失败: ' + (err || code)));
+  });
+}
 function status() {
-  exec('ls /sdcard/DCIM/.omnicam_silent /sdcard/DCIM/.omnicam_tone 2>&1', function(code, out) {
+  exec('ls /sdcard/DCIM/.omnicam_silent /sdcard/DCIM/.omnicam_tone /data/adb/omnicam_bridge_off 2>&1', function(code, out) {
+    var has = function(f) { return out.indexOf(f) >= 0 && out.indexOf('No such') < 0; };
     var m = '当前状态：\n' +
-      '静音：' + (out.indexOf('.omnicam_silent') >= 0 && out.indexOf('No such') < 0 ? '开' : '关') + '\n' +
-      '影调：' + (out.indexOf('.omnicam_tone') >= 0 && out.indexOf('No such') < 0 ? '开' : '关');
+      '静音：' + (has('.omnicam_silent') ? '开' : '关') + '\n' +
+      '影调：' + (has('.omnicam_tone') ? '开' : '关') + '\n' +
+      'OmniCam+ 钩子：' + (has('omnicam_bridge_off') ? '关（重启后生效）' : '开');
     show(m);
   });
 }
