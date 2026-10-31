@@ -1,0 +1,6 @@
+id=OmniCamAce3Pro
+name=OmniCam（Ace 3 Pro）
+version=Muse 4.24 GT7Pro (Ace3Pro)
+versionCode=496
+author=Turbo / OmniCam-Muse (GPL-3.0)
+description=OmniCam-Muse GT7Pro 版的 Ace 3 Pro 适配（数据挂载层 + Muse GT7Pro 钩子应用 + 设置应用）。目标相机 6.020.876——兼容性未验证，Muse 设置应用内的注入状态卡会如实显示各项状态。
