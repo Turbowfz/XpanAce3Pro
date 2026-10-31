@@ -19,6 +19,18 @@
 # Kill switch: touch /data/adb/omnicam_off, then reboot.
 
 MODDIR=${0%/*}
+
+# Feature-hiding gate: the hooks app hides features this camera build cannot support. The camera
+# version decides - 6.020.876 hides the 7.x-only set (POP / GR / 25MP / 200MP / tilt-shift); anything
+# else shows everything, so a future system update brings the items back on its own, no reflash.
+# The marker lives on /sdcard because both the camera process (which runs the hooks) and the app
+# read it there. Idempotent: this script runs at late_start and again from boot-completed.
+CAM_VER=$(dumpsys package com.oplus.camera 2>/dev/null | sed -n 's/.*versionName=\([0-9.]*\).*/\1/p' | head -n 1)
+case "$CAM_VER" in
+    6.020.876) touch /sdcard/DCIM/.omnicam_c16_hide 2>/dev/null ;;
+    *) rm -f /sdcard/DCIM/.omnicam_c16_hide 2>/dev/null ;;
+esac
+
 APP=/data/user/0/com.oplus.camera
 GALLERY=/data/user/0/com.coloros.gallery3d
 

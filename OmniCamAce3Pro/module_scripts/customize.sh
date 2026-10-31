@@ -9,7 +9,12 @@
 WANT_CAM="6.020.876 或 7.012.64"
 GOT_CAM=$(dumpsys package com.oplus.camera 2>/dev/null | sed -n 's/.*versionName=\([0-9.]*\).*/\1/p' | head -n 1)
 case "$GOT_CAM" in
-    6.020.876|7.012.64) ;;
+    6.020.876)
+        : > /sdcard/DCIM/.omnicam_c16_hide 2>/dev/null
+        ;;
+    *)
+        rm -f /sdcard/DCIM/.omnicam_c16_hide 2>/dev/null
+        ;;
     *)
         ui_print "!"
         ui_print "! 本包只适配：一加 Ace 3 Pro（PJX110）"
