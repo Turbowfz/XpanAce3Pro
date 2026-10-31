@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OmniCam Ace3Pro 开关</title>
+<style>
+  body{font-family:system-ui,sans-serif;background:#101418;color:#e8eaed;margin:0;padding:16px;max-width:520px;margin:0 auto}
+  h2{font-size:18px;margin:8px 0 4px}
+  p.desc{font-size:13px;color:#9aa0a6;margin:4px 0 12px;line-height:1.5}
+  .card{background:#1b2129;border-radius:12px;padding:14px;margin-bottom:14px}
+  .row{display:flex;gap:10px;margin-top:8px}
+  button{flex:1;padding:12px;border:0;border-radius:10px;font-size:15px;color:#fff}
+  .on{background:#1a73e8}.off{background:#5f6368}.warn{background:#b3261e}
+  #st{font-size:13px;background:#0c0f12;border-radius:8px;padding:10px;margin-top:10px;white-space:pre-wrap;word-break:break-all}
+  .note{font-size:12px;color:#9aa0a6;margin-top:8px;line-height:1.5}
+</style>
+</head>
+<body>
+<h2>OmniCam Ace3Pro 开关</h2>
+<p class="desc">改动最多 2 秒生效（相机里读开关有缓存）；「影调」和「渲染器」改完要重启相机/手机。</p>
+
+<div class="card">
+  <h2>相机静音</h2>
+  <p class="desc">快门/对焦/倒计时等全部提示音不播放（系统非静音模式也生效）。</p>
+  <div class="row">
+    <button class="on" onclick="set('.omnicam_silent', true)">开启静音</button>
+    <button class="off" onclick="set('.omnicam_silent', false)">关闭静音</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>哈苏自然影调（C17 相机 7.012.64）</h2>
+  <p class="desc">打开后相机才会应用挂载层里的影调数据（X8U 影调表）。改完重启相机。<b>默认关。</b></p>
+  <div class="row">
+    <button class="on" onclick="set('.omnicam_tone', true)">开启影调</button>
+    <button class="off" onclick="set('.omnicam_tone', false)">关闭影调</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Meishe 渲染器替换（POP/GR 胶片滤镜）</h2>
+  <p class="desc">替换库缺 98 个本机原厂符号，<b>默认不替换</b>。要试 POP/GR 胶片滤镜的，到 KernelSU 模块卡片按「执行」按钮开启（可随时关回），重启手机生效。</p>
+</div>
+
+<div id="st">加载中…</div>
+<p class="note">没有 WebUI 按钮时（KernelSU 版本过旧），用 adb 等价操作：<br>
+开启静音：<code>su -c "touch /sdcard/DCIM/.omnicam_silent"</code><br>
+关闭静音：<code>su -c "rm /sdcard/DCIM/.omnicam_silent"</code><br>
+影调同理，文件名 .omnicam_tone。</p>
+
+<script>
+var n = 0;
+function exec(cmd, cb) {
+  if (typeof ksu !== 'undefined' && ksu.exec) {
+    var name = 'cb' + (++n);
+    window[name] = function(code, out, err) { cb(code, out, err); };
+    try { ksu.exec(cmd, '{}', name); } catch (e) { cb(-1, '', String(e)); }
+  } else { cb(-1, '', '此环境不支持 ksu.exec（KernelSU 管理器过旧）'); }
+}
+function set(file, on) {
+  var cmd = on ? ('touch /sdcard/DCIM/' + file) : ('rm -f /sdcard/DCIM/' + file);
+  exec(cmd, function(code, out, err) {
+    show((code === 0 ? '✓ 已' + (on ? '开启' : '关闭') + ' ' + file : '✗ 失败: ' + (err || code)) +
+         '\n（影调改动需重启相机生效）');
+  });
+}
+function show(s) { document.getElementById('st').textContent = s; }
+function status() {
+  exec('ls /sdcard/DCIM/.omnicam_silent /sdcard/DCIM/.omnicam_tone 2>&1', function(code, out) {
+    var m = '当前状态：\n' +
+      '静音：' + (out.indexOf('.omnicam_silent') >= 0 && out.indexOf('No such') < 0 ? '开' : '关') + '\n' +
+      '影调：' + (out.indexOf('.omnicam_tone') >= 0 && out.indexOf('No such') < 0 ? '开' : '关');
+    show(m);
+  });
+}
+status();
+</script>
+</body>
+</html>

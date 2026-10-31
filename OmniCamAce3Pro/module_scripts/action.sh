@@ -1,31 +1,25 @@
 #!/system/bin/sh
-# KernelSU 的模块卡片上按「执行」时运行这里。
+# KernelSU 的模块卡片上按「执行」时运行这里：开关 Meishe 渲染器替换（POP/GR 胶片滤镜的画面来源）。
 #
-# 目前只有一件事需要人在手机上决定：要不要用模块自带的 Meishe 渲染器
-# （/odm/lib64/libmsnativefilter.so）替换原厂那一个。
+# 背景：本机原厂 /odm/lib64/libmsnativefilter.so（6218904 字节）没有 CNvPolaroid / CNvFilterCCD /
+# CNvPortra400 / CNvShapeMask / CNvCompoundLutTiled 渲染器，POP 和 GR 的四款胶片滤镜渲染不出画面。
+# 模块带的替换库（10957976 字节，4097 导出）含这些渲染器。
 #
-# 为什么需要它：POP（Polaroid）和 GR 的四款胶片滤镜是 Meishe 的 renderer，不在 BasicTone 里。
-# 本机原厂的 libmsnativefilter.so 只有 2,723 个导出，**没有** CNvPolaroid / CNvFilterCCD /
-# CNvPortra400 / CNvShapeMask / CNvCompoundLutTiled，所以 POP 渲染不出画面（取景黑屏、成片纯绿），
-# GR 除「标准」以外的四款也一样。模块带的是含这些 renderer 的版本。
+# ⚠️ 与 GT7Pro 版的重要差别：对照过本机原厂库（2391 导出）与替换库的导出表，替换库
+# **缺 98 个本机原厂符号**（CNvBlackSoft / NvGenerateHDRPlusToneMapData / CMraContext 等）。
+# 注册模型下大概率无碍（缺的只是那几个滤镜），但不排除个别滤镜/功能黑屏。
+# 所以 v0.4 起默认**不替换**（库停在 msfilter-off/，行为与原厂完全一致），想试 POP/GR 的
+# 再用本开关打开；任何滤镜异常就再按一次关回来，重启即还原。
 #
-# 487 起这个文件是挂载层的一部分（system/odm/lib64/libmsnativefilter.so），由 magic mount 挂上去，
-# 所以「关掉」不是写个标记就完事，得把它从层里挪出去 —— 本脚本做的就是这件事：
+# 状态以「库在哪」为准（挂载层数据源），/data/adb/omnicam_msfilter_off 标记同步维护
+# （service.sh 的 bind 兜底读它）。
 #
-#   开：把 msfilter-off/libmsnativefilter.so 挪回 system/odm/lib64/，删掉标记
-#   关：把它挪到 msfilter-off/，并写标记（标记同时让 service.sh 的 bind 兜底不再执行）
-#
-# 两种状态都要重启手机才生效：库在相机启动前就要挂好。
-#
-# 手动等价操作：
-#   关：mv system/odm/lib64/libmsnativefilter.so msfilter-off/ && touch /data/adb/omnicam_msfilter_off
-#   开：mv msfilter-off/libmsnativefilter.so system/odm/lib64/ && rm -f /data/adb/omnicam_msfilter_off
-#   然后 reboot
+# 两种状态都要重启手机才生效。
 
 MODDIR=${0%/*}
-OFF=/data/adb/omnicam_msfilter_off
 LAYER=$MODDIR/system/odm/lib64
 PARKED=$MODDIR/msfilter-off
+OFF=/data/adb/omnicam_msfilter_off
 LIB=libmsnativefilter.so
 
 say() {
@@ -39,17 +33,16 @@ if [ -f "$LAYER/$LIB" ]; then
     mv -f "$LAYER/$LIB" "$PARKED/$LIB" 2>/dev/null
     : > "$OFF"
     say "Meishe 渲染器替换：已关闭"
-    say "模块自带的渲染器已从挂载层移出，重启后相机用回原厂那个。"
-    say "POP 与 GR 的四款胶片滤镜会重新变成黑屏，其余功能不受影响。"
-else
-    if [ -f "$PARKED/$LIB" ]; then
-        mv -f "$PARKED/$LIB" "$LAYER/$LIB" 2>/dev/null
-        say "Meishe 渲染器替换：已开启"
-        say "模块自带的渲染器已放回挂载层，重启后 POP 和 GR 的四款胶片滤镜才有画面。"
-    else
-        say "找不到模块自带的 libmsnativefilter.so —— 这个安装包不完整，请重新刷入模块。"
-    fi
+    say "替换库已收回 msfilter-off/，重启后相机用回原厂渲染器（6218904 字节）。"
+    say "POP 与 GR 的四款胶片滤镜会回到黑屏，其余功能不受影响。"
+elif [ -f "$PARKED/$LIB" ]; then
+    mv -f "$PARKED/$LIB" "$LAYER/$LIB" 2>/dev/null
     rm -f "$OFF"
+    say "Meishe 渲染器替换：已开启"
+    say "替换库已放进挂载层，重启后 POP 和 GR 的四款胶片滤镜才有画面。"
+    say "提醒：替换库缺 98 个本机原厂导出符号，若个别滤镜异常，再按一次本按钮关闭。"
+else
+    say "找不到模块自带的 $LIB —— 这个安装包不完整，请重新刷入模块。"
 fi
 
 # 相机正在跑的时候换库没有意义，下一次启动才会重新 dlopen。

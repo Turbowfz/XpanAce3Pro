@@ -1,6 +1,6 @@
 id=OmniCamAce3Pro
 name=OmniCam（Ace 3 Pro）
-version=Muse 4.24 GT7Pro (Ace3Pro)
+version=Muse 4.24 Ace3Pro (C16+C17 双版本)
 versionCode=496
 author=Turbo / OmniCam-Muse (GPL-3.0)
-description=OmniCam-Muse GT7Pro 版的 Ace 3 Pro 适配（数据挂载层 + Muse GT7Pro 钩子应用，单 APK）。只适配一加 Ace 3 Pro（PJX110）相机 6.020.876，其它机型/相机版本（含一切 7.x）不支持，安装脚本会直接拒绝。Muse 应用内的注入状态卡会如实显示各项状态。
+description=OmniCam-Muse GT7Pro 版的 Ace 3 Pro 适配（数据挂载层 + Muse 应用 + OmniCam+ 双版本钩子，单 APK）。只适配一加 Ace 3 Pro（PJX110）相机 6.020.876（ColorOS 16）或 7.012.64（ColorOS 17），其它机型/版本安装脚本直接拒绝。功能：相机静音（开关见 KernelSU 模块 WebUI）、按模式记忆闪光灯、X8U 影调表挂载、影调开关（C17）、Meishe 渲染器替换（默认关，模块卡「执行」开关）。
