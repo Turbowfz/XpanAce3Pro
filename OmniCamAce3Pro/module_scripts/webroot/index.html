@@ -52,6 +52,14 @@
   </div>
 </div>
 
+<div class="card">
+  <h2>日志打包（反馈问题用）</h2>
+  <p class="desc">把 LSPosed 模块日志 + 本模块全部日志打成一个包，存到 下载/Download/omni_logs.tar，用文件管理器或聊天软件直接发出去即可。</p>
+  <div class="row">
+    <button class="on" onclick="packLogs()">打包日志</button>
+  </div>
+</div>
+
 <div id="st">加载中…</div>
 <p class="note">没有 WebUI 按钮时（KernelSU 版本过旧），用 adb 等价操作：<br>
 开启静音：<code>su -c "touch /sdcard/DCIM/.omnicam_silent"</code><br>
@@ -79,6 +87,20 @@ function bridgeOff(off) {
   var cmd = off ? 'touch /data/adb/omnicam_bridge_off' : 'rm -f /data/adb/omnicam_bridge_off';
   exec(cmd, function(code, out, err) {
     show((code === 0 ? '✓ OmniCam+ 钩子已' + (off ? '关闭' : '开启') + '，重启手机生效' : '✗ 失败: ' + (err || code)));
+  });
+}
+function packLogs() {
+  var cmd = "tar -cf /sdcard/Download/omni_logs.tar /data/adb/lspd/log " +
+            "/data/adb/modules/OmniCamAce3Pro/install.log /data/adb/modules/OmniCamAce3Pro/action.log " +
+            "/data/adb/modules/OmniCamAce3Pro/bind.log /data/local/tmp/omnicam-bind.log " +
+            "/data/local/tmp/omnicam-uninstall.log 2>/dev/null; " +
+            "chmod 644 /sdcard/Download/omni_logs.tar; ls -la /sdcard/Download/omni_logs.tar";
+  show('打包中…');
+  exec(cmd, function(code, out, err) {
+    show(code === 0
+      ? '✓ 已打包：下载(Download)/omni_logs.tar\n' + out +
+        '\n（LSPosed 日志只含模块日志；要完整版在 LSPosed 管理器→日志 里另存）'
+      : '✗ 打包失败: ' + (err || code));
   });
 }
 function status() {
