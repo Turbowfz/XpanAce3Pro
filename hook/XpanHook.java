@@ -1175,10 +1175,11 @@ public class XpanHook implements IXposedHookLoadPackage {
      *
      * 做法：在档位列表交给变焦条之前，把不要的档位剔掉 ——
      *   1) ≤0 的非法档位（DUAL=0.0 那个渲染成 "0" 的按钮）；
-     *   2) <1.0 的档位 = 0.6× 超广角，按用户要求删掉（2026-10-06）：本机超广角的 X-Pan 成像
-     *      通路没被 OPPO 调过，出片绿帧/噪声不可靠，X-Pan 只留 1×/2×。
+     *   2) 0.6× 超广角：本机超广角的 X-Pan 成像通路没被 OPPO 调过，出片绿帧/噪声不可靠；
+     *   3) 2× 长焦：本机 HAL 对 X-Pan 的 65:24 流不做变焦裁剪（三路实测全死），
+     *      按用户要求删掉（2026-11-07）—— 变焦条**只留 1×**。
      *   只动值列表、不动 IconType 顺序 —— 按钮文字取的是"值"，
-     *   所以剔掉后是 1 | 2，点按映射也不会错位。
+     *   所以剔掉后只剩 1x，点按映射也不会错位。
      */
     private void installXpanZoomPointFix(XC_LoadPackage.LoadPackageParam lp) {
         try {
@@ -1212,11 +1213,13 @@ public class XpanHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** 档位列表里是否还有需要剔除的档位（≤0 非法 / <1.0 的 0.6× 超广角） */
+    /** 档位列表里是否还有需要剔除的档位（≠1× 的全部剔掉：≤0 非法、0.6× 超广角、2× 长焦） */
     private static boolean hasBadZoomPoint(List<?> list) {
         for (int i = list.size() - 1; i >= 0; i--) {
             Object v = list.get(i);
-            if (v instanceof Float && ((Float) v) < 1.0f) return true;
+            if (!(v instanceof Float)) continue;
+            float f = (Float) v;
+            if (f < 0.99f || f > 1.01f) return true;
         }
         return false;
     }
@@ -1226,10 +1229,12 @@ public class XpanHook implements IXposedHookLoadPackage {
             Object v = list.get(i);
             if (!(v instanceof Float)) continue;
             float f = (Float) v;
-            if (f >= 1.0f) continue;   // 保留 1× 及以上
+            if (f >= 0.99f && f <= 1.01f) continue;   // 只保留 1×
             list.remove(i);
             XposedBridge.log(TAG + "xpan 变焦条剔掉档位 " + v
-                    + (f <= 0f ? "（非法）" : "（0.6× 超广角，按要求删除）"));
+                    + (f <= 0f ? "（非法）"
+                       : f < 1f ? "（0.6× 超广角，超广角出片不可靠）"
+                       : "（2× 长焦，本机 HAL 不支持真裁切）"));
         }
     }
 
@@ -2467,15 +2472,15 @@ public class XpanHook implements IXposedHookLoadPackage {
         if (sCaptureSize != null) return sCaptureSize;
         String p = prop("debug.xpan.capture");
         Size s = parseSize(p);
-        // ★ 默认 4096x1512（真实像素通路：最清晰、无重影）。8192x3024 是算法放大
-        //   （像素 ×4、细节不变）且走 remosaic 通路自带 2~3 像素错位重影 ——
-        //   想要大数字：setprop debug.xpan.capture 8192x3024 或建 /sdcard/DCIM/.xpan_bigpic
-        if (s == null && bigPicEnabled()) {
-            s = parseSize(BIG_CAPTURE);
-            XposedBridge.log(TAG + "大图档标记存在 → " + BIG_CAPTURE + "（算法放大、带重影）");
+        // ★ 默认 8192x3024（24.8MP，用户 2026-11-07 定）；想回 4096x1512 真实像素档
+        //   （最清晰、无 2~3 像素重影）：建 /sdcard/DCIM/.xpan_smallpic 空文件并重启相机。
+        //   .xpan_bigpic 作为旧开关保留，仍等价于默认。
+        if (s == null && smallPicEnabled()) {
+            s = parseSize(DEFAULT_CAPTURE);
+            XposedBridge.log(TAG + "小图档标记存在 → " + DEFAULT_CAPTURE + "（真实像素、无重影）");
         }
-        if (s == null) s = parseSize(DEFAULT_CAPTURE);
-        if (s == null) s = new Size(4096, 1512);
+        if (s == null) s = parseSize(BIG_CAPTURE);
+        if (s == null) s = new Size(8192, 3024);
         sCaptureSize = s;
         XposedBridge.log(TAG + "captureSize resolved = " + s);
         return s;
@@ -2483,6 +2488,16 @@ public class XpanHook implements IXposedHookLoadPackage {
 
     /** 可选大图档开关：/sdcard/DCIM/.xpan_bigpic（空文件）存在 → 8192x3024（算法放大、
      *  带 2~3 像素重影）。默认（无文件）= 4096x1512 真实像素。改完重启相机生效。 */
+    /** 小图档（4096x1512 真实像素）：/sdcard/DCIM/.xpan_smallpic 空文件。 */
+    private static boolean smallPicEnabled() {
+        try {
+            if (new File("/storage/emulated/0/DCIM/.xpan_smallpic").exists()) return true;
+            return new File("/storage/emulated/0/Android/media/com.oneplus.camera/.xpan_smallpic").exists();
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     private static boolean bigPicEnabled() {
         try {
             if (new File("/storage/emulated/0/DCIM/.xpan_bigpic").exists()) return true;
