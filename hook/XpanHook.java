@@ -140,6 +140,7 @@ public class XpanHook implements IXposedHookLoadPackage {
         installSurfaceSetters(lp);
         installXpanSurfaceSize(lp);
         installTakePictureProbe(lp);
+        installProxdrPost(lp);
         installXpanUiRestore(lp);
         installXpanZoomUnlock(lp);
         installXpanZoomPointFix(lp);
@@ -2567,5 +2568,607 @@ public class XpanHook implements IXposedHookLoadPackage {
             XposedBridge.log(TAG + "currentContext failed: " + t);
         }
         return null;
+    }
+
+    /* ==================================================================================
+     *  ProXDR 增益图调整（ratioMax 8x）：出片后处理，全局生效（2026-10-18 配方，实测通过）
+     *  ① ratioMax 提到 8 倍 → ProXDR 高光更亮（tmap 定点 + XMP 等长替换）
+     *  ② 就地覆盖、两阶段写入等待、水印条增益压平
+     *  开关：prop debug.xpan.proxdr = "0" 关闭；debug.xpan.proxdr.ratio 改倍率
+     * ================================================================================== */
+    private static final String PX_TMAP_TYPE = "tmap";
+    private static final java.util.HashMap<String, long[]> sPxState = new java.util.HashMap<>();
+    private static final String DCIM_CAMERA = "/storage/emulated/0/DCIM/Camera";
+    private static final class Hx {
+        byte[] d;
+        java.util.HashMap<Integer, String> types = new java.util.HashMap<>();
+        java.util.HashMap<Integer, int[]> ext = new java.util.HashMap<>();   // id -> {cm, off, len}
+        java.util.HashMap<Integer, int[]> extField = new java.util.HashMap<>(); // id -> {offPos, offSz, lenPos, lenSz}
+        java.util.HashMap<Integer, int[]> dimg = new java.util.HashMap<>();  // from -> ids
+        java.util.HashMap<Integer, int[]> dimgPos = new java.util.HashMap<>(); // from -> {idsPos, count}
+        int pitm = -1;
+        int idatData = -1;                                                   // idat 载荷起点
+    }
+    private void installProxdrPost(XC_LoadPackage.LoadPackageParam lp) {
+        try {
+            Class<?> c = Class.forName("com.oplus.ocs.camera.producer.device.Camera2Impl",
+                    false, lp.classLoader);
+            int n = 0;
+            for (Method m : c.getDeclaredMethods()) {
+                if (!"takePicture".equals(m.getName()) || m.getParameterTypes().length != 5) continue;
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        try {
+                            if ("0".equals(prop("debug.xpan.proxdr"))) return;
+                            float z = 1.0f;
+                            Object zz = field(param.args[0], "mZoomRatio");
+                            if (zz instanceof Number) z = ((Number) zz).floatValue();
+                            final float zf = z;
+                            final java.io.File dir = new java.io.File(DCIM_CAMERA);
+                            final java.util.Set<String> before = pxListNames(dir);
+                            new Thread(new Runnable() {
+                                @Override
+                                public void run() {
+                                    pxWatch(dir, before, zf);
+                                }
+                            }, "xpan-proxdr").start();
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                });
+                n++;
+            }
+            XposedBridge.log(TAG + "hook installed OK (ProXDR 后处理 x" + n + ")");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "!! ProXDR 后处理安装失败: " + t);
+        }
+    }
+    private static void pxWatch(java.io.File dir, java.util.Set<String> before, float zoom) {
+        try {
+            int idle = 0;
+            for (int i = 0; i < 240; i++) {
+                Thread.sleep(500);
+                String[] a = dir.list();
+                if (a == null) continue;
+                boolean busy = false;
+                for (String nm : a) {
+                    if (before.contains(nm)) continue;
+                    String low = nm.toLowerCase();
+                    if (!low.endsWith(".heic") && !low.endsWith(".heif")) continue;
+                    java.io.File f = new java.io.File(dir, nm);
+                    long len = f.length();
+                    if (len < 20000) continue;
+                    busy = true;
+                    boolean go;
+                    synchronized (sPxState) {
+                        if (sPxState.size() > 200) sPxState.clear();   // 防慢性增长（一张照片一条）
+                        long[] st = sPxState.get(nm);
+                        if (st == null) {
+                            st = new long[]{len, 0, 0, 0};
+                            sPxState.put(nm, st);
+                        }
+                        if (st[0] != len) {                 // 长度又变了 → 相机在重写，重新计时
+                            st[0] = len;
+                            st[1] = 0;
+                            st[2] = 0;
+                            st[3] = 0;
+                        } else {
+                            st[1]++;
+                        }
+                        go = (st[1] >= 4 && st[2] == 0);
+                    }
+                    if (!go) continue;
+                    boolean ok = pxPostProcess(f, zoom);
+                    synchronized (sPxState) {
+                        long[] st = sPxState.get(nm);
+                        if (st != null) {
+                            st[0] = f.length();
+                            st[2] = ok ? 1 : 0;
+                            st[1] = ok ? st[1] : 0;         // 没写回就等下一轮稳定计数
+                        }
+                    }
+                }
+                if (busy) idle = 0;
+                else if (++idle >= 12) return;               // 连续 6 秒没新照片就收工
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "ProXDR 后处理轮询失败: " + t);
+        }
+    }
+    private static boolean pxPostProcess(java.io.File f, float zoom) {
+        StringBuilder log = new StringBuilder();
+        try {
+            if (f == null || !f.exists() || f.length() < 20000) return true;   // 没得处理，别再重试
+            if (!isHeifLike(f)) {
+                log.append("不是 HEIF，跳过; ");
+                return true;
+            }
+            byte[] data = pxReadAll(f);
+            long len0 = (data != null) ? data.length : -1;
+            Hx h = (data != null) ? hxParse(data) : null;
+            if (h == null) {
+                XposedBridge.log(TAG + "ProXDR 后处理：容器读不全（可能还在写），稍后重试");
+                return false;
+            }
+            boolean hasTmap = false;
+            for (String t : h.types.values()) if (PX_TMAP_TYPE.equals(t)) { hasTmap = true; break; }
+            if (!hasTmap) {
+                XposedBridge.log(TAG + "ProXDR 后处理：这一版还没有增益图（相机第一版），等它重写");
+                return false;
+            }
+            float ratio = 8.0f;
+            try {
+                String p = prop("debug.xpan.proxdr.ratio");
+                if (p != null && p.length() > 0) ratio = Float.parseFloat(p.trim());
+            } catch (Throwable ignored) {
+            }
+            // ★ 不再解 getGainmapContents()：那张 bitmap 是 4096x1512(≈24MB)，而它的唯一用途
+            //   （压平增益图）已经删掉了 —— 现在只需要 Gainmap 对象上的 ratioMax。省内存也省时间。
+            int decHeight = 0;
+            float curRatio = 4.956563f;
+            final int[] realH = new int[1];
+            try {
+                android.graphics.Bitmap b = android.graphics.ImageDecoder.decodeBitmap(
+                        android.graphics.ImageDecoder.createSource(f),
+                        new android.graphics.ImageDecoder.OnHeaderDecodedListener() {
+                            @Override
+                            public void onHeaderDecoded(android.graphics.ImageDecoder d,
+                                                        android.graphics.ImageDecoder.ImageInfo info,
+                                                        android.graphics.ImageDecoder.Source src) {
+                                d.setAllocator(android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE);
+                                // 全尺寸解码 8192x3528 要 ~100MB，相机进程吃不消；
+                                // 主体图缩到 1/4，尺寸从 header 拿，增益图按自己的尺寸解
+                                try {
+                                    android.util.Size sz = info.getSize();
+                                    if (sz != null && sz.getWidth() > 0) {
+                                        realH[0] = sz.getHeight();
+                                        if (sz.getWidth() > 2048) {
+                                            d.setTargetSize(sz.getWidth() / 4, sz.getHeight() / 4);
+                                        }
+                                    }
+                                } catch (Throwable ignored) {
+                                }
+                            }
+                        });
+                if (b != null) {
+                    decHeight = realH[0] > 0 ? realH[0] : b.getHeight();
+                    android.graphics.Gainmap gm = b.getGainmap();
+                    if (gm != null) {
+                        float[] rm = gm.getRatioMax();
+                        if (rm != null && rm.length > 0 && rm[0] > 1.0f) curRatio = rm[0];
+                    }
+                }
+            } catch (Throwable t) {
+                log.append("读增益图失败: ").append(t).append("; ");
+            }
+            int[] gwh0 = hxBaseGridOutWH(h);
+            boolean xpanShot0 = gwh0[0] > 0 && gwh0[1] > 0 && gwh0[0] >= gwh0[1] * 2;
+            // ★ 出片尺寸（用户要求：1× = 8192、2× = 4096），自己写"声明尺寸"。
+            //   背景：X-Pan 拍照流默认 4096x1512（干净通路，见 captureSize 注释 —— 8192 那条
+            //   全分辨率 remosaic 通路自带 2~3 像素双线重影）。而应用会把"声明尺寸"跟着拍照流走，
+            //   于是 1× 也变成 4096。这里改回来：
+            //     1× → 网格的 2 倍（8192 宽，等同应用原来的口径，解码器放大 2 倍输出）
+            //     2× → 网格本身（4096 宽，原生像素，不放大）
+            //   网格真实尺寸 gwh0 就是编码尺寸（4096x1512 或 4096x1764），所以两者都不损失真实细节。
+            if (xpanShot0 && gwh0[0] > 0 && gwh0[1] > 0) {
+                int[] ispe = hxIspeOfSize(h, gwh0[0], gwh0[1]);
+                if (ispe != null && ispe[1] > 0 && ispe[2] > 0 && zoom > 1.5f) {
+                    boolean x2 = true;
+                    int wantW = gwh0[0];
+                    int wantH = gwh0[1];
+                    if (ispe[1] != wantW || ispe[2] != wantH) {
+                        hxBe32Put(h.d, ispe[0] + 12, wantW);
+                        hxBe32Put(h.d, ispe[0] + 16, wantH);
+                        log.append("出片尺寸 ").append(ispe[1]).append("x").append(ispe[2])
+                                .append(" → ").append(wantW).append("x").append(wantH)
+                                .append(x2 ? "（2× 原生像素）; " : "（1× 网格×2）; ");
+                    }
+                }
+            }
+            // ★ ratioMax：XDR 亮度增强（用户 2026-11-07 要求）：提到 8 倍（只升不降），
+            //   **全局生效包括 X-Pan 照片**（2026-11-07 改：撤销 10-18 的 X-Pan 排除）。
+            if (ratio > curRatio + 0.01f) {
+                pxPatchRatioMax(h, ratio, curRatio, log);
+            } else {
+                log.append("ratioMax 已是 ").append(curRatio).append("，不降; ");
+            }
+            int[] gwh = hxBaseGridOutWH(h);
+            int outW = gwh[0], outH = gwh[1];
+            long lenNow = f.length();
+            if (lenNow != len0) {
+                log.append("文件长度变了（").append(len0).append("→").append(lenNow).append("），放弃写回; ");
+                XposedBridge.log(TAG + "ProXDR 后处理（未写回）: " + log);
+                return false;
+            }
+            boolean ok = pxWriteBack(f, data, log);
+            XposedBridge.log(TAG + "ProXDR 后处理" + (ok ? "完成" : "未写回")
+                    + "（倍率 " + zoom + "）: " + log);
+            return ok;
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "ProXDR 后处理失败（保留原图）: " + t);
+            return false;
+        }
+    }
+    private static boolean pxPatchRatioMax(Hx h, float ratio, float curRatio, StringBuilder log) {
+        try {
+            int[] ex = null;
+            for (java.util.Map.Entry<Integer, String> e : h.types.entrySet()) {
+                if (PX_TMAP_TYPE.equals(e.getValue())) {
+                    ex = h.ext.get(e.getKey());
+                    break;
+                }
+            }
+            if (ex == null || ex[0] != 0) {
+                log.append("没找到 tmap 项载荷; ");
+                return false;
+            }
+            int off = ex[1], len = ex[2];
+            if (len < 20 || len > 4096) {
+                log.append("tmap 载荷长度异常 ").append(len).append("; ");
+                return false;
+            }
+            double log2Now = Math.log(curRatio > 1.0f ? curRatio : 4.956563f) / Math.log(2.0);
+            double log2New = Math.log(ratio) / Math.log(2.0);
+            // 定点标度按文件自己探测：实测同一台相机 X-Pan 出片是 ×2^21、拍照模式出片是 ×2^23
+            // （设备上跑两个变体验证过：×2^23 那版解码器读出来正好 8.0，×2^21 那版读出来 1.68）
+            int scaleBits = 0, nowFixed = 0;
+            for (int k : new int[]{21, 23, 22}) {
+                int v = (int) Math.round(log2Now * (1 << k));
+                if (v <= 0) continue;
+                byte[] p = new byte[]{(byte) (v >> 24), (byte) (v >> 16), (byte) (v >> 8), (byte) v};
+                int at = hxIndexOfFrom(h.d, p, off);
+                if (at >= 0 && at + 4 <= off + len) {
+                    scaleBits = k;
+                    nowFixed = v;
+                    break;
+                }
+            }
+            if (scaleBits == 0) {
+                log.append("tmap 里没匹配到 ratioMax 字节（当前 ").append(curRatio).append("）; ");
+                return false;
+            }
+            int newFixed = (int) Math.round(log2New * (1 << scaleBits));
+            byte[] pat = new byte[]{(byte) (nowFixed >> 24), (byte) (nowFixed >> 16),
+                    (byte) (nowFixed >> 8), (byte) nowFixed};
+            byte[] rep = new byte[]{(byte) (newFixed >> 24), (byte) (newFixed >> 16),
+                    (byte) (newFixed >> 8), (byte) newFixed};
+            int patched = 0;
+            for (int i = 0; i + 4 <= len; i++) {
+                boolean hit = true;
+                for (int k = 0; k < 4; k++) {
+                    if (h.d[off + i + k] != pat[k]) {
+                        hit = false;
+                        break;
+                    }
+                }
+                if (!hit) continue;
+                System.arraycopy(rep, 0, h.d, off + i, 4);
+                patched++;
+            }
+            if (patched == 0) {
+                log.append("tmap 里没匹配到 ratioMax 字节（当前 ").append(curRatio).append("）; ");
+                return false;
+            }
+            log.append("ratioMax ").append(curRatio).append("→").append(ratio)
+                    .append("（定点 ×2^").append(scaleBits).append("，改了 ").append(patched)
+                    .append(" 处）; ");
+            // XMP 里的两个同名字符串（"%.6f" 定宽，只在长度一致时原位替换，宁可不改也不写坏）
+            String val = String.format(java.util.Locale.US, "%.6f", log2New);
+            String valOld = String.format(java.util.Locale.US, "%.6f", log2Now);
+            int xmpChanged = 0;
+            for (String key : new String[]{"GainMapMax=\"", "HDRCapacityMax=\""}) {
+                byte[] kb = key.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
+                byte[] ob = valOld.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
+                byte[] nb = val.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
+                int i = hxIndexOf(h.d, kb);
+                while (i >= 0) {
+                    int q = i + kb.length;
+                    if (ob.length == nb.length && q + ob.length <= h.d.length) {
+                        boolean same = true;
+                        for (int k = 0; k < ob.length; k++) if (h.d[q + k] != ob[k]) same = false;
+                        if (same) {
+                            System.arraycopy(nb, 0, h.d, q, nb.length);
+                            xmpChanged++;
+                        }
+                    }
+                    i = hxIndexOfFrom(h.d, kb, q);
+                }
+            }
+            if (xmpChanged > 0) log.append("XMP 字符串改了 ").append(xmpChanged).append(" 处; ");
+            return true;
+        } catch (Throwable t) {
+            log.append("改 ratioMax 失败: ").append(t).append("; ");
+            return false;
+        }
+    }
+    private static byte[] pxReadAll(java.io.File f) {
+        try {
+            int len = (int) f.length();
+            if (len <= 0 || len > (1 << 28)) return null;
+            byte[] b = new byte[len];
+            java.io.FileInputStream in = new java.io.FileInputStream(f);
+            int n = 0;
+            while (n < len) {
+                int r = in.read(b, n, len - n);
+                if (r <= 0) break;
+                n += r;
+            }
+            in.close();
+            return (n == len) ? b : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+    private static boolean pxWriteBack(java.io.File f, byte[] data, StringBuilder log) {
+        java.io.File tmp = new java.io.File(f.getParentFile(), f.getName() + ".xptmp");
+        try {
+            java.io.FileOutputStream fos = new java.io.FileOutputStream(tmp);
+            fos.write(data);
+            fos.flush();
+            fos.close();
+            if (tmp.length() != data.length) {
+                log.append("临时文件长度不对，放弃写回; ");
+                tmp.delete();
+                return false;
+            }
+        } catch (Throwable t) {
+            log.append("写临时文件失败（").append(t).append("），放弃写回; ");
+            try {
+                tmp.delete();
+            } catch (Throwable ignored) {
+            }
+            return false;
+        }
+        try {
+            java.io.FileOutputStream fos = new java.io.FileOutputStream(f);
+            fos.write(data);
+            fos.flush();
+            fos.close();
+        } catch (Throwable t) {
+            log.append("就地写回失败: ").append(t).append("; ");
+            try {
+                tmp.delete();
+            } catch (Throwable ignored) {
+            }
+            return false;
+        }
+        try {
+            tmp.delete();
+        } catch (Throwable ignored) {
+        }
+        return true;
+    }
+    private static java.util.Set<String> pxListNames(java.io.File d) {
+        java.util.Set<String> s = new java.util.HashSet<>();
+        try {
+            String[] a = d.list();
+            if (a != null) java.util.Collections.addAll(s, a);
+        } catch (Throwable ignored) {
+        }
+        return s;
+    }
+    private static boolean isHeifLike(java.io.File f) {
+        try {
+            byte[] b = new byte[12];
+            java.io.FileInputStream in = new java.io.FileInputStream(f);
+            int n = in.read(b);
+            in.close();
+            return n == 12 && b[4] == 'f' && b[5] == 't' && b[6] == 'y' && b[7] == 'p';
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+    private static Hx hxParse(byte[] d) {
+        try {
+            Hx h = new Hx();
+            h.d = d;
+            int[] meta = null, mdat = null;
+            for (int[] b : hxKids(d, 0, d.length)) {
+                String t = hxType(d, b[0]);
+                if (t.equals("meta")) meta = b;
+                else if (t.equals("mdat")) mdat = b;
+            }
+            if (meta == null || mdat == null) return null;
+            int ms = meta[0] + meta[2] + 4, me = meta[0] + meta[1];
+            int[] iinf = hxFind(d, ms, me, "iinf");
+            int[] iloc = hxFind(d, ms, me, "iloc");
+            int[] iref = hxFind(d, ms, me, "iref");
+            int[] pitm = hxFind(d, ms, me, "pitm");
+            int[] idat = hxFind(d, ms, me, "idat");
+            if (iinf == null || iloc == null || pitm == null) return null;
+            if (idat != null) h.idatData = idat[0] + idat[2];
+            // iinf: id -> type
+            int p = iinf[0] + 12;
+            int cnt = hxBe16(d, p);
+            p += 2;
+            for (int i = 0; i < cnt; i++) {
+                int isz = hxBe32(d, p);
+                h.types.put(hxBe16(d, p + 12), new String(d, p + 16, 4,
+                        java.nio.charset.StandardCharsets.ISO_8859_1));
+                p += isz;
+            }
+            // pitm
+            h.pitm = (d[pitm[0] + 8] == 0) ? hxBe16(d, pitm[0] + 12) : hxBe32(d, pitm[0] + 12);
+            // iref dimg
+            if (iref != null) {
+                for (int[] b : hxKids(d, iref[0] + iref[2] + 4, iref[0] + iref[1])) {
+                    if (!hxType(d, b[0]).equals("dimg")) continue;
+                    int frm = hxBe16(d, b[0] + 8), n = hxBe16(d, b[0] + 10);
+                    int[] ids = new int[n];
+                    for (int i = 0; i < n; i++) ids[i] = hxBe16(d, b[0] + 12 + 2 * i);
+                    h.dimg.put(frm, ids);
+                    h.dimgPos.put(frm, new int[]{b[0] + 12, n});
+                }
+            }
+            // iloc
+            int ver = d[iloc[0] + 8];
+            int q = iloc[0] + 12;
+            int b1 = d[q] & 255, b2 = d[q + 1] & 255;
+            q += 2;
+            int n2 = (ver < 2) ? hxBe16(d, q) : hxBe32(d, q);
+            q += (ver < 2) ? 2 : 4;
+            int offsz = b1 >> 4, lensz = b1 & 15, basesz = b2 >> 4, idxsz = b2 & 15;
+            for (int i = 0; i < n2; i++) {
+                int id = (ver < 2) ? hxBe16(d, q) : hxBe32(d, q);
+                q += (ver < 2) ? 2 : 4;
+                int cm = 0;
+                if (ver == 1 || ver == 2) {
+                    cm = hxBe16(d, q);
+                    q += 2;
+                }
+                q += 2;
+                int base = 0;
+                for (int k = 0; k < basesz; k++) base = (base << 8) | (d[q + k] & 255);
+                q += basesz;
+                int ec = hxBe16(d, q);
+                q += 2;
+                int off = 0, len = 0;
+                for (int e = 0; e < ec; e++) {
+                    if (idxsz > 0) q += idxsz;
+                    int opos = q, o1 = 0;
+                    for (int k = 0; k < offsz; k++) o1 = (o1 << 8) | (d[q + k] & 255);
+                    q += offsz;
+                    int lpos = q, l1 = 0;
+                    for (int k = 0; k < lensz; k++) l1 = (l1 << 8) | (d[q + k] & 255);
+                    q += lensz;
+                    if (e == 0) {
+                        off = base + o1;
+                        len = l1;
+                        if (cm == 0 && offsz > 0 && lensz > 0) {
+                            h.extField.put(id, new int[]{opos, offsz, lpos, lensz});
+                        }
+                    }
+                }
+                h.ext.put(id, new int[]{cm, off, len});
+            }
+            return h;
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "HEIF 解析失败: " + t);
+            return null;
+        }
+    }
+    private static java.util.List<int[]> hxKids(byte[] d, int start, int end) {
+        java.util.List<int[]> out = new java.util.ArrayList<>();
+        int o = start;
+        while (o + 8 <= end) {
+            long sz = hxBe32(d, o) & 0xFFFFFFFFL;
+            int hdr = 8;
+            if (sz == 1) {
+                sz = 0;
+                for (int i = 0; i < 8; i++) sz = (sz << 8) | (d[o + 8 + i] & 255);
+                hdr = 16;
+            } else if (sz == 0) {
+                sz = end - o;
+            }
+            if (sz < hdr || o + sz > end) break;
+            out.add(new int[]{o, (int) sz, hdr});
+            o += (int) sz;
+        }
+        return out;
+    }
+    private static String hxType(byte[] d, int off) {
+        return new String(d, off + 4, 4, java.nio.charset.StandardCharsets.ISO_8859_1);
+    }
+    private static int[] hxFind(byte[] d, int start, int end, String name) {
+        for (int[] b : hxKids(d, start, end)) {
+            String t = new String(d, b[0] + 4, 4, java.nio.charset.StandardCharsets.ISO_8859_1);
+            if (t.equals(name)) return b;
+        }
+        return null;
+    }
+    private static int hxBe16(byte[] b, int o) {
+        return ((b[o] & 255) << 8) | (b[o + 1] & 255);
+    }
+    private static int hxBe32(byte[] b, int o) {
+        return ((b[o] & 255) << 24) | ((b[o + 1] & 255) << 16) | ((b[o + 2] & 255) << 8) | (b[o + 3] & 255);
+    }
+    private static void hxBe32Put(byte[] b, int o, int v) {
+        b[o] = (byte) (v >>> 24);
+        b[o + 1] = (byte) (v >>> 16);
+        b[o + 2] = (byte) (v >>> 8);
+        b[o + 3] = (byte) v;
+    }
+    private static int hxIndexOf(byte[] d, byte[] pat) {
+        return hxIndexOfFrom(d, pat, 0);
+    }
+    private static int hxIndexOfFrom(byte[] d, byte[] pat, int from) {
+        outer:
+        for (int i = Math.max(0, from); i + pat.length <= d.length; i++) {
+            for (int k = 0; k < pat.length; k++) {
+                if (d[i + k] != pat[k]) continue outer;
+            }
+            return i;
+        }
+        return -1;
+    }
+    private static int[] hxIspeOfSize(Hx h, int w, int hh) {
+        try {
+            byte[] d = h.d;
+            int[] meta = null;
+            for (int[] b : hxKids(d, 0, d.length)) {
+                if (hxType(d, b[0]).equals("meta")) {
+                    meta = b;
+                    break;
+                }
+            }
+            if (meta == null) return null;
+            int ms = meta[0] + meta[2] + 4, me = meta[0] + meta[1];
+            int[] iprp = hxFind(d, ms, me, "iprp");
+            if (iprp == null) return null;
+            int[] ipco = hxFind(d, iprp[0] + 8, iprp[0] + iprp[1], "ipco");
+            if (ipco == null) return null;
+            for (int[] b : hxKids(d, ipco[0] + 8, ipco[0] + ipco[1])) {
+                if (!hxType(d, b[0]).equals("ispe")) continue;
+                int ww = hxBe32(d, b[0] + 12), hh2 = hxBe32(d, b[0] + 16);
+                if (ww == w && hh2 == hh) return new int[]{b[0], ww, hh2};
+            }
+            return hxMainIspe(h);      // 兜底：找不到就退回"最大那个"
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+    private static int[] hxMainIspe(Hx h) {
+        try {
+            byte[] d = h.d;
+            int[] meta = null;
+            for (int[] b : hxKids(d, 0, d.length)) {
+                if (hxType(d, b[0]).equals("meta")) {
+                    meta = b;
+                    break;
+                }
+            }
+            if (meta == null) return null;
+            int ms = meta[0] + meta[2] + 4, me = meta[0] + meta[1];
+            int[] iprp = hxFind(d, ms, me, "iprp");      // iprp/ipco 都是普通盒（子盒从 +8 起）
+            if (iprp == null) return null;
+            int[] ipco = hxFind(d, iprp[0] + 8, iprp[0] + iprp[1], "ipco");
+            if (ipco == null) return null;
+            int best = -1;
+            long bestArea = -1;
+            for (int[] b : hxKids(d, ipco[0] + 8, ipco[0] + ipco[1])) {
+                if (!hxType(d, b[0]).equals("ispe")) continue;
+                int w = hxBe32(d, b[0] + 12), hh = hxBe32(d, b[0] + 16);
+                long area = (long) w * hh;
+                if (area > bestArea) {
+                    bestArea = area;
+                    best = b[0];
+                }
+            }
+            if (best < 0) return null;
+            return new int[]{best, hxBe32(d, best + 12), hxBe32(d, best + 16)};
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+    private static int[] hxBaseGridOutWH(Hx h) {
+        try {
+            int[] gex = h.ext.get(h.pitm);
+            if (gex == null || gex[0] != 1 || h.idatData < 0) return new int[]{-1, -1};
+            int pay = h.idatData + gex[1];
+            return new int[]{hxBe16(h.d, pay + 4), hxBe16(h.d, pay + 6)};
+        } catch (Throwable t) {
+            return new int[]{-1, -1};
+        }
     }
 }
