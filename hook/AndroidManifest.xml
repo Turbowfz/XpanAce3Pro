@@ -1,19 +1,32 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.xpanport.hook"
-    android:versionCode="1"
-    android:versionName="1.0">
+    android:versionCode="20"
+    android:versionName="2.0">
 
     <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="35" />
+    <queries>
+        <package android:name="com.oplus.camera" />
+    </queries>
 
     <application
-        android:label="XPan 尺寸修正"
+        android:label="XPanForAce3Pro"
         android:hasCode="true">
 
         <meta-data android:name="xposedmodule" android:value="true" />
         <meta-data android:name="xposeddescription"
-            android:value="把 X-Pan 模式申请的出流尺寸换成本机 HAL 真支持的档位（Ace 3 Pro）" />
+            android:value="Ace 3 Pro X-Pan：C16/C17 精确版本与模块配置配套；8192×3024、仅1×、XDR上限至少8×（开发中，实机待验收）" />
         <meta-data android:name="xposedminversion" android:value="93" />
         <meta-data android:name="xposedscope" android:value="com.oplus.camera" />
+        <activity
+            android:name=".XpanSetupActivity"
+            android:exported="true"
+            android:label="XPanForAce3Pro">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="de.robv.android.xposed.category.MODULE_SETTINGS" />
+            </intent-filter>
+        </activity>
     </application>
 </manifest>

@@ -10,6 +10,8 @@ import android.util.Pair;
 
 import java.io.File;
 import java.lang.reflect.Method;
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.util.ArrayList;
@@ -33,12 +35,12 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *
  * ★ 三条必须守住的边界（都是踩过坑换来的）：
  *   1) 只在 X-Pan 模式改尺寸。其他模式一律放行 —— 否则切回普通模式会预览格式不符（果冻）、
- *      预览起不来（快门消失）、模式状态卡死。用 buildStreamSurface 的 thisObject 判断模式。
+     *      预览起不来（快门消失）、模式状态卡死。建流使用独立 scope，提交状态读实际模式实例。
  *   2) 只改"能确认是预览/拍照"的面。usage 认不出来就**一律不动** ——
- *      曾经默认按预览处理，结果把 4096x3072/4096x1512 的拍照面强改成 2304x1048，
- *      比例从 4:3 / 65:24 变成 2.2:1，画面就不对了。
+     *      RAW、PRIVATE 或未知格式不改；usage 单独不能区分 RAW 与 YUV，必须同时核对格式。
+     *      不能把其他流强改为预览，破坏画面比例。
  *   3) 某个 hook 装失败不能影响其他 hook —— 之前 getSurfaceSize 找不到就 return，
- *      把后面真正管用的模式门和尺寸修正全跳过了。
+     *      耦合成员应先成组验证；C17 路线注册失败撤回，不能以某个单钩子成功冒充完整功能。
  *
  * 另外还修了"进一次 X-Pan 只能拍一张"（实机取证 2026-10-05）：
  *   X-Pan 的界面容器 zl.q(XpanUIContainer) 在版本号==3 时确实被创建了，
@@ -62,8 +64,6 @@ public class XpanHook implements IXposedHookLoadPackage {
         if (sDiag) XposedBridge.log(TAG + msg);
     }
 
-    /** 2× 真放大（配置换带）总开关，默认开；debug.xpan.configzoom=0 退回 v1.2 原始行为 */
-    private static volatile boolean sCfgZoom = true;
     private static final String PKG = "com.oplus.camera";
 
     private static final String CLS_XPAN_MODE = "com.oplus.ocs.camera.producer.mode.XpanMode";
@@ -84,8 +84,7 @@ public class XpanHook implements IXposedHookLoadPackage {
      *  3200x1181 → 快门静默失败，根本不出片；
      *  2780x1264 (2.199) → ✔ 唯一能出真实照片的宽幅档 —— 超广角的 ISP 只调通了
      *  2.2:1 电影比例这一条路，硬件上出不了 65:24（imx355 是 8MP，流表最宽 3216）。
-     *  所以 X-Pan 的 0.6× 拍出来是 2.2:1（横向视野仍是完整 16mm 超广角），
-     *  1×/2× 主摄不受影响，仍是 4096x1512 的 65:24。可用 debug.xpan.uwcap 覆盖。 */
+     *  历史实验曾开放超广角；当前变焦条和内部请求仅允许主摄 1×，此档不再对用户开放。 */
     private static final String DEFAULT_UW_CAPTURE = "2780x1264";
 
     /** rear_main=主摄；rear_wide=超广角（本机命名，实测日志里 0.6× 时出现） */
@@ -105,14 +104,19 @@ public class XpanHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** 当前是否正在为 X-Pan 模式构建流（只有这时才改尺寸） */
+    /** 已从 ModeManager 实际运行实例见证的模式，不是建流/请求模式。 */
     private static volatile boolean sXpanActive = false;
+    /** SDK 建流期间的嵌套线程作用域；after 即使 gateoff 也必须归还。 */
+    private static final ThreadLocal<Boolean> sXpanBuilding = new ThreadLocal<>();
+    private static final String MODE_FRAME = "com.xpanport.hook.mode.transaction";
+    private static final String BUILD_FRAME = "com.xpanport.hook.mode.build";
 
-    /** X-Pan 会话内最近的变焦请求值（fh.g.f 钳制钩子记录；进模式时复位 1.0）。
-     *  ★ v1.2 实测：拍照流 8192 宽超出传感器活动阵列(4096x3072)时，HAL 不理变焦裁剪
-     *  —— 2× 预览正常(预览流 2304 在阵列内)但拍出来只有 ~1.12× 视野(CamX currentZoom
-     *  实锤，无 2.0)。所以变焦 ≠1× 时拍照流回退 4096x1512（v1.1 验证过 2× 正常；
-     *  2× 下真实细节本来就只有 ~2048 宽，不吃亏），1× 才用 8192x3024 大图。 */
+    private static final class BuildScope {
+        final Boolean prior;
+        BuildScope(Boolean prior) { this.prior = prior; }
+    }
+
+    /** 实际倍率仅用于诊断；X-Pan 不按倍率改变拍照尺寸。 */
     private static volatile float sXpanZoomReq = 1.0f;
 
     /** XPanPresenter(bh.c) 实例 —— FeatureFactory.b 的返回值，滤镜重新装配必须用它 */
@@ -127,20 +131,143 @@ public class XpanHook implements IXposedHookLoadPackage {
     private static volatile Size sPreviewSize = null;
     private static volatile Size sCaptureSize = null;
     private static volatile Size[] sAvail = null;
+    private static volatile CameraProfile sProfile;
+    private static volatile ModuleGate sModuleGate;
+    private static volatile boolean sC17CoreReady;
+    private boolean initialized;
+    private XdrBeforeSave.InstallResult xdrProcessor;
+    private XpanC17Menu.InstallResult c17Menu;
+    private XpanC17Ui.InstallResult c17Ui;
+    private XpanGainMapFrame.InstallResult gainMapFrame;
+
+    private static boolean moduleEnabled() {
+        ModuleGate gate = sModuleGate;
+        return gate != null && gate.enabled();
+    }
+
+    /** C16 callbacks share the same fail-closed gate; attach itself is not gated. */
+    private abstract static class QualifiedHook extends XC_MethodHook {
+        @Override
+        protected final void beforeHookedMethod(MethodHookParam param) throws Throwable {
+            if (moduleEnabled()) beforeQualified(param);
+        }
+
+        @Override
+        protected final void afterHookedMethod(MethodHookParam param) throws Throwable {
+            if (moduleEnabled()) afterQualified(param);
+        }
+
+        protected void beforeQualified(MethodHookParam param) throws Throwable { }
+        protected void afterQualified(MethodHookParam param) throws Throwable { }
+    }
 
     @Override
-    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lp) throws Throwable {
-        if (!PKG.equals(lp.packageName)) return;
-        XposedBridge.log(TAG + "handleLoadPackage pkg=" + lp.packageName
-                + " proc=" + lp.processName + " first=" + lp.isFirstApplication);
+    public void handleLoadPackage(final XC_LoadPackage.LoadPackageParam lp) throws Throwable {
+        if (!PKG.equals(lp.packageName) || !PKG.equals(lp.processName)) return;
+        Method attach = android.app.Application.class.getDeclaredMethod("attach", Context.class);
+        XposedBridge.hookMethod(attach, new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) {
+                try {
+                    initialize(lp, (Context) param.args[0]);
+                } catch (Throwable t) {
+                    XposedBridge.log(TAG + "camera profile installation failed: " + t);
+                }
+            }
+        });
+    }
+
+    private synchronized void initialize(XC_LoadPackage.LoadPackageParam lp, Context context)
+            throws Throwable {
+        if (initialized) return;
+        CameraProfile profile = CameraProfile.read(context);
+        if (profile.generation == CameraProfile.Generation.UNSUPPORTED) {
+            XposedBridge.log(TAG + "unsupported camera build: " + profile.cameraVersion);
+            return;
+        }
+        sProfile = profile;
+        sModuleGate = ModuleGate.create(context, profile);
+        if (!sModuleGate.verified()) {
+            XposedBridge.log(TAG + "module qualification refused: " + sModuleGate.detail());
+            return;
+        }
+        if (profile.generation == CameraProfile.Generation.C17) {
+            sC17CoreReady = false;
+            XpanC17Config.InstallResult config = XpanC17Config.install(
+                    lp.classLoader, profile.cameraVersion, new XpanC17Config.Gate() {
+                @Override public boolean enabled() { return sC17CoreReady && moduleEnabled(); }
+            });
+            XposedBridge.log(TAG + "C17 geometry config installation: " + config.detail);
+            if (!config.installed) return;
+            c17Menu = XpanC17Menu.install(lp.classLoader, profile.cameraVersion, new XpanC17Menu.Gate() {
+                @Override public boolean enabled() { return sC17CoreReady && moduleEnabled(); }
+            });
+            XposedBridge.log(TAG + "C17 menu installation: " + c17Menu.detail);
+            if (!c17Menu.installed) return;
+            c17Ui = XpanC17Ui.install(lp.classLoader, profile.cameraVersion, new XpanC17Ui.Gate() {
+                @Override public boolean enabled() { return sC17CoreReady && moduleEnabled(); }
+            });
+            XposedBridge.log(TAG + "C17 UI guard installation: " + c17Ui.detail);
+            installWatermarkIsolation(lp);
+            XpanC17Hook.InstallResult result = XpanC17Hook.install(
+                    lp.classLoader, profile.cameraVersion, new XpanC17Hook.Callbacks() {
+                @Override
+                public Object beforeModeChange(Object manager, String oldMode, String requestedMode) {
+                    return wmBeforeModeChange(oldMode, requestedMode);
+                }
+
+                @Override
+                public void afterModeChange(Object manager, String oldMode, String requestedMode,
+                                            String actualMode, Object token, Throwable originalFailure) {
+                    wmAfterModeChange(oldMode, actualMode, token);
+                    if (c17Ui != null) c17Ui.onActualMode(manager, oldMode, actualMode);
+                    if (originalFailure != null) {
+                        XposedBridge.log(TAG + "C17 original mode switch failed: " + originalFailure);
+                    }
+                }
+            }, new XpanC17Hook.Gate() {
+                @Override public boolean enabled() { return moduleEnabled(); }
+            });
+            initialized = result.installed;
+            sC17CoreReady = result.installed;
+            if (result.installed) {
+                installXdrProcessor(lp.classLoader, context);
+                if ("1".equals(prop("debug.xpan.apstrace"))) {
+                    XpanApsCaptureTrace.InstallResult trace = XpanApsCaptureTrace.install(
+                            lp.classLoader, profile.cameraVersion, new XpanApsCaptureTrace.Gate() {
+                        @Override public boolean enabled() {
+                            return sC17CoreReady && moduleEnabled() && "1".equals(prop("debug.xpan.apstrace"));
+                        }
+                    });
+                    XposedBridge.log(TAG + "APS capture evidence: " + trace.detail);
+                }
+                gainMapFrame = XpanGainMapFrame.install(lp.classLoader, profile.cameraVersion,
+                        new XpanGainMapFrame.Gate() {
+                    @Override public boolean enabled() {
+                        return sC17CoreReady && moduleEnabled() && !"0".equals(prop("debug.xpan.proxdr"));
+                    }
+                });
+                XposedBridge.log(TAG + "XPAN gain-frame parameter installation: " + gainMapFrame.detail);
+            }
+            XposedBridge.log(TAG + "C17 installation: " + result.detail);
+            return;
+        }
+        XpanC16Config.InstallResult config = XpanC16Config.install(
+                lp.classLoader, profile.cameraVersion, new XpanC16Config.Gate() {
+            @Override public boolean enabled() { return moduleEnabled(); }
+        });
+        XposedBridge.log(TAG + "C16 config installation: " + config.detail);
+        if (!config.installed || !installModeGate(lp)) return;
+        initialized = true;
+        XposedBridge.log(TAG + "camera profile=" + profile.generation
+                + " version=" + profile.cameraVersion + " proc=" + lp.processName);
 
         // 每个 hook 各自 try/catch：任何一个装不上都不许影响其他（边界 3）
-        installModeGate(lp);
         installHalSizeFix(lp);
         installSurfaceSetters(lp);
         installXpanSurfaceSize(lp);
         installTakePictureProbe(lp);
-        installProxdrPost(lp);
+        installXdrProcessor(lp.classLoader, context);
         installXpanUiRestore(lp);
         installXpanZoomUnlock(lp);
         installXpanZoomPointFix(lp);
@@ -150,23 +277,6 @@ public class XpanHook implements IXposedHookLoadPackage {
         installWatermarkIsolation(lp);
 
         sDiag = "1".equals(prop("debug.xpan.diag"));
-        // 相机进程重启后从请求文件恢复档位
-        try {
-            File rf = new File(CROP_REQ_FILE);
-            if (rf.exists()) {
-                FileInputStream rin = new FileInputStream(rf);
-                byte[] rb = new byte[8];
-                int rn = rin.read(rb);
-                rin.close();
-                if (rn > 0) {
-                    String rt = new String(rb, 0, rn, java.nio.charset.StandardCharsets.US_ASCII).trim();
-                    if (rt.equals("2")) sCropZoom = 2;
-                    else if (rt.equals("1")) sCropZoom = 1;
-                    sXpanZoomReq = (sCropZoom >= 2) ? 2.0f : 1.0f;
-                }
-            }
-        } catch (Throwable ignored) {
-        }
         // 下面两个是排查用的取证 hook，日志量大，默认关闭。
         // 需要复现问题时：setprop debug.xpan.diag 1，重启相机即可。
         // installXpanContainerWake 也放这里：它只是把休眠的 XpanUIContainer 状态推回 0，
@@ -188,9 +298,9 @@ public class XpanHook implements IXposedHookLoadPackage {
                 Class<?> ff = Class.forName("q7.d0", false, lp.classLoader);
                 for (Method m : ff.getDeclaredMethods()) {
                     if (!"b".equals(m.getName()) || m.getParameterTypes().length != 5) continue;
-                    XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    XposedBridge.hookMethod(m, new QualifiedHook() {
                         @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
+                        protected void beforeQualified(MethodHookParam param) {
                             try {
                                 XposedBridge.log(TAG + "FeatureFactory feature=" + param.args[0]
                                         + " | mode=" + param.args[1] + " | id=" + param.args[2]);
@@ -207,6 +317,19 @@ public class XpanHook implements IXposedHookLoadPackage {
         }
     }
 
+    /** 只在原保存流程之前修改完整 HEIC 内存副本，不额外写文件。 */
+    private void installXdrProcessor(ClassLoader loader, Context context) {
+        if (xdrProcessor != null || sProfile == null) return;
+        xdrProcessor = XdrBeforeSave.install(loader, sProfile.cameraVersion, new XdrBeforeSave.Gate() {
+            @Override
+            public boolean enabled() {
+                ModuleGate gate = sModuleGate;
+                return gate != null && gate.verified() && !"0".equals(prop("debug.xpan.proxdr"));
+            }
+        });
+        XposedBridge.log(TAG + "XDR before-save installation: " + xdrProcessor.detail);
+    }
+
     /** 诊断：把某个类的所有方法都挂上，每个方法只记第一次调用。
      *  目的：搞清应用到底驱动了容器的哪些生命周期方法（决定显影动画/双皮肤能不能补上）。 */
     private static final java.util.HashSet<String> sSeen = new java.util.HashSet<>();
@@ -219,9 +342,9 @@ public class XpanHook implements IXposedHookLoadPackage {
                 if (m.isSynthetic() || m.isBridge()) continue;
                 final String sig = clsName + "." + m.getName() + "/" + m.getParameterTypes().length;
                 try {
-                    XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    XposedBridge.hookMethod(m, new QualifiedHook() {
                         @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
+                        protected void beforeQualified(MethodHookParam param) {
                             try {
                                 if (!sSeen.add(sig)) return;      // 每个方法只记一次
                                 StringBuilder sb = new StringBuilder();
@@ -242,9 +365,9 @@ public class XpanHook implements IXposedHookLoadPackage {
             for (java.lang.reflect.Constructor<?> ctor : c.getDeclaredConstructors()) {
                 final String csig = clsName + ".<init>/" + ctor.getParameterTypes().length;
                 try {
-                    XposedBridge.hookMethod(ctor, new XC_MethodHook() {
+                    XposedBridge.hookMethod(ctor, new QualifiedHook() {
                         @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
+                        protected void afterQualified(MethodHookParam param) {
                             try {
                                 if (sSeen.add(csig)) XposedBridge.log(TAG + csig + " ← 已实例化");
                             } catch (Throwable ignored) {
@@ -277,9 +400,9 @@ public class XpanHook implements IXposedHookLoadPackage {
             int n = 0;
             for (Method m : c.getDeclaredMethods()) {
                 if (!"takePicture".equals(m.getName()) || m.getParameterTypes().length != 5) continue;
-                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                XposedBridge.hookMethod(m, new QualifiedHook() {
                     @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
+                    protected void beforeQualified(MethodHookParam param) {
                         try {
                             if (!sXpanActive) return;
                             Object tag = param.args[0];
@@ -311,9 +434,9 @@ public class XpanHook implements IXposedHookLoadPackage {
                     false, lp.classLoader);
             Method set = cls.getDeclaredMethod("set",
                     android.hardware.camera2.CaptureRequest.Key.class, Object.class);
-            XposedBridge.hookMethod(set, new XC_MethodHook() {
+            XposedBridge.hookMethod(set, new QualifiedHook() {
                 @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
+                protected void beforeQualified(MethodHookParam param) {
                     try {
                         if (!sXpanActive) return;
                         String name = String.valueOf(param.args[0]);
@@ -331,9 +454,9 @@ public class XpanHook implements IXposedHookLoadPackage {
             });
             // build() 之后把请求里所有变焦/裁剪相关的最终值打出来（含框架补的 SCALER_CROP_REGION）
             Method build = cls.getDeclaredMethod("build");
-            XposedBridge.hookMethod(build, new XC_MethodHook() {
+            XposedBridge.hookMethod(build, new QualifiedHook() {
                 @Override
-                protected void afterHookedMethod(MethodHookParam param) {
+                protected void afterQualified(MethodHookParam param) {
                     try {
                         if (!sXpanActive) return;
                         Object req = param.getResult();
@@ -370,9 +493,9 @@ public class XpanHook implements IXposedHookLoadPackage {
         try {
             Class<?> view = Class.forName("android.view.View", false, lp.classLoader);
             Method setEnabled = view.getDeclaredMethod("setEnabled", boolean.class);
-            XposedBridge.hookMethod(setEnabled, new XC_MethodHook() {
+            XposedBridge.hookMethod(setEnabled, new QualifiedHook() {
                 @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
+                protected void beforeQualified(MethodHookParam param) {
                     try {
                         Object en = (param.args != null && param.args.length > 0) ? param.args[0] : null;
                         if (!Boolean.FALSE.equals(en)) return;
@@ -468,9 +591,9 @@ public class XpanHook implements IXposedHookLoadPackage {
                 return;
             }
             final Method fA = mA, fC4 = mC4;
-            XC_MethodHook h = new XC_MethodHook() {
+            XC_MethodHook h = new QualifiedHook() {
                 @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
+                protected void beforeQualified(MethodHookParam param) {
                     try {
                         if (param.thisObject != null) sControlUI = param.thisObject;  // 供 switch fix 使用
                         if (!sXpanActive) return;
@@ -486,6 +609,7 @@ public class XpanHook implements IXposedHookLoadPackage {
                                 new Runnable() {
                                     @Override
                                     public void run() {
+                                        if (!moduleEnabled()) return;
                                         sRestorePending = false;
                                         restoreXpanUi(ui, fA, fC4);
                                     }
@@ -527,9 +651,9 @@ public class XpanHook implements IXposedHookLoadPackage {
             final Class<?> screenCls = Class.forName("com.oplus.camera.common.screen.a", false, lp.classLoader);
             // 只在 c1() 里唤醒：c1() 才是"建视图(bc) + 刷UI(ic)"的入口。
             // g() 会比 c1() 早被调用，在 g 里唤醒必然 ic() 撞 null 视图 → 相机崩在 onResume。
-            XC_MethodHook wake = new XC_MethodHook() {
+            XC_MethodHook wake = new QualifiedHook() {
                 @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
+                protected void beforeQualified(MethodHookParam param) {
                     try {
                         Object c = param.thisObject;
                         if (fQ.getInt(c) != -1) return;
@@ -576,9 +700,9 @@ public class XpanHook implements IXposedHookLoadPackage {
         try {
             Class<?> c = Class.forName("zl.q", false, lp.classLoader);
             Method hc = c.getDeclaredMethod("hc", int.class);
-            XposedBridge.hookMethod(hc, new XC_MethodHook() {
+            XposedBridge.hookMethod(hc, new QualifiedHook() {
                 @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
+                protected void beforeQualified(MethodHookParam param) {
                     try {
                         Object st = (param.args != null && param.args.length > 0) ? param.args[0] : null;
                         XposedBridge.log(TAG + "XpanUI state -> " + st + "\n"
@@ -597,17 +721,17 @@ public class XpanHook implements IXposedHookLoadPackage {
         try {
             Class<?> cb = Class.forName("ch.b", false, lp.classLoader);
             Method vb = cb.getDeclaredMethod("b");
-            XposedBridge.hookMethod(vb, new XC_MethodHook() {
+            XposedBridge.hookMethod(vb, new QualifiedHook() {
                 @Override
-                protected void afterHookedMethod(MethodHookParam param) {
+                protected void afterQualified(MethodHookParam param) {
                     XposedBridge.log(TAG + "ch.b.b() xpan ui version = " + param.getResult());
                 }
             });
             Class<?> xc = Class.forName("zl.q", false, lp.classLoader);
             for (java.lang.reflect.Constructor<?> ctor : xc.getDeclaredConstructors()) {
-                XposedBridge.hookMethod(ctor, new XC_MethodHook() {
+                XposedBridge.hookMethod(ctor, new QualifiedHook() {
                     @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
+                    protected void afterQualified(MethodHookParam param) {
                         XposedBridge.log(TAG + "XpanUIContainer 已创建");
                     }
                 });
@@ -637,9 +761,9 @@ public class XpanHook implements IXposedHookLoadPackage {
         try {
             Class<?> c = Class.forName(cls, false, lp.classLoader);
             Method m = c.getDeclaredMethod(name);
-            XposedBridge.hookMethod(m, new XC_MethodHook() {
+            XposedBridge.hookMethod(m, new QualifiedHook() {
                 @Override
-                protected void afterHookedMethod(MethodHookParam param) {
+                protected void afterQualified(MethodHookParam param) {
                     try {
                         XposedBridge.log(TAG + label + " -> " + param.getResult());
                     } catch (Throwable ignored) {
@@ -658,9 +782,9 @@ public class XpanHook implements IXposedHookLoadPackage {
             Class<?> c = Class.forName(cls, false, lp.classLoader);
             for (Method m : c.getDeclaredMethods()) {
                 if (!name.equals(m.getName()) || m.getParameterTypes().length != argc) continue;
-                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                XposedBridge.hookMethod(m, new QualifiedHook() {
                     @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
+                    protected void beforeQualified(MethodHookParam param) {
                         try {
                             StringBuilder sb = new StringBuilder();
                             for (Object a : param.args) sb.append(a).append(' ');
@@ -696,9 +820,9 @@ public class XpanHook implements IXposedHookLoadPackage {
             int n = 0;
             for (Method m : z1.getDeclaredMethods()) {
                 if (!"m".equals(m.getName()) || m.getParameterTypes().length != 6) continue;
-                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                XposedBridge.hookMethod(m, new QualifiedHook() {
                     @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
+                    protected void beforeQualified(MethodHookParam param) {
                         try {
                             XposedBridge.log(TAG + "zoom z1.m 收到请求 value=" + param.args[0]
                                     + " endValue=" + param.args[1]);
@@ -723,9 +847,9 @@ public class XpanHook implements IXposedHookLoadPackage {
                 Class<?>[] pt = m.getParameterTypes();
                 if (pt.length != 1 || !float.class.equals(pt[0])) continue;
                 if ("h".equals(m.getName())) {
-                    XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    XposedBridge.hookMethod(m, new QualifiedHook() {
                         @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
+                        protected void afterQualified(MethodHookParam param) {
                             try {
                                 XposedBridge.log(TAG + "zoom 请求 fh.g.h(" + param.args[0]
                                         + ") -> 模型 g=" + field(param.thisObject, "g"));
@@ -735,9 +859,9 @@ public class XpanHook implements IXposedHookLoadPackage {
                     });
                     n++;
                 } else if ("f".equals(m.getName())) {
-                    XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    XposedBridge.hookMethod(m, new QualifiedHook() {
                         @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
+                        protected void afterQualified(MethodHookParam param) {
                             try {
                                 XposedBridge.log(TAG + "zoom 钳制 fh.g.f(" + param.args[0]
                                         + ") -> " + param.getResult());
@@ -757,9 +881,9 @@ public class XpanHook implements IXposedHookLoadPackage {
             int n = 0;
             for (Method m : c.getDeclaredMethods()) {
                 if (!"b0".equals(m.getName()) || m.getParameterTypes().length != 1) continue;
-                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                XposedBridge.hookMethod(m, new QualifiedHook() {
                     @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
+                    protected void afterQualified(MethodHookParam param) {
                         try {
                             // 记录真正下发 HAL 的变焦值：b0(arg) 把模型值写进自身 e0 再下发，
                             // after 里 e0 已是新值（比 UI 钳制函数可靠：点按/滑动/复位都走这）
@@ -803,7 +927,8 @@ public class XpanHook implements IXposedHookLoadPackage {
      *   pref_ai_master_watermark_photo_open_state（AI 大师水印开关）
      *   pref_watermark_function_key（普通水印开关）
      *   pref_hasselblad_watermark_function_key（哈苏水印开关）
-     * 这四个键的 DataKey 分别是 c6.d 里的静态字段 N0 / K0 / l1 / q1。
+     * 这四个键在 C16 c6.d 是 N0 / K0 / l1 / q1，在 C17 m9.d 是 t1 / m1 / f2 / k2。
+     * 只延迟调用各版本的全局工厂 f / b0，不提前读取这些静态字段。
      * 于是"在 X-Pan 里换了水印，回拍照模式也跟着变"——应用侧没有模式维度，只能我们补。
      *
      * 做法：**值交换**（键名一个都不改）
@@ -812,7 +937,8 @@ public class XpanHook implements IXposedHookLoadPackage {
      *   出 X-Pan：把当前值存成 X-Pan 的值，再把其他模式那份写回去。
      * 为什么不用"改键名"：那样应用的观察者/界面刷新挂在原键上，改了键名就收不到通知，界面不刷新。
      * 存档：/data/data/com.oplus.camera/files/xpan_watermark_keep.txt（我们自己的文件，不碰应用 MMKV）。
-     * 读写走应用自己的 DataManager.c()/g()，内存缓存与观察者通知都跟着走。
+     * 读写走应用自己的 DataManager.c()/g()；缺失值只走已核实的 f() 单键删除再验 contains/readback。
+     * f() 不像 g() 显式派发 DataRepoProxy 的更新通知，不能把存储恢复冒充 UI 已同步。
      * 开关：debug.xpan.wmper=0 关闭（默认开）。
      */
     private static final String[] WM_FIELD = {
@@ -824,10 +950,6 @@ public class XpanHook implements IXposedHookLoadPackage {
             "pref_watermark_function_key",
             "pref_hasselblad_watermark_function_key",
     };
-    private static final Object[] sWmKey = new Object[WM_FIELD.length];    // 应用自己的 DataKey
-    private static final Object[] sWmOther = new Object[WM_FIELD.length];  // 其他模式当前值
-    private static final Object[] sWmMine = new Object[WM_FIELD.length];   // X-Pan 上次的值
-    private static volatile boolean sWmInXpan = false;
     private static final String WM_KEEP =
             "/data/data/com.oplus.camera/files/xpan_watermark_keep.txt";
 
@@ -835,182 +957,186 @@ public class XpanHook implements IXposedHookLoadPackage {
     private static final Class<?>[] WM_TYPE = {
             String.class, Boolean.class, String.class, String.class,
     };
-    private static volatile boolean sWmDiag = false;
+    private static final WatermarkState sWatermark = new WatermarkState(WM_TYPE,
+            new WatermarkState.Store() {
+                @Override public Object read(int index) throws Throwable { return wmRead(index); }
+                @Override public void write(int index, Object value) throws Throwable { wmWrite(index, value); }
+                @Override public boolean canRemove(int index) throws Throwable { return wmCanRemove(index); }
+                @Override public void remove(int index) throws Throwable { wmRemove(index); }
+            }, new WatermarkState.Gate() {
+                @Override public boolean enabled() { return moduleEnabled(); }
+            });
 
-    private static String wmUriOf(int i) {
-        try {
-            Object dk = sWmKey[i];
-            if (dk == null) return "null";
-            return String.valueOf(dk.getClass().getMethod("h").invoke(dk));
-        } catch (Throwable t) {
-            return "err:" + t;
+    /** Published only after every coupled read/write/remove/presence binding and key is verified. */
+    private static final class WmAbi {
+        final ClassLoader loader;
+        final CameraProfile.Generation generation;
+        final Object dm;
+        final Method get, set, remove, uri, contains;
+        final Object[] keys, stores;
+        final android.net.Uri[] uris;
+
+        WmAbi(ClassLoader loader, CameraProfile.Generation generation, Object dm,
+              Method get, Method set, Method remove, Method uri, Method contains,
+              Object[] keys, Object[] stores, android.net.Uri[] uris) {
+            this.loader = loader;
+            this.generation = generation;
+            this.dm = dm;
+            this.get = get;
+            this.set = set;
+            this.remove = remove;
+            this.uri = uri;
+            this.contains = contains;
+            this.keys = keys;
+            this.stores = stores;
+            this.uris = uris;
+        }
+
+        void checkKey(int i) throws Throwable {
+            if (i < 0 || i >= keys.length || !uris[i].equals(uri.invoke(keys[i])))
+                throw new IllegalStateException("watermark key URI changed");
         }
     }
 
-    private static Object sDm;                 // DataManager 实例
-    private static Method sDmGet, sDmSet, sDkFactory;
-    private static Class<?> sDkCls;
+    private static volatile WmAbi sWmAbi;
     private static ClassLoader sClsLoader;
 
     private void installWatermarkIsolation(XC_LoadPackage.LoadPackageParam lp) {
         try {
             sClsLoader = lp.classLoader;
             wmLoad();
-            XposedBridge.log(TAG + "hook installed OK (水印按模式隔离 x" + WM_FIELD.length + ")");
+            XposedBridge.log(TAG + "watermark transaction prepared; verified missing-key reset ABI required; runtime unverified");
         } catch (Throwable t) {
             XposedBridge.log(TAG + "!! 水印隔离安装失败: " + t);
         }
     }
 
-    /** 造 DataKey：走应用自己的工厂 androidx.preference.e.f(Class, String)。
-     *  ⚠️ 不用 c6.d 的静态字段（N0/K0/l1/q1）——实测在 handleLoadPackage 里取它会卡住
-     *  （那会触发 c6.d 的静态初始化，而那时应用还没起来）。所以**延迟到切模式时才造键**。 */
-    private static boolean wmInitKeys() {
-        try {
-            if (sWmKey[0] != null) return true;
-            if (sClsLoader == null) return false;
-            sDkCls = Class.forName("com.oplus.camera.data.DataKey", false, sClsLoader);
-            Class<?> fac = Class.forName("androidx.preference.e", false, sClsLoader);
-            sDkFactory = fac.getMethod("f", Class.class, String.class);
-            for (int i = 0; i < WM_FIELD.length; i++) {
-                sWmKey[i] = sDkFactory.invoke(null, WM_TYPE[i], WM_NAME[i]);
-            }
-            return sWmKey[0] != null;
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "水印隔离造键失败: " + t);
-            return false;
-        }
+    private static Method wmStaticMethod(Class<?> owner, String name, Class<?> result, Class<?>... args)
+            throws Throwable {
+        Method m = owner.getDeclaredMethod(name, args);
+        if (!Modifier.isPublic(m.getModifiers()) || !Modifier.isStatic(m.getModifiers())
+                || m.getReturnType() != result)
+            throw new NoSuchMethodException("watermark static ABI mismatch");
+        return m;
     }
 
-    /** DataManager 懒加载：拿不到就整段放弃（绝不影响正常拍照） */
-    private static boolean wmInitDm() {
-        try {
-            if (sDm != null) return true;
-            if (sClsLoader == null) return false;
-            // ⚠️ 必须用应用的类加载器：用模块自己的会 ClassNotFoundException（实测踩过）
-            Class<?> dm = Class.forName("com.oplus.camera.data.DataManager", false, sClsLoader);
-            sDmGet = dm.getMethod("c", sDkCls);
-            sDmSet = dm.getMethod("g", sDkCls, Object.class);
-            sDm = dm.getMethod("getInstance").invoke(null);
-            return sDm != null;
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "水印隔离取 DataManager 失败: " + t);
-            return false;
+    /** Lazy at mode switch, never read c6.d/m9.d statics in handleLoadPackage.
+     * C16 f / C17 b0 are GLOBAL factories; C17 M0 is per-camera and must not be used here.
+     * f(DataKey) -> h7.f/va.d.c(Uri) -> i7.b/wa.b.b(fragment), apply(): real single-key removal.
+     * Raw c(DataKey) checks contains before typed reads with null default. A present-null or
+     * unknown URI is refused; we never turn Boolean absence into the setter's false default.
+     */
+    private static synchronized WmAbi wmInitAbi() throws Throwable {
+        if (sClsLoader == null || sProfile == null) throw new IllegalStateException("watermark profile unavailable");
+        WmAbi ready = sWmAbi;
+        if (ready != null) {
+            if (ready.loader != sClsLoader || ready.generation != sProfile.generation)
+                throw new IllegalStateException("watermark version changed");
+            return ready;
         }
+        final String factoryName, repoName, storageName;
+        if (sProfile.generation == CameraProfile.Generation.C16) {
+            factoryName = "f"; repoName = "i7.a"; storageName = "i7.b";
+        } else if (sProfile.generation == CameraProfile.Generation.C17) {
+            factoryName = "b0"; repoName = "wa.a"; storageName = "wa.b";
+        } else throw new IllegalStateException("unknown watermark reset ABI");
+        Class<?> dk = Class.forName("com.oplus.camera.data.DataKey", false, sClsLoader);
+        Class<?> fac = Class.forName("androidx.preference.e", false, sClsLoader);
+        Class<?> dmClass = Class.forName("com.oplus.camera.data.DataManager", false, sClsLoader);
+        Class<?> repoClass = Class.forName(repoName, false, sClsLoader);
+        Class<?> holder = Class.forName(repoName + "$a", false, sClsLoader);
+        Class<?> storage = Class.forName(storageName, false, sClsLoader);
+        Method factory = wmStaticMethod(fac, factoryName, dk, Class.class, String.class);
+        Method instance = wmStaticMethod(dmClass, "getInstance", dmClass);
+        Method get = modeMethod(dmClass, "c", Object.class, dk);
+        Method set = modeMethod(dmClass, "g", void.class, dk, Object.class);
+        Method remove = modeMethod(dmClass, "f", void.class, dk);
+        Method uri = modeMethod(dk, "h", android.net.Uri.class);
+        Field type = modeField(dk, "g", Class.class, Modifier.FINAL);
+        Method route = modeMethod(repoClass, "a", storage, android.net.Uri.class);
+        Method contains = modeMethod(storage, "contains", boolean.class, String.class);
+        Field repoInstance = holder.getDeclaredField("a");
+        if (repoInstance.getType() != repoClass || !Modifier.isPublic(repoInstance.getModifiers())
+                || !Modifier.isStatic(repoInstance.getModifiers()) || !Modifier.isFinal(repoInstance.getModifiers()))
+            throw new NoSuchFieldException("watermark repo singleton ABI mismatch");
+        Object[] keys = new Object[WM_NAME.length], stores = new Object[WM_NAME.length];
+        android.net.Uri[] uris = new android.net.Uri[WM_NAME.length];
+        Object dm = instance.invoke(null), repo = repoInstance.get(null);
+        if (dm == null || repo == null) throw new IllegalStateException("watermark storage unavailable");
+        for (int i = 0; i < keys.length; i++) {
+            keys[i] = factory.invoke(null, WM_TYPE[i], WM_NAME[i]);
+            if (!dk.isInstance(keys[i]) || type.get(keys[i]) != WM_TYPE[i])
+                throw new IllegalStateException("watermark DataKey type mismatch");
+            uris[i] = (android.net.Uri) uri.invoke(keys[i]);
+            android.net.Uri u = uris[i];
+            if (u == null || !("sp".equals(u.getScheme()) || "mmkv".equals(u.getScheme()))
+                    || !"com.oplus.camera".equals(u.getAuthority())
+                    || !"/com.oplus.camera_preferences".equals(u.getPath())
+                    || !WM_NAME[i].equals(u.getFragment())
+                    || !WM_TYPE[i].getName().equals(u.getQueryParameter("class_type")))
+                throw new IllegalStateException("unknown watermark key namespace/reset path");
+            stores[i] = route.invoke(repo, u);
+            // Only the traced global SP/MMKV implementations, not a guessed memory/per-camera key.
+            String expected = storageName.substring(0, storageName.lastIndexOf('.') + 1)
+                    + ("sp".equals(u.getScheme()) ? "h" : "d");
+            if (stores[i] == null || !expected.equals(stores[i].getClass().getName()))
+                throw new IllegalStateException("unknown watermark backing store");
+        }
+        ready = new WmAbi(sClsLoader, sProfile.generation, dm, get, set, remove, uri, contains,
+                keys, stores, uris);
+        sWmAbi = ready; // no partial key/method publication, including when any lookup throws
+        return ready;
     }
 
-    private static Object wmRead(int i) {
-        try {
-            if (!wmInitKeys() || !wmInitDm()) return null;
-            Object v = sDmGet.invoke(sDm, sWmKey[i]);
-            if (v == null && !sWmDiag) {
-                sWmDiag = true;
-                XposedBridge.log(TAG + "水印隔离诊断：键 " + WM_NAME[i] + " 读到 null，uri=" + wmUriOf(i));
-            }
-            return v;
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "水印隔离读失败（" + WM_NAME[i] + "）: " + t);
-            return null;
-        }
+    /** Reflection failures propagate; null is accepted only as verified raw key absence. */
+    private static Object wmRead(int i) throws Throwable {
+        WmAbi abi = wmInitAbi();
+        abi.checkKey(i);
+        Object value = abi.get.invoke(abi.dm, abi.keys[i]);
+        boolean present = (Boolean) abi.contains.invoke(abi.stores[i], WM_NAME[i]);
+        if (present != (value != null) || (value != null && !WM_TYPE[i].isInstance(value)))
+            throw new IllegalStateException("ambiguous watermark presence/value " + i);
+        return value;
     }
 
-    private static void wmWrite(int i, Object v) {
-        try {
-            if (v == null || !wmInitKeys() || !wmInitDm()) return;
-            sDmSet.invoke(sDm, sWmKey[i], v);
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "水印隔离写入失败（" + WM_NAME[i] + "）: " + t);
-        }
+    private static void wmWrite(int i, Object value) throws Throwable {
+        if (i < 0 || i >= WM_TYPE.length || value == null || !WM_TYPE[i].isInstance(value))
+            throw new IllegalArgumentException("untyped watermark value");
+        WmAbi abi = wmInitAbi();
+        abi.checkKey(i);
+        abi.set.invoke(abi.dm, abi.keys[i], value);
     }
 
-    /** 进 X-Pan：抄下其他模式的水印值；有上次 X-Pan 的值就写回去（首次进什么都不写 = 沿用拍照模式） */
-    private static void wmEnterXpan() {
-        if (sWmInXpan || "0".equals(prop("debug.xpan.wmper"))) return;
-        sWmInXpan = true;
-        try {
-            for (int i = 0; i < WM_FIELD.length; i++) {
-                Object cur = wmRead(i);
-                sWmOther[i] = cur;
-                Object mine = sWmMine[i];
-                if (mine != null && !mine.equals(cur)) wmWrite(i, mine);
-            }
-            XposedBridge.log(TAG + "水印隔离：进 X-Pan，其他模式=" + wmDump(sWmOther)
-                    + "，X-Pan 用=" + wmDump(sWmMine));
-            // ★ 兜底复查：应用有可能是在"关设置页/切模式"之后才把水印值写下去，压过上面这次切换
-            //   （用户反馈"水印控制没有隔离"）。延迟 1.5 秒再查一次，发现不是 X-Pan 那份就补写。
-            final Object[] mine = sWmMine.clone();
-            final Object[] others = sWmOther.clone();
-            new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        if (!sWmInXpan) return;
-                        for (int i = 0; i < WM_FIELD.length; i++) {
-                            Object want = mine[i];
-                            Object clobber = others[i];
-                            if (want == null) continue;
-                            Object cur = wmRead(i);
-                            // 只在"当前值 = 其他模式那份"（被覆盖特征）时补写；
-                            // 用户自己在 X-Pan 里改的新值不动
-                            if (!want.equals(cur) && (clobber == null || clobber.equals(cur))) {
-                                wmWrite(i, want);
-                                XposedBridge.log(TAG + "水印隔离复查：补写 " + WM_NAME[i] + " → " + want);
-                            }
-                        }
-                    } catch (Throwable ignored) {
-                    }
-                }
-            }, 1500L);
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "水印隔离进模式失败: " + t);
-        }
+    private static boolean wmCanRemove(int i) throws Throwable {
+        wmInitAbi().checkKey(i);
+        return true; // all coupled ABI and exact global routes resolved before the first write
     }
 
-    /** 出 X-Pan：把当前值存成 X-Pan 的值，再把其他模式那份写回去 */
-    private static void wmExitXpan() {
-        if (!sWmInXpan) return;
-        sWmInXpan = false;
-        try {
-            // ★ 快照必须在还原循环**之前**拿（循环里会把 sWmOther 清空，
-            //   之前在循环后 clone 拿到的是全 null，复查永远空转 —— bug 实录）
-            final Object[] other = sWmOther.clone();
-            final Object[] mine = sWmMine.clone();
-            for (int i = 0; i < WM_FIELD.length; i++) {
-                Object cur = wmRead(i);
-                if (cur != null) sWmMine[i] = cur;
-                Object o = sWmOther[i];
-                if (o != null && !o.equals(cur)) wmWrite(i, o);
-                sWmOther[i] = null;
-            }
-            wmSave();
-            XposedBridge.log(TAG + "水印隔离：出 X-Pan，X-Pan 存下=" + wmDump(sWmMine));
-            // 兜底复查：出模式后延迟查一次。只在"当前值 = X-Pan 那份"（泄漏特征）时补写回
-            //   其他模式的值 —— 用户后来自己改的不动。
-            new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        if (sWmInXpan) return;
-                        for (int i = 0; i < WM_FIELD.length; i++) {
-                            Object want = other[i];
-                            Object leaked = mine[i];
-                            if (want == null || leaked == null) continue;
-                            Object cur = wmRead(i);
-                            if (leaked.equals(cur) && !want.equals(cur)) {
-                                wmWrite(i, want);
-                                XposedBridge.log(TAG + "水印隔离复查：补写回 " + WM_NAME[i] + " → " + want);
-                            }
-                        }
-                    } catch (Throwable ignored) {
-                    }
-                }
-            }, 1500L);
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "水印隔离出模式失败: " + t);
-        }
+    private static void wmRemove(int i) throws Throwable {
+        WmAbi abi = wmInitAbi();
+        abi.checkKey(i);
+        abi.remove.invoke(abi.dm, abi.keys[i]); // never g(key, null): Boolean would become false
+        if (wmRead(i) != null) throw new IllegalStateException("watermark removal readback mismatch " + i);
     }
 
+    private static WatermarkState.Transition wmBeforeModeChange(String oldMode, String requestedMode) {
+        WatermarkState.Transition t = sWatermark.begin(oldMode, requestedMode,
+                moduleEnabled() && !"0".equals(prop("debug.xpan.wmper")));
+        if (!t.staged && !"no swap".equals(t.detail)) XposedBridge.log(TAG + "watermark: " + t.detail);
+        return t;
+    }
 
+    private void wmAfterModeChange(String oldMode, String actualMode, Object token) {
+        if (!(token instanceof WatermarkState.Transition)) return;
+        WatermarkState.Transition t = (WatermarkState.Transition) token;
+        boolean committed = sWatermark.finish(t, actualMode);
+        if (t.staged) XposedBridge.log(TAG + "watermark: " + t.detail);
+        // Archive only the successful exit, never speculative writes or failed cleanup.
+        if (committed && !"xpan".equals(actualMode)) wmSave();
+        if (actualMode != null && sWatermark.current(t) && moduleEnabled())
+            onActualMode(oldMode, actualMode, t.epoch);
+        // No delayed watermark writes: value equality is not proof of a clobber's source.
+    }
 
     private static String wmDump(Object[] a) {
         StringBuilder sb = new StringBuilder("[");
@@ -1023,15 +1149,9 @@ public class XpanHook implements IXposedHookLoadPackage {
 
     private static void wmSave() {
         try {
-            StringBuilder sb = new StringBuilder();
-            for (int i = 0; i < WM_FIELD.length; i++) {
-                Object v = sWmMine[i];
-                if (v == null) continue;
-                sb.append(i).append('\t').append(v instanceof Boolean ? "b" : "s").append('\t')
-                        .append(v).append('\n');
-            }
+            String archive = sWatermark.archive();
             java.io.FileOutputStream fos = new java.io.FileOutputStream(WM_KEEP);
-            fos.write(sb.toString().getBytes("UTF-8"));
+            fos.write(archive.getBytes("UTF-8"));
             fos.close();
         } catch (Throwable t) {
             XposedBridge.log(TAG + "水印隔离存档失败: " + t);
@@ -1042,7 +1162,9 @@ public class XpanHook implements IXposedHookLoadPackage {
         try {
             java.io.File f = new java.io.File(WM_KEEP);
             if (!f.exists()) return;
-            byte[] buf = new byte[(int) f.length()];
+            long length = f.length();
+            if (!f.isFile() || length < 0 || length > 4096) return;
+            byte[] buf = new byte[(int) length];
             java.io.FileInputStream in = new java.io.FileInputStream(f);
             int n = 0;
             while (n < buf.length) {
@@ -1051,115 +1173,33 @@ public class XpanHook implements IXposedHookLoadPackage {
                 n += r;
             }
             in.close();
-            for (String line : new String(buf, 0, n, "UTF-8").split("\n")) {
-                String[] p = line.split("\t");
-                if (p.length != 3) continue;
-                int i = Integer.parseInt(p[0].trim());
-                if (i < 0 || i >= WM_FIELD.length) continue;
-                sWmMine[i] = "b".equals(p[1]) ? (Object) Boolean.valueOf(p[2]) : (Object) p[2];
-            }
+            if (n != buf.length || !sWatermark.loadArchive(new String(buf, 0, n, "UTF-8")))
+                XposedBridge.log(TAG + "watermark archive refused; previous snapshot retained");
         } catch (Throwable t) {
             XposedBridge.log(TAG + "水印隔离读档失败: " + t);
         }
     }
 
 
-    /* ---------------- 2× 真变焦：配置换带 + 会话重建 ----------------
-     * 原理（实测）：裁剪窗口 tag 应用在会话建立时读一次定死；换配置后必须让会话
-     *   重建（模式往返一趟）才生效（实测 FOV 0.50~0.55 = 真 2×）。2.5×/3× 被 HAL 钳回 2×。
-     * 分工：本 hook 识别用户意图写请求文件 + 把应用倍率钉 1×（否则预览 4× 叠加）；
-     *   换配置与模式往返由 root 脚本 crop_watch.sh 做。 */
-    private static final String CROP_REQ_FILE =
-            "/sdcard/Android/data/com.oplus.camera/files/xpan_cropzoom";
-    private static final String CROP_BUSY_FILE =
-            "/sdcard/Android/data/com.oplus.camera/files/xpan_cropzoom_busy";
-    /** 当前档位：1 = 1×，2 = 2×（点 "2" chip 当开关：点一下切 2×、再点回 1×） */
-    private static volatile int sCropZoom = 1;
-    /** 换配置/重建会话期间及冷却期：忽略"应用把倍率复位成 1×"那种请求（防打架） */
-    private static volatile long sZoomIgnoreUntil = 0L;
-
-    private static boolean cropBusy() {
-        try {
-            if (System.currentTimeMillis() < sZoomIgnoreUntil) return true;
-            File b = new File(CROP_BUSY_FILE);
-            if (!b.exists()) return false;
-            // busy 残留超 30 秒 = watcher 中途死掉了，忽略它（否则功能会被一个
-            // 残留文件永久卡死 —— "点 2× 毫无反应"的硬故障模式，实测踩过）
-            return System.currentTimeMillis() - b.lastModified() < 30000L;
-        } catch (Throwable t) {
-            return true;
-        }
-    }
-
-    /** 把"用户要哪一档"写给 root 脚本（脚本负责换配置 + 模式往返重建会话） */
-    private static void writeCropRequest(int zoom) {
-        try {
-            File f = new File(CROP_REQ_FILE);
-            File dir = f.getParentFile();
-            if (dir != null && !dir.exists()) dir.mkdirs();
-            FileOutputStream fos = new FileOutputStream(f);
-            fos.write(String.valueOf(zoom).getBytes(java.nio.charset.StandardCharsets.US_ASCII));
-            fos.close();
-        } catch (Throwable ignored) {
-        }
-    }
-
-    private static final float XPAN_MAX_ZOOM = 3.0f;
-
+    /** X-Pan 仅允许 1×，不写请求文件，不启动换配置/切模式流程。 */
     private void installXpanZoomUnlock(XC_LoadPackage.LoadPackageParam lp) {
         try {
-            Class<?> c = Class.forName("fh.g", false, lp.classLoader);
-            int n = 0;
-            for (Method m : c.getDeclaredMethods()) {
-                Class<?>[] pt = m.getParameterTypes();
-                if (!"f".equals(m.getName()) || pt.length != 1 || !float.class.equals(pt[0])) continue;
-                XposedBridge.hookMethod(m, new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
-                    try {
-                        if (!sXpanActive) return;
-                        if (param.getResult() == null) return;
-                        float want = (Float) param.args[0];
-                        if (want < 1.0f) return;                 // 0.6× / 坏档位 0.0 都保持原样
-                        // ★ 开关现读不缓存：相机进程可能跨属性修改长期存活（实测：测试时
-                        //   setprop configzoom=0，之后还原了属性但进程没重启，运行中的相机
-                        //   一直按"关"跑 → 用户点 2 只有预览放大、出片还是 1×）。变焦请求
-                        //   不频繁，每次读一次 prop 的开销可以忽略。
-                        if (!"0".equals(prop("debug.xpan.configzoom"))) {
-                            // ★ 芯片直接映射（无翻转、无状态）：点 "2" 恒设 2×，点 "1×" 恒设 1×。
-                            //   翻转式设计在"请求文件/配置/用户预期"三者失步时会把 2× 翻成 1×
-                            //   （用户点 2 毫无反应 —— 实测踩过）。应用自身的 1.0 请求（初始化恢复）
-                            //   落在冷却期内被跳过（实测配置在连拍后仍保持 2×，无自发 1.0 重发）。
-                            int target = (want >= 1.5f) ? 2 : 1;
-                            if (target != sCropZoom && !cropBusy()) {
-                                sCropZoom = target;
-                                sZoomIgnoreUntil = System.currentTimeMillis() + 15000L;
-                                writeCropRequest(target);
-                                XposedBridge.log(TAG + "X-Pan 倍率 → " + target + "×（配置换带）");
-                            }
-                            sXpanZoomReq = (sCropZoom >= 2) ? 2.0f : 1.0f;
-                            if (param.getResult() != null && ((Float) param.getResult()) != 1.0f) {
-                                param.setResult(1.0f);
-                            }
-                            return;
-                        }
-                        if (want >= 1.0f) sXpanZoomReq = want;   // 记录当前变焦档（大图回退判断用）
-                            float got = (Float) param.getResult();
-                            if (got >= want) return;                 // 没被钳制，不用管
-                            float fixed = Math.min(want, XPAN_MAX_ZOOM);
-                            param.setResult(fixed);
-                            if ("1".equals(prop("debug.xpan.diag"))) {
-                                XposedBridge.log(TAG + "xpan zoom 解锁 " + want + " -> " + fixed);
-                            }
-                        } catch (Throwable ignored) {
-                        }
-                    }
-                });
-                n++;
+            Class<?> model = Class.forName("fh.g", false, lp.classLoader);
+            Method clamp = model.getDeclaredMethod("f", float.class);
+            if (clamp.getReturnType() != float.class) {
+                throw new NoSuchMethodException("fh.g.f(float) must return float");
             }
-            XposedBridge.log(TAG + "hook installed OK (xpan zoom unlock x" + n + ")");
+            XposedBridge.hookMethod(clamp, new QualifiedHook() {
+                @Override
+                protected void beforeQualified(MethodHookParam param) {
+                    if (!sXpanActive) return;
+                    sXpanZoomReq = 1.0f;
+                    param.setResult(1.0f);
+                }
+            });
+            XposedBridge.log(TAG + "hook installed OK (xpan 1x lock)");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "!! xpan zoom unlock failed: " + t);
+            XposedBridge.log(TAG + "!! xpan 1x lock failed: " + t);
         }
     }
 
@@ -1173,13 +1213,8 @@ public class XpanHook implements IXposedHookLoadPackage {
      *   于是取到默认 0.0 → 按钮文字渲染成 "0"、点了也不生效。
      *   普通照片模式的档位列表只有 3 项（0.6/1/2），所以那边正常。
      *
-     * 做法：在档位列表交给变焦条之前，把不要的档位剔掉 ——
-     *   1) ≤0 的非法档位（DUAL=0.0 那个渲染成 "0" 的按钮）；
-     *   2) 0.6× 超广角：本机超广角的 X-Pan 成像通路没被 OPPO 调过，出片绿帧/噪声不可靠；
-     *   3) 2× 长焦：本机 HAL 对 X-Pan 的 65:24 流不做变焦裁剪（三路实测全死），
-     *      按用户要求删掉（2026-11-07）—— 变焦条**只留 1×**。
-     *   只动值列表、不动 IconType 顺序 —— 按钮文字取的是"值"，
-     *   所以剔掉后只剩 1x，点按映射也不会错位。
+     * 当前策略：只保留 1×，仅复制并过滤已核对的点按档位和变焦点列表。
+     *   非 X-Pan 和其他 Float 列表均保持原样；不触发换带、裁剪或切模式。
      */
     private void installXpanZoomPointFix(XC_LoadPackage.LoadPackageParam lp) {
         try {
@@ -1188,18 +1223,21 @@ public class XpanHook implements IXposedHookLoadPackage {
             int n = 0;
             for (Method m : c.getDeclaredMethods()) {
                 if (!"R8".equals(m.getName()) || m.getParameterTypes().length != 18) continue;
-                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                XposedBridge.hookMethod(m, new QualifiedHook() {
                     @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
+                    protected void beforeQualified(MethodHookParam param) {
                         try {
                             if (!sXpanActive || param.args == null) return;
-                            // 注：实测 R8 每次 X-Pan 会话只被调 6 次左右，不是热路径，
-                            // 所以这里老实扫一遍参数即可 —— 曾经想"缓存参数下标"提速，
-                            // 结果参数顺序不稳定、下标指错列表，0.6× 又冒出来了。
-                            for (Object a : param.args) {
-                                if (!(a instanceof List)) continue;
-                                List<?> list = (List<?>) a;
-                                if (hasBadZoomPoint(list)) filterBadZoomPoints(list);
+                            // C16 R8 的第 5、6 个参数才是点按档位与变焦点；其他 Float 列表保持原样。
+                            for (int index : new int[]{4, 5}) {
+                                Object value = param.args[index];
+                                if (!(value instanceof List)) continue;
+                                List<?> list = (List<?>) value;
+                                if (hasBadZoomPoint(list)) {
+                                    List<Object> copy = new ArrayList<Object>(list);
+                                    filterBadZoomPoints(copy);
+                                    if (!copy.isEmpty()) param.args[index] = new ArrayList<Object>(copy);
+                                }
                             }
                         } catch (Throwable ignored) {
                         }
@@ -1213,7 +1251,7 @@ public class XpanHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** 档位列表里是否还有需要剔除的档位（≠1× 的全部剔掉：≤0 非法、0.6× 超广角、2× 长焦） */
+    /** 档位列表里是否还有需要剔除的档位（≤0 非法 / <1.0 的 0.6× 超广角） */
     private static boolean hasBadZoomPoint(List<?> list) {
         for (int i = list.size() - 1; i >= 0; i--) {
             Object v = list.get(i);
@@ -1233,8 +1271,8 @@ public class XpanHook implements IXposedHookLoadPackage {
             list.remove(i);
             XposedBridge.log(TAG + "xpan 变焦条剔掉档位 " + v
                     + (f <= 0f ? "（非法）"
-                       : f < 1f ? "（0.6× 超广角，超广角出片不可靠）"
-                       : "（2× 长焦，本机 HAL 不支持真裁切）"));
+                       : f < 1f ? "（0.6× 超广角，成像不可靠）"
+                       : "（2× 长焦，本机无长焦且 HAL 不裁 65:24 流）"));
         }
     }
 
@@ -1245,19 +1283,31 @@ public class XpanHook implements IXposedHookLoadPackage {
      *   本机 mode=xpan 的功能表里没有这个名字 → 两者从未被创建 → 动画/皮肤/双皮肤全休眠。
      *
      * 做法（hook 路线，不动配置——配置手术已失败 4 次）：
-     *   1) getFeatureInfoList(I) 返回的 Set 无条件加进 "com.oplus.camera.feature.xpan"。
-     *      这个 Set 只被 x0.e(generateFeatures) 拿去逐个调 FeatureFactory.b，
-     *      不影响模式菜单（那走 hasConfigFeature 查 protobuf，不查这个 Set）。
+     *   1) getFeatureInfoList(I) 只在已核对的 X-Pan 功能生成 scope 中复制加此名字。
+     *      不改原 Set 缓存，也不影响通过 hasConfigFeature 查 protobuf 的模式菜单。
      *   2) FeatureFactory.b 加闸：featureName==xpan 且 modeName!="xpan" 时返回 null
      *      （调用方 i0.accept 对 null 有判空），保证其他模式不受影响。
      *
      * 开关：默认开启（显影动画/双皮肤/专属 UI 都靠它）。setprop debug.xpan.feat 0 重启相机可关。
-     * 已知代价：0.6×（超广角）出流会被 presenter 按设备能力改成 2.2:1 —— 已随"删掉 0.6× 档"一并规避，
-     * 1×/2× 主摄保持 4096x1512 的 65:24。
+     * 主摄只留 1×，默认申请 8192x3024；不能把 presenter 创建日志当成界面或成像验收。
      * 验证口径：日志出现 "FeatureFactory feature=com.oplus.camera.feature.xpan | mode=xpan"
      *   和 "bh.c <init>" / "dh.w <init>"，且相机不崩、X-Pan 仍能正常拍照。
      */
     private static final String FEAT_XPAN = "com.oplus.camera.feature.xpan";
+    private static volatile boolean sFeatureGuardReady;
+    private static final String GENERATION_FRAME = "com.xpanport.hook.mode.generation";
+    private static final ThreadLocal<FeatureGeneration> sFeatureGeneration = new ThreadLocal<>();
+    private static volatile Method sC16SurfaceFormat;
+
+    private static final class FeatureGeneration {
+        final String mode;
+        final int mask;
+        FeatureGeneration(String mode, int mask) { this.mode = mode; this.mask = mask; }
+    }
+    private static final class GenerationScope {
+        final FeatureGeneration prior;
+        GenerationScope(FeatureGeneration prior) { this.prior = prior; }
+    }
 
     private void installXpanFeatureInject(XC_LoadPackage.LoadPackageParam lp) {
         // 1) 功能名 Set 注入
@@ -1265,16 +1315,20 @@ public class XpanHook implements IXposedHookLoadPackage {
             Class<?> ad = Class.forName(
                     "com.oplus.ocs.camera.config.FeatureConfigureAdapter", false, lp.classLoader);
             Method m = ad.getDeclaredMethod("getFeatureInfoList", int.class);
-            XposedBridge.hookMethod(m, new XC_MethodHook() {
+            XposedBridge.hookMethod(m, new QualifiedHook() {
                 @Override
-                protected void afterHookedMethod(MethodHookParam param) {
+                protected void afterQualified(MethodHookParam param) {
                     try {
-                        if ("0".equals(prop("debug.xpan.feat"))) return;   // 默认开，置 0 关
+                        if (!sFeatureGuardReady || param.hasThrowable() || "0".equals(prop("debug.xpan.feat"))) return;
+                        FeatureGeneration generation = sFeatureGeneration.get();
+                        if (generation == null || !"xpan".equals(generation.mode)
+                                || generation.mask != (Integer) param.args[0]) return;
                         Object r = param.getResult();
                         if (r instanceof java.util.Set) {
-                            @SuppressWarnings("unchecked")
-                            java.util.Set<Object> s = (java.util.Set<Object>) r;
-                            s.add(FEAT_XPAN);
+                            for (Object value : (java.util.Set<?>) r) if (!(value instanceof String)) return;
+                            java.util.Set<Object> copy = new java.util.LinkedHashSet<>((java.util.Set<?>) r);
+                            copy.add(FEAT_XPAN);
+                            param.setResult(copy);
                         }
                     } catch (Throwable ignored) {
                     }
@@ -1291,9 +1345,16 @@ public class XpanHook implements IXposedHookLoadPackage {
             Class<?> ui = Class.forName("com.oplus.camera.protocal.ui.a", false, lp.classLoader);
             Method b = d0.getDeclaredMethod("b", String.class, String.class,
                     int.class, android.app.Activity.class, ui);
-            XposedBridge.hookMethod(b, new XC_MethodHook() {
+            XposedBridge.hookMethod(b, new QualifiedHook() {
                 @Override
-                protected void afterHookedMethod(MethodHookParam param) {
+                protected void beforeQualified(MethodHookParam param) {
+                    if (FEAT_XPAN.equals(param.args[0]) && !"xpan".equals(param.args[1])) {
+                        param.setResult(null);
+                    }
+                }
+
+                @Override
+                protected void afterQualified(MethodHookParam param) {
                     try {
                         if (!FEAT_XPAN.equals(param.args[0])) return;
                         String mode = String.valueOf(param.args[1]);
@@ -1317,6 +1378,7 @@ public class XpanHook implements IXposedHookLoadPackage {
                     }
                 }
             });
+            sFeatureGuardReady = true;
             XposedBridge.log(TAG + "hook installed OK (xpan feature gate)");
         } catch (Throwable t) {
             XposedBridge.log(TAG + "!! xpan feature gate failed: " + t);
@@ -1326,9 +1388,9 @@ public class XpanHook implements IXposedHookLoadPackage {
             for (final String cn : new String[]{"bh.c", "dh.w"}) {
                 Class<?> c = Class.forName(cn, false, lp.classLoader);
                 for (java.lang.reflect.Constructor<?> ctor : c.getDeclaredConstructors()) {
-                    XposedBridge.hookMethod(ctor, new XC_MethodHook() {
+                    XposedBridge.hookMethod(ctor, new QualifiedHook() {
                         @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
+                        protected void afterQualified(MethodHookParam param) {
                             if ("1".equals(prop("debug.xpan.diag"))) {
                                 XposedBridge.log(TAG + cn + " <init> ← 已实例化");
                             }
@@ -1361,25 +1423,29 @@ public class XpanHook implements IXposedHookLoadPackage {
             Class<?> bm = Class.forName(CLS_BASE_MODE, false, lp.classLoader);
             Class<?> cfg = Class.forName(CLS_DEVICE_CONFIG, false, lp.classLoader);
             Method bss = bm.getDeclaredMethod("buildStreamSurface", cfg, String.class);
-            XposedBridge.hookMethod(bss, new XC_MethodHook() {
+            XposedBridge.hookMethod(bss, new QualifiedHook() {
                 @Override
-                protected void afterHookedMethod(MethodHookParam param) {
+                protected void afterQualified(MethodHookParam param) {
                     try {
                         Object thiz = param.thisObject;
                         if (thiz == null || !CLS_XPAN_MODE.equals(thiz.getClass().getName())) return;
+                        final long epoch = sWatermark.epoch();
+                        if (param.hasThrowable()) return;
                         android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
                         h.postDelayed(new Runnable() {
                             @Override
                             public void run() {
+                                if (!moduleEnabled() || !sWatermark.current(epoch)) return;
                                 driveXpanContainer();
                             }
                         }, 2000);
                         h.postDelayed(new Runnable() {
                             @Override
                             public void run() {
+                                if (!moduleEnabled() || !sWatermark.current(epoch)) return;
                                 driveXpanContainer();
                             }
-                        }, 4500);   // 兜底第二次
+                        }, 4500);   // 同一实际模式 epoch 才允许兜底
                     } catch (Throwable ignored) {
                     }
                 }
@@ -1395,9 +1461,9 @@ public class XpanHook implements IXposedHookLoadPackage {
             Class<?> zlq = Class.forName("zl.q", false, lp.classLoader);
             Class<?> scr = Class.forName("bk.g", false, lp.classLoader);
             Method c1 = zlq.getDeclaredMethod("c1", scr);
-            XposedBridge.hookMethod(c1, new XC_MethodHook() {
+            XposedBridge.hookMethod(c1, new QualifiedHook() {
                 @Override
-                protected void afterHookedMethod(MethodHookParam param) {
+                protected void afterQualified(MethodHookParam param) {
                     try {
                         if (!sXpanActive || sPresenter == null) return;
                         wireXpanFilter(param.thisObject);
@@ -1417,9 +1483,9 @@ public class XpanHook implements IXposedHookLoadPackage {
             final java.lang.reflect.Field fQ = zlq.getDeclaredField("Q");
             fQ.setAccessible(true);
             Method xa = zlq.getDeclaredMethod("xa");
-            XposedBridge.hookMethod(xa, new XC_MethodHook() {
+            XposedBridge.hookMethod(xa, new QualifiedHook() {
                 @Override
-                protected void afterHookedMethod(MethodHookParam param) {
+                protected void afterQualified(MethodHookParam param) {
                     try {
                         // 性能：这是热路径（应用每帧/每次状态查询都会调 xa()）。
                         // 成功后立刻短路，之后只剩一次布尔判断，不再做任何反射。
@@ -1435,6 +1501,7 @@ public class XpanHook implements IXposedHookLoadPackage {
                                 .postDelayed(new Runnable() {
                                     @Override
                                     public void run() {
+                                        if (!moduleEnabled()) return;
                                         sDrivePending = false;
                                         driveXpanContainer();   // 失败则下次 xa() 再触发
                                     }
@@ -1590,6 +1657,7 @@ public class XpanHook implements IXposedHookLoadPackage {
                 ((android.view.View) panel).postDelayed(new Runnable() {
                     @Override
                     public void run() {
+                                        if (!moduleEnabled()) return;
                         recenterFilterStripOnce(p, attempt);
                     }
                 }, RECENTER_AT_MS[i]);
@@ -1835,9 +1903,9 @@ public class XpanHook implements IXposedHookLoadPackage {
                 final String nm = m.getName();
                 if (!"setXpanFilterList".equals(nm) && !"setFilterViewListener".equals(nm)
                         && !"performClick".equals(nm) && !"n".equals(nm)) continue;
-                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                XposedBridge.hookMethod(m, new QualifiedHook() {
                     @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
+                    protected void beforeQualified(MethodHookParam param) {
                         try {
                             StringBuilder sb = new StringBuilder();
                             if (param.args != null) {
@@ -1867,9 +1935,9 @@ public class XpanHook implements IXposedHookLoadPackage {
                     false, lp.classLoader);
             Method ot = l.getDeclaredMethod("onTouch", android.view.View.class,
                     android.view.MotionEvent.class);
-            XposedBridge.hookMethod(ot, new XC_MethodHook() {
+            XposedBridge.hookMethod(ot, new QualifiedHook() {
                 @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
+                protected void beforeQualified(MethodHookParam param) {
                     try {
                         android.view.MotionEvent ev = (android.view.MotionEvent) param.args[1];
                         if (ev != null && ev.getAction() == android.view.MotionEvent.ACTION_UP) {
@@ -1888,9 +1956,9 @@ public class XpanHook implements IXposedHookLoadPackage {
         try {
             Class<?> u = Class.forName("dh.u", false, lp.classLoader);
             Method a = u.getDeclaredMethod("a", String.class);
-            XposedBridge.hookMethod(a, new XC_MethodHook() {
+            XposedBridge.hookMethod(a, new QualifiedHook() {
                 @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
+                protected void beforeQualified(MethodHookParam param) {
                     try {
                         Object w = field(param.thisObject, "a");      // dh.u.a : dh/w
                         Object yPanel = (w == null) ? null : field(w, "Y");
@@ -1937,9 +2005,9 @@ public class XpanHook implements IXposedHookLoadPackage {
             Class<?> w = Class.forName("dh.w", false, lp.classLoader);
             for (Method m : w.getDeclaredMethods()) {
                 if (!"h".equals(m.getName()) || m.getParameterTypes().length != 4) continue;
-                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                XposedBridge.hookMethod(m, new QualifiedHook() {
                     @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
+                    protected void afterQualified(MethodHookParam param) {
                         try {
                             sViewSetup = new Object[]{param.thisObject,
                                     param.args[0], param.args[1], param.args[2], param.args[3]};
@@ -1961,9 +2029,9 @@ public class XpanHook implements IXposedHookLoadPackage {
             for (Method m : c.getDeclaredMethods()) {
                 final String nm = m.getName();
                 if (!"c1".equals(nm) && !"w0".equals(nm) && !"n1".equals(nm)) continue;
-                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                XposedBridge.hookMethod(m, new QualifiedHook() {
                     @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
+                    protected void beforeQualified(MethodHookParam param) {
                         try {
                             android.view.View v = (android.view.View) param.thisObject;
                             XposedBridge.log(TAG + "面板." + nm + "("
@@ -2007,9 +2075,9 @@ public class XpanHook implements IXposedHookLoadPackage {
         try {
             Class<?> zlq = Class.forName("zl.q", false, lp.classLoader);
             Method fc = zlq.getDeclaredMethod("fc");
-            XposedBridge.hookMethod(fc, new XC_MethodHook() {
+            XposedBridge.hookMethod(fc, new QualifiedHook() {
                 @Override
-                protected void afterHookedMethod(MethodHookParam param) {
+                protected void afterQualified(MethodHookParam param) {
                     try {
                         Object panel = field(param.thisObject, "C");
                         if (panel instanceof android.view.View) {
@@ -2110,124 +2178,143 @@ public class XpanHook implements IXposedHookLoadPackage {
         }
     }
 
-    /* ---------------- 【已停用】退出清理：靠"功能表重建"信号 ----------------
-     * ⚠️ 2026-10-07 实测：这段是"往返切换后界面卡死（除滤镜外全不能点）"的元凶 ——
-     *    它在模式名≠xpan 时调 fc() 拆掉 X-Pan 视图，而切换过程中该回调会在"正在回 X-Pan"
-     *    的时刻被触发，把刚建好的界面拆了 → 卡死。A/B 对照：加 debug.xpan.noexit=1 跳过它，
-     *    往返 3/3 全部正常；不跳过则频繁卡死。故整段停用（函数保留以便日后改造）。
-     * 代价：退出 X-Pan 后可能有少量视图残留（原先要修的重叠问题），但那比卡死轻得多。
-     * ---------------------------------------------------------------------
-     * 实测退出走"轮盘切模式"时：buildStreamSurface 不重跑（模式门不翻转）、fc() 也不调，
-     * 于是 X-Pan 的皮肤/面板留在照片模式上重叠。
-     * 但模式切换时应用一定会重建功能表：q7.x0.e(Activity, modeName, ...)，modeName 就是新模式名。
-     * 只要 modeName 不是 "xpan"，就说明离开了 X-Pan → 延迟卸掉容器视图与面板。
-     */
-    private void installXpanExitCleanup(XC_LoadPackage.LoadPackageParam lp) {
-        try {
-            Class<?> x0 = Class.forName("q7.x0", false, lp.classLoader);
-            for (Method m : x0.getDeclaredMethods()) {
-                if (!"e".equals(m.getName()) || m.getParameterTypes().length != 7) continue;
-                XposedBridge.hookMethod(m, new XC_MethodHook() {
-                    @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
-                        try {
-                            // 调试开关：置 1 就完全不清理（用来对照"卡死是否由退出清理引起"）
-                            if ("1".equals(prop("debug.xpan.noexit"))) return;
-                            String mode = String.valueOf(param.args[1]);
-                            if ("xpan".equals(mode)) return;      // 还在 X-Pan
-                            if (!sXpanActive) return;             // 本来就不在
-                            sXpanActive = false;                  // 模式门没翻转也要清，这里直接置位
-                            sDriveDone = true;                    // 别让 xa() 兜底再把它建回来
-                            android.os.Handler h = new android.os.Handler(
-                                    android.os.Looper.getMainLooper());
-                            Runnable r = new Runnable() {
-                                @Override
-                                public void run() {
-                                    cleanupXpanContainer();
-                                }
-                            };
-                            h.postDelayed(r, 300);
-                            h.postDelayed(r, 1200);
-                            XposedBridge.log(TAG + "离开 X-Pan（新模式=" + mode + "）→ 触发界面清理");
-                        } catch (Throwable ignored) {
-                        }
-                    }
-                });
-            }
-            XposedBridge.log(TAG + "hook installed OK (xpan exit cleanup)");
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "!! xpan exit cleanup failed: " + t);
+    /* Requested feature rebuilds are not exits. UI cleanup is driven by actual mode only. */
+    private void onActualMode(String oldMode, String actualMode, final long epoch) {
+        boolean isXpan = "xpan".equals(actualMode);
+        boolean changed = sXpanActive != isXpan;
+        sXpanActive = isXpan;
+        if (!changed || sProfile == null || sProfile.generation != CameraProfile.Generation.C16) return;
+        if (isXpan) {
+            sXpanZoomReq = 1.0f;
+            sDriveDone = false;
+            sDroveThisSession = false;
+            sDriveFails = 0;
         }
+        final boolean entering = isXpan;
+        Runnable task = new Runnable() {
+            @Override public void run() {
+                if (!moduleEnabled() || !sWatermark.current(epoch) || sXpanActive != entering) return;
+                if (entering) driveXpanContainer(); else cleanupXpanContainer();
+            }
+        };
+        android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
+        h.postDelayed(task, isXpan ? 600L : 300L);
+        h.postDelayed(task, isXpan ? 1800L : 1200L);
+        XposedBridge.log(TAG + "actual mode " + oldMode + " -> " + actualMode);
     }
 
-    /* ---------------- 模式门：判断当前在不在 X-Pan ---------------- */
-    private void installModeGate(XC_LoadPackage.LoadPackageParam lp) {
+    private static Field modeField(Class<?> owner, String name, Class<?> type, int required)
+            throws Throwable {
+        Field f = owner.getDeclaredField(name);
+        if (f.getType() != type || Modifier.isStatic(f.getModifiers())
+                || (f.getModifiers() & required) != required)
+            throw new NoSuchFieldException(owner.getName() + "." + name + " ABI mismatch");
+        f.setAccessible(true);
+        return f;
+    }
+
+    private static Method modeMethod(Class<?> owner, String name, Class<?> result, Class<?>... args)
+            throws Throwable {
+        Method m = owner.getDeclaredMethod(name, args);
+        if (Modifier.isStatic(m.getModifiers()) || m.getReturnType() != result)
+            throw new NoSuchMethodException(owner.getName() + "." + name + " ABI mismatch");
+        m.setAccessible(true);
+        return m;
+    }
+
+    private static String c16ActualMode(Object manager, Field holderField, Field runningField,
+                                        Field nameField) throws Throwable {
+        Object holder = holderField.get(manager);
+        if (holder == null) return null;
+        Object running = runningField.get(holder);
+        if (running == null) return null;
+        Object name = nameField.get(running);
+        if (name == null) return null;
+        if (!(name instanceof String)) throw new IllegalStateException("untyped actual mode");
+        return (String) name;
+    }
+
+    /* C16 core bindings are all resolved before hooks become active. */
+    private boolean installModeGate(XC_LoadPackage.LoadPackageParam lp) {
+        final List<XC_MethodHook.Unhook> installed = new ArrayList<>();
+        final boolean[] ready = {false};
         try {
+            Class<?> manager = Class.forName("wh.q3", false, lp.classLoader);
+            Class<?> holder = Class.forName("wh.w4", false, lp.classLoader);
+            Class<?> actualBase = Class.forName("com.oplus.camera.module.BaseMode", false, lp.classLoader);
+            final Field holderField = modeField(manager, "a", holder, 0);
+            final Field runningField = modeField(holder, "a", actualBase, Modifier.VOLATILE);
+            final Field nameField = modeField(actualBase, "a0", String.class, Modifier.FINAL);
+            Method change = modeMethod(manager, "d0", boolean.class, String.class, boolean.class, boolean.class);
             Class<?> bm = Class.forName(CLS_BASE_MODE, false, lp.classLoader);
             Class<?> cfg = Class.forName(CLS_DEVICE_CONFIG, false, lp.classLoader);
-            // 真实签名（反编译 BaseMode 得到）：buildStreamSurface(SdkCameraDeviceConfig, String) -> LinkedList
-            // 之前多写了两个 String 和一个 int → NoSuchMethodException → 标志位永不置位 → 整个覆盖失效
-            Method bss = bm.getDeclaredMethod("buildStreamSurface", cfg, String.class);
-            XposedBridge.hookMethod(bss, new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
+            Method bss = modeMethod(bm, "buildStreamSurface", java.util.LinkedList.class, cfg, String.class);
+            final Method format = modeMethod(bm, "getSurfaceFormatBySurfaceType", int.class,
+                    String.class, String.class, String.class);
+            Method generate = modeMethod(Class.forName("q7.x0", false, lp.classLoader), "e", void.class,
+                    android.app.Activity.class, String.class, int.class, int.class,
+                    Class.forName("com.oplus.camera.filter.IEffectProcessor", false, lp.classLoader), actualBase,
+                    Class.forName("nk.b", false, lp.classLoader));
+            installed.add(XposedBridge.hookMethod(change, new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam param) {
+                    if (!ready[0] || !moduleEnabled()) return;
                     try {
-                        Object thiz = param.thisObject;
-                        boolean isXpan = thiz != null && CLS_XPAN_MODE.equals(thiz.getClass().getName());
-                        if (sXpanActive != isXpan) {
-                            sXpanActive = isXpan;
-                            // 水印按模式隔离：进 X-Pan 换成 X-Pan 那份，出去换回其他模式那份
-                            if (isXpan) wmEnterXpan(); else wmExitXpan();
-                            if (isXpan) {
-                                sXpanZoomReq = 1.0f;             // 进模式复位变焦档
-                                sZoomIgnoreUntil = System.currentTimeMillis() + 4000L;
-                            }
-                            XposedBridge.log(TAG + "xpan stream building = " + isXpan);
-                            if (isXpan) {
-                                // 进入 X-Pan：复位会话级状态 + 快速补建（滤镜由 wireXpanFilter 负责接回）
-                                sDriveDone = false;
-                                sDroveThisSession = false;
-                                sDriveFails = 0;
-                                android.os.Handler h = new android.os.Handler(
-                                        android.os.Looper.getMainLooper());
-                                h.postDelayed(new Runnable() {
-                                    @Override
-                                    public void run() {
-                                        driveXpanContainer();
-                                    }
-                                }, 600);
-                                h.postDelayed(new Runnable() {
-                                    @Override
-                                    public void run() {
-                                        driveXpanContainer();
-                                    }
-                                }, 1800);
-                            } else {
-                                // 退出 X-Pan：卸掉可能残留的容器视图，防止与其他模式界面重叠
-                                android.os.Handler h = new android.os.Handler(
-                                        android.os.Looper.getMainLooper());
-                                h.postDelayed(new Runnable() {
-                                    @Override
-                                    public void run() {
-                                        cleanupXpanContainer();
-                                    }
-                                }, 300);
-                                h.postDelayed(new Runnable() {
-                                    @Override
-                                    public void run() {
-                                        cleanupXpanContainer();
-                                    }
-                                }, 1200);
-                            }
-                        }
-                    } catch (Throwable t) {
-                        XposedBridge.log(TAG + "mode flag error: " + t);
+                        String old = c16ActualMode(param.thisObject, holderField, runningField, nameField);
+                        param.setObjectExtra(MODE_FRAME, wmBeforeModeChange(old, (String) param.args[0]));
+                    } catch (Throwable failure) {
+                        XposedBridge.log(TAG + "C16 actual-mode before read failed; original preserved: " + failure);
                     }
                 }
-            });
-            XposedBridge.log(TAG + "hook installed OK (buildStreamSurface mode gate)");
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "!! buildStreamSurface hook failed: " + t);
+                @Override protected void afterHookedMethod(MethodHookParam param) {
+                    Object token = param.getObjectExtra(MODE_FRAME);
+                    if (!(token instanceof WatermarkState.Transition)) return;
+                    String actual = null;
+                    try { actual = c16ActualMode(param.thisObject, holderField, runningField, nameField); }
+                    catch (Throwable failure) {
+                        XposedBridge.log(TAG + "C16 actual-mode after read failed; direct live rollback: " + failure);
+                    }
+                    // Delivered despite gateoff/throwable: only this token's cleanup is allowed.
+                    wmAfterModeChange(((WatermarkState.Transition) token).oldMode, actual, token);
+                }
+            }));
+            installed.add(XposedBridge.hookMethod(bss, new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam param) {
+                    if (!ready[0] || !moduleEnabled()) return;
+                    param.setObjectExtra(BUILD_FRAME, new BuildScope(sXpanBuilding.get()));
+                    sXpanBuilding.set(param.thisObject != null
+                            && CLS_XPAN_MODE.equals(param.thisObject.getClass().getName()));
+                }
+                @Override protected void afterHookedMethod(MethodHookParam param) {
+                    Object frame = param.getObjectExtra(BUILD_FRAME);
+                    if (!(frame instanceof BuildScope)) return;
+                    Boolean prior = ((BuildScope) frame).prior;
+                    if (prior == null) sXpanBuilding.remove(); else sXpanBuilding.set(prior);
+                }
+            }));
+            installed.add(XposedBridge.hookMethod(generate, new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam param) {
+                    if (!ready[0] || !moduleEnabled()) return;
+                    param.setObjectExtra(GENERATION_FRAME, new GenerationScope(sFeatureGeneration.get()));
+                    sFeatureGeneration.set(new FeatureGeneration((String) param.args[1], (Integer) param.args[3]));
+                }
+                @Override protected void afterHookedMethod(MethodHookParam param) {
+                    Object frame = param.getObjectExtra(GENERATION_FRAME);
+                    if (!(frame instanceof GenerationScope)) return;
+                    FeatureGeneration prior = ((GenerationScope) frame).prior;
+                    if (prior == null) sFeatureGeneration.remove(); else sFeatureGeneration.set(prior);
+                }
+            }));
+            sC16SurfaceFormat = format;
+            ready[0] = true;
+            XposedBridge.log(TAG + "C16 exact mode/build/generation ABI installed; runtime unverified");
+            return true;
+        } catch (Throwable failure) {
+            ready[0] = false;
+            for (int i = installed.size() - 1; i >= 0; i--) {
+                try { installed.get(i).unhook(); } catch (Throwable ignored) { }
+            }
+            XposedBridge.log(TAG + "C16 core binding/registration refused: " + failure);
+            return false;
         }
     }
 
@@ -2238,9 +2325,9 @@ public class XpanHook implements IXposedHookLoadPackage {
             Method getHal = sw.getDeclaredMethod("getHalSurfaceSize");
             // ImageReader 就是按这个 getter 建的；它在 mHalSurfaceSize==null 时直接回退成 App 尺寸，
             // 所以只改 setHalSurfaceSize 没用，必须拦 getter。
-            XposedBridge.hookMethod(getHal, new XC_MethodHook() {
+            XposedBridge.hookMethod(getHal, new QualifiedHook() {
                 @Override
-                protected void afterHookedMethod(MethodHookParam param) {
+                protected void afterQualified(MethodHookParam param) {
                     try {
                         Object r = param.getResult();
                         if (!(r instanceof Size)) return;
@@ -2266,9 +2353,9 @@ public class XpanHook implements IXposedHookLoadPackage {
             Class<?> sw = Class.forName(CLS_SURFACE_WRAPPER, false, lp.classLoader);
             Method setHal = sw.getDeclaredMethod("setHalSurfaceSize", Size.class);
             Method setApp = sw.getDeclaredMethod("setAppSurfaceSize", Size.class);
-            XC_MethodHook fix = new XC_MethodHook() {
+            XC_MethodHook fix = new QualifiedHook() {
                 @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
+                protected void beforeQualified(MethodHookParam param) {
                     try {
                         if (param.args == null || param.args.length < 1) return;
                         Object o = param.args[0];
@@ -2295,20 +2382,12 @@ public class XpanHook implements IXposedHookLoadPackage {
     private void installXpanSurfaceSize(XC_LoadPackage.LoadPackageParam lp) {
         try {
             Class<?> cls = Class.forName(CLS_XPAN_MODE, false, lp.classLoader);
-            Method target = null;
-            for (Method m : cls.getDeclaredMethods()) {
-                if ("getSurfaceSize".equals(m.getName()) && m.getParameterTypes().length == 5) {
-                    target = m;
-                    break;
-                }
-            }
-            if (target == null) {
-                XposedBridge.log(TAG + "note: XpanMode.getSurfaceSize(5) not found, skip（不影响尺寸修正）");
-                return;
-            }
-            XposedBridge.hookMethod(target, new XC_MethodHook() {
+            Method target = modeMethod(cls, "getSurfaceSize", List.class,
+                    Class.forName(CLS_DEVICE_CONFIG, false, lp.classLoader),
+                    String.class, String.class, String.class, int.class);
+            XposedBridge.hookMethod(target, new QualifiedHook() {
                 @Override
-                protected void afterHookedMethod(MethodHookParam param) {
+                protected void afterQualified(MethodHookParam param) {
                     try {
                         onSurfaceSize(param);
                     } catch (Throwable t) {
@@ -2325,7 +2404,7 @@ public class XpanHook implements IXposedHookLoadPackage {
     /**
      * 算出这个面该用哪个尺寸；**返回 null 表示不要动**。
      * 预览 → previewSize()（2304x1048，可被 debug.xpan.preview 覆盖）
-     * 拍照 → captureSize()（默认 8192x3024；建 .xpan_smallpic 回 4096x1512；prop 可显式覆盖）
+     * 拍照 → captureSize()（默认 8192x3024 高像素；调试 prop debug.xpan.capture 可覆盖）
      *   app/HAL 两侧同尺寸 —— 大图档就是让 HAL 出 8192x3024 的放大流
      *   （2026-10-10 实测：HAL 收下 >4096 宽的流，内部从 12.5MP 读出放大，连拍稳定）。
      *   曾试过"app 侧大图 + HAL 侧真读出、借 APS mfll/upscale 放大"的 C 路线：
@@ -2335,49 +2414,35 @@ public class XpanHook implements IXposedHookLoadPackage {
      */
     private static Size targetFor(Size s, Object wrapper) {
         try {
-            if (!sXpanActive) return null;                 // 边界 1：非 X-Pan 模式一律不动
-            if (s == null) return null;
-
+            if (!xpanSizeScope() || s == null || !"rear_main".equals(cameraTypeOf(wrapper))) return null;
             String usage = surfaceUsage(wrapper);
-            if (usage == null) return null;                // 认不出来 → 不动
-            String u = usage.toLowerCase();
-
-            boolean isPreview = u.contains("preview");
-            boolean isPicture = u.contains("picture") || u.contains("snapshot")
-                    || u.contains("capture") || u.contains("jpeg") || u.contains("blob");
-            if (!isPreview && !isPicture) return null;     // 视频/缩略图/metadata 等 → 不动
-
+            boolean isPreview = "surface_key_preview".equals(usage)
+                    || "surface_key_preview_frame".equals(usage);
+            boolean isPicture = "surface_key_picture".equals(usage);
+            if (!isPreview && !isPicture) return null;
+            Method getter = wrapper.getClass().getMethod("getFormat");
+            if (getter.getReturnType() != int.class || Modifier.isStatic(getter.getModifiers())) return null;
+            int format = (Integer) getter.invoke(wrapper);
+            if (!safeC16Format(isPreview, format)) return null;
             String forced = isPreview ? prop("debug.xpan.preview") : prop("debug.xpan.capture");
             Size want = (forced != null) ? parseSize(forced)
                     : (isPreview ? previewSize() : captureSize());
             if (want == null) return null;
-
-            // ★ 变焦 ≠1× 时拍照流回退 4096x1512：8192 宽大流超出活动阵列，HAL 不理
-            //   变焦裁剪（2× 实拍只有 ~1.12× 视野，见 sXpanZoomReq 注释）。prop 显式
-            //   指定时尊重 prop（老语义，自行承担）。
-            //   注：2026-10-11 实验过"改发显式 SCALER_CROP_REGION"的替代方案 ——
-            //   HAL 直接崩进程（拍照请求带 crop 就 SIGSEGV），此路不通，勿再试。
-            if (!isPreview && forced == null && sXpanZoomReq > 1.05f) {
-                Size real = parseSize(DEFAULT_CAPTURE);
-                if (real != null) {
-                    want = real;
-                    dlog("变焦档回退: " + sXpanZoomReq + "x -> " + real);
-                }
-            }
-
-            // 超广角的 HAL 流必须用它自己支持的宽度（imx355 流表最大 3200/3216），
-            // 否则绿帧/噪声；JPEG 输出仍由应用侧的 4096x1512 负责（APS 缩放）。
-            if (!isPreview && isUltraWide(cameraTypeOf(wrapper))) {
-                String uw = prop("debug.xpan.uwcap");
-                if (uw == null || uw.isEmpty()) uw = DEFAULT_UW_CAPTURE;
-                Size uwSize = parseSize(uw);
-                if (uwSize != null) want = uwSize;
-            }
             return want.equals(s) ? null : want;
         } catch (Throwable t) {
             XposedBridge.log(TAG + "targetFor failed: " + t);
             return null;
         }
+    }
+
+    private static boolean xpanSizeScope() {
+        Boolean building = sXpanBuilding.get();
+        return building == null ? sXpanActive : building;
+    }
+
+    private static boolean safeC16Format(boolean preview, int format) {
+        return format == ImageFormat.YUV_420_888 || (!preview
+                && (format == ImageFormat.JPEG || format == ImageFormat.HEIC));
     }
 
     /** 取 SurfaceWrapper.getSurfaceUsage()；拿不到返回 null（表示"说不清"） */
@@ -2407,21 +2472,19 @@ public class XpanHook implements IXposedHookLoadPackage {
         dlog("getSurfaceSize surfaceType=" + surfaceType
                 + " cameraType=" + cameraType + " orig=" + describe(orig));
 
-        if (!sXpanActive || surfaceType == null || !(orig instanceof List)) return;
+        if (!xpanSizeScope() || param.hasThrowable() || !(orig instanceof List)
+                || !"rear_main".equals(cameraType) || a.length != 5 || !"rear_main".equals(a[3])) return;
         List<Object> list = (List<Object>) orig;
         if (list.isEmpty()) return;
-
-        String st = surfaceType.toLowerCase();
-        Size want;
-        if (st.contains("preview")) {
-            want = previewSize();
-        } else if (st.startsWith("capture") || st.equals("raw_output") || st.equals("raw12_output")) {
-            want = captureSize();
-            // 注：超广角的 HAL 流尺寸在 targetFor 里单独处理（getHalSurfaceSize 那层），
-            // 应用侧尺寸（这里）保持 4096x1512 不变，APS 负责最终输出。
-        } else {
-            return;
-        }
+        boolean preview = "preview".equals(surfaceType) || "preview_frame".equals(surfaceType);
+        if (!preview && !"capture".equals(surfaceType) && !"capture_yuv".equals(surfaceType)) return;
+        try {
+            Method formatMethod = sC16SurfaceFormat;
+            if (formatMethod == null) return;
+            int format = (Integer) formatMethod.invoke(param.thisObject, surfaceType, cameraType, a[3]);
+            if (!safeC16Format(preview, format)) return;
+        } catch (Throwable failure) { return; }
+        Size want = preview ? previewSize() : captureSize();
         if (want == null) return;
 
         List<Object> out = new ArrayList<>(list.size());
@@ -2465,20 +2528,15 @@ public class XpanHook implements IXposedHookLoadPackage {
     /**
      * X-Pan 拍照尺寸，优先级：debug.xpan.capture > 默认档 > DEFAULT_CAPTURE。
      * v1.3 起默认 = BIG_CAPTURE（8192x3024，24.8MP 算法放大）；
-     * 想回 6.2MP 小文件档：新建 /sdcard/DCIM/.xpan_smallpic（空文件）并重启相机。
+     * 想看 6.2MP 真实像素档只走 prop：setprop debug.xpan.capture 4096x1512。
      * 有缓存，改动后重启相机进程生效（与 prop 行为一致）。
      */
     private static Size captureSize() {
         if (sCaptureSize != null) return sCaptureSize;
         String p = prop("debug.xpan.capture");
         Size s = parseSize(p);
-        // ★ 默认 8192x3024（24.8MP，用户 2026-11-07 定）；想回 4096x1512 真实像素档
-        //   （最清晰、无 2~3 像素重影）：建 /sdcard/DCIM/.xpan_smallpic 空文件并重启相机。
-        //   .xpan_bigpic 作为旧开关保留，仍等价于默认。
-        if (s == null && smallPicEnabled()) {
-            s = parseSize(DEFAULT_CAPTURE);
-            XposedBridge.log(TAG + "小图档标记存在 → " + DEFAULT_CAPTURE + "（真实像素、无重影）");
-        }
+        // ★ 默认 8192x3024（24.8MP 高像素档）。想看 6.2MP 真实像素档（无重影）只走调试 prop：
+        //   setprop debug.xpan.capture 4096x1512，改完重启相机。
         if (s == null) s = parseSize(BIG_CAPTURE);
         if (s == null) s = new Size(8192, 3024);
         sCaptureSize = s;
@@ -2486,27 +2544,7 @@ public class XpanHook implements IXposedHookLoadPackage {
         return s;
     }
 
-    /** 可选大图档开关：/sdcard/DCIM/.xpan_bigpic（空文件）存在 → 8192x3024（算法放大、
-     *  带 2~3 像素重影）。默认（无文件）= 4096x1512 真实像素。改完重启相机生效。 */
-    /** 小图档（4096x1512 真实像素）：/sdcard/DCIM/.xpan_smallpic 空文件。 */
-    private static boolean smallPicEnabled() {
-        try {
-            if (new File("/storage/emulated/0/DCIM/.xpan_smallpic").exists()) return true;
-            return new File("/storage/emulated/0/Android/media/com.oneplus.camera/.xpan_smallpic").exists();
-        } catch (Throwable t) {
-            return false;
-        }
-    }
-
-    private static boolean bigPicEnabled() {
-        try {
-            if (new File("/storage/emulated/0/DCIM/.xpan_bigpic").exists()) return true;
-            return new File("/storage/emulated/0/Android/media/com.oneplus.camera/.xpan_bigpic").exists();
-        } catch (Throwable t) {
-            return false;
-        }
-    }
-
+    /** 解析调试用宽×高；读取失败时由调用方使用已定义的默认档。 */
     private static Size parseSize(String s) {
         try {
             String[] p = s.trim().toLowerCase().split("[x*]");
@@ -2585,605 +2623,4 @@ public class XpanHook implements IXposedHookLoadPackage {
         return null;
     }
 
-    /* ==================================================================================
-     *  ProXDR 增益图调整（ratioMax 8x）：出片后处理，全局生效（2026-10-18 配方，实测通过）
-     *  ① ratioMax 提到 8 倍 → ProXDR 高光更亮（tmap 定点 + XMP 等长替换）
-     *  ② 就地覆盖、两阶段写入等待、水印条增益压平
-     *  开关：prop debug.xpan.proxdr = "0" 关闭；debug.xpan.proxdr.ratio 改倍率
-     * ================================================================================== */
-    private static final String PX_TMAP_TYPE = "tmap";
-    private static final java.util.HashMap<String, long[]> sPxState = new java.util.HashMap<>();
-    private static final String DCIM_CAMERA = "/storage/emulated/0/DCIM/Camera";
-    private static final class Hx {
-        byte[] d;
-        java.util.HashMap<Integer, String> types = new java.util.HashMap<>();
-        java.util.HashMap<Integer, int[]> ext = new java.util.HashMap<>();   // id -> {cm, off, len}
-        java.util.HashMap<Integer, int[]> extField = new java.util.HashMap<>(); // id -> {offPos, offSz, lenPos, lenSz}
-        java.util.HashMap<Integer, int[]> dimg = new java.util.HashMap<>();  // from -> ids
-        java.util.HashMap<Integer, int[]> dimgPos = new java.util.HashMap<>(); // from -> {idsPos, count}
-        int pitm = -1;
-        int idatData = -1;                                                   // idat 载荷起点
-    }
-    private void installProxdrPost(XC_LoadPackage.LoadPackageParam lp) {
-        try {
-            Class<?> c = Class.forName("com.oplus.ocs.camera.producer.device.Camera2Impl",
-                    false, lp.classLoader);
-            int n = 0;
-            for (Method m : c.getDeclaredMethods()) {
-                if (!"takePicture".equals(m.getName()) || m.getParameterTypes().length != 5) continue;
-                XposedBridge.hookMethod(m, new XC_MethodHook() {
-                    @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
-                        try {
-                            if ("0".equals(prop("debug.xpan.proxdr"))) return;
-                            float z = 1.0f;
-                            Object zz = field(param.args[0], "mZoomRatio");
-                            if (zz instanceof Number) z = ((Number) zz).floatValue();
-                            final float zf = z;
-                            final java.io.File dir = new java.io.File(DCIM_CAMERA);
-                            final java.util.Set<String> before = pxListNames(dir);
-                            new Thread(new Runnable() {
-                                @Override
-                                public void run() {
-                                    pxWatch(dir, before, zf);
-                                }
-                            }, "xpan-proxdr").start();
-                        } catch (Throwable ignored) {
-                        }
-                    }
-                });
-                n++;
-            }
-            XposedBridge.log(TAG + "hook installed OK (ProXDR 后处理 x" + n + ")");
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "!! ProXDR 后处理安装失败: " + t);
-        }
-    }
-    private static void pxWatch(java.io.File dir, java.util.Set<String> before, float zoom) {
-        try {
-            int idle = 0;
-            for (int i = 0; i < 240; i++) {
-                Thread.sleep(500);
-                String[] a = dir.list();
-                if (a == null) continue;
-                boolean busy = false;
-                for (String nm : a) {
-                    if (before.contains(nm)) continue;
-                    String low = nm.toLowerCase();
-                    if (!low.endsWith(".heic") && !low.endsWith(".heif")) continue;
-                    java.io.File f = new java.io.File(dir, nm);
-                    long len = f.length();
-                    if (len < 20000) continue;
-                    busy = true;
-                    boolean go;
-                    synchronized (sPxState) {
-                        if (sPxState.size() > 200) sPxState.clear();   // 防慢性增长（一张照片一条）
-                        long[] st = sPxState.get(nm);
-                        if (st == null) {
-                            st = new long[]{len, 0, 0, 0};
-                            sPxState.put(nm, st);
-                        }
-                        if (st[0] != len) {                 // 长度又变了 → 相机在重写，重新计时
-                            st[0] = len;
-                            st[1] = 0;
-                            st[2] = 0;
-                            st[3] = 0;
-                        } else {
-                            st[1]++;
-                        }
-                        go = (st[1] >= 4 && st[2] == 0);
-                    }
-                    if (!go) continue;
-                    boolean ok = pxPostProcess(f, zoom);
-                    synchronized (sPxState) {
-                        long[] st = sPxState.get(nm);
-                        if (st != null) {
-                            st[0] = f.length();
-                            st[2] = ok ? 1 : 0;
-                            st[1] = ok ? st[1] : 0;         // 没写回就等下一轮稳定计数
-                        }
-                    }
-                }
-                if (busy) idle = 0;
-                else if (++idle >= 12) return;               // 连续 6 秒没新照片就收工
-            }
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "ProXDR 后处理轮询失败: " + t);
-        }
-    }
-    private static boolean pxPostProcess(java.io.File f, float zoom) {
-        StringBuilder log = new StringBuilder();
-        try {
-            if (f == null || !f.exists() || f.length() < 20000) return true;   // 没得处理，别再重试
-            if (!isHeifLike(f)) {
-                log.append("不是 HEIF，跳过; ");
-                return true;
-            }
-            byte[] data = pxReadAll(f);
-            long len0 = (data != null) ? data.length : -1;
-            Hx h = (data != null) ? hxParse(data) : null;
-            if (h == null) {
-                XposedBridge.log(TAG + "ProXDR 后处理：容器读不全（可能还在写），稍后重试");
-                return false;
-            }
-            boolean hasTmap = false;
-            for (String t : h.types.values()) if (PX_TMAP_TYPE.equals(t)) { hasTmap = true; break; }
-            if (!hasTmap) {
-                XposedBridge.log(TAG + "ProXDR 后处理：这一版还没有增益图（相机第一版），等它重写");
-                return false;
-            }
-            float ratio = 8.0f;
-            try {
-                String p = prop("debug.xpan.proxdr.ratio");
-                if (p != null && p.length() > 0) ratio = Float.parseFloat(p.trim());
-            } catch (Throwable ignored) {
-            }
-            // ★ 不再解 getGainmapContents()：那张 bitmap 是 4096x1512(≈24MB)，而它的唯一用途
-            //   （压平增益图）已经删掉了 —— 现在只需要 Gainmap 对象上的 ratioMax。省内存也省时间。
-            int decHeight = 0;
-            float curRatio = 4.956563f;
-            final int[] realH = new int[1];
-            try {
-                android.graphics.Bitmap b = android.graphics.ImageDecoder.decodeBitmap(
-                        android.graphics.ImageDecoder.createSource(f),
-                        new android.graphics.ImageDecoder.OnHeaderDecodedListener() {
-                            @Override
-                            public void onHeaderDecoded(android.graphics.ImageDecoder d,
-                                                        android.graphics.ImageDecoder.ImageInfo info,
-                                                        android.graphics.ImageDecoder.Source src) {
-                                d.setAllocator(android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE);
-                                // 全尺寸解码 8192x3528 要 ~100MB，相机进程吃不消；
-                                // 主体图缩到 1/4，尺寸从 header 拿，增益图按自己的尺寸解
-                                try {
-                                    android.util.Size sz = info.getSize();
-                                    if (sz != null && sz.getWidth() > 0) {
-                                        realH[0] = sz.getHeight();
-                                        if (sz.getWidth() > 2048) {
-                                            d.setTargetSize(sz.getWidth() / 4, sz.getHeight() / 4);
-                                        }
-                                    }
-                                } catch (Throwable ignored) {
-                                }
-                            }
-                        });
-                if (b != null) {
-                    decHeight = realH[0] > 0 ? realH[0] : b.getHeight();
-                    android.graphics.Gainmap gm = b.getGainmap();
-                    if (gm != null) {
-                        float[] rm = gm.getRatioMax();
-                        if (rm != null && rm.length > 0 && rm[0] > 1.0f) curRatio = rm[0];
-                    }
-                }
-            } catch (Throwable t) {
-                log.append("读增益图失败: ").append(t).append("; ");
-            }
-            int[] gwh0 = hxBaseGridOutWH(h);
-            boolean xpanShot0 = gwh0[0] > 0 && gwh0[1] > 0 && gwh0[0] >= gwh0[1] * 2;
-            // ★ 出片尺寸（用户要求：1× = 8192、2× = 4096），自己写"声明尺寸"。
-            //   背景：X-Pan 拍照流默认 4096x1512（干净通路，见 captureSize 注释 —— 8192 那条
-            //   全分辨率 remosaic 通路自带 2~3 像素双线重影）。而应用会把"声明尺寸"跟着拍照流走，
-            //   于是 1× 也变成 4096。这里改回来：
-            //     1× → 网格的 2 倍（8192 宽，等同应用原来的口径，解码器放大 2 倍输出）
-            //     2× → 网格本身（4096 宽，原生像素，不放大）
-            //   网格真实尺寸 gwh0 就是编码尺寸（4096x1512 或 4096x1764），所以两者都不损失真实细节。
-            if (xpanShot0 && gwh0[0] > 0 && gwh0[1] > 0) {
-                int[] ispe = hxIspeOfSize(h, gwh0[0], gwh0[1]);
-                if (ispe != null && ispe[1] > 0 && ispe[2] > 0 && zoom > 1.5f) {
-                    boolean x2 = true;
-                    int wantW = gwh0[0];
-                    int wantH = gwh0[1];
-                    if (ispe[1] != wantW || ispe[2] != wantH) {
-                        hxBe32Put(h.d, ispe[0] + 12, wantW);
-                        hxBe32Put(h.d, ispe[0] + 16, wantH);
-                        log.append("出片尺寸 ").append(ispe[1]).append("x").append(ispe[2])
-                                .append(" → ").append(wantW).append("x").append(wantH)
-                                .append(x2 ? "（2× 原生像素）; " : "（1× 网格×2）; ");
-                    }
-                }
-            }
-            // ★ ratioMax：XDR 亮度增强（用户 2026-11-07 要求）：提到 8 倍（只升不降），
-            //   **全局生效包括 X-Pan 照片**（2026-11-07 改：撤销 10-18 的 X-Pan 排除）。
-            if (ratio > curRatio + 0.01f) {
-                pxPatchRatioMax(h, ratio, curRatio, log);
-            } else {
-                log.append("ratioMax 已是 ").append(curRatio).append("，不降; ");
-            }
-            int[] gwh = hxBaseGridOutWH(h);
-            int outW = gwh[0], outH = gwh[1];
-            long lenNow = f.length();
-            if (lenNow != len0) {
-                log.append("文件长度变了（").append(len0).append("→").append(lenNow).append("），放弃写回; ");
-                XposedBridge.log(TAG + "ProXDR 后处理（未写回）: " + log);
-                return false;
-            }
-            boolean ok = pxWriteBack(f, data, log);
-            XposedBridge.log(TAG + "ProXDR 后处理" + (ok ? "完成" : "未写回")
-                    + "（倍率 " + zoom + "）: " + log);
-            return ok;
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "ProXDR 后处理失败（保留原图）: " + t);
-            return false;
-        }
-    }
-    private static boolean pxPatchRatioMax(Hx h, float ratio, float curRatio, StringBuilder log) {
-        try {
-            int[] ex = null;
-            for (java.util.Map.Entry<Integer, String> e : h.types.entrySet()) {
-                if (PX_TMAP_TYPE.equals(e.getValue())) {
-                    ex = h.ext.get(e.getKey());
-                    break;
-                }
-            }
-            if (ex == null || ex[0] != 0) {
-                log.append("没找到 tmap 项载荷; ");
-                return false;
-            }
-            int off = ex[1], len = ex[2];
-            if (len < 20 || len > 4096) {
-                log.append("tmap 载荷长度异常 ").append(len).append("; ");
-                return false;
-            }
-            double log2Now = Math.log(curRatio > 1.0f ? curRatio : 4.956563f) / Math.log(2.0);
-            double log2New = Math.log(ratio) / Math.log(2.0);
-            // 定点标度按文件自己探测：实测同一台相机 X-Pan 出片是 ×2^21、拍照模式出片是 ×2^23
-            // （设备上跑两个变体验证过：×2^23 那版解码器读出来正好 8.0，×2^21 那版读出来 1.68）
-            int scaleBits = 0, nowFixed = 0;
-            for (int k : new int[]{21, 23, 22}) {
-                int v = (int) Math.round(log2Now * (1 << k));
-                if (v <= 0) continue;
-                byte[] p = new byte[]{(byte) (v >> 24), (byte) (v >> 16), (byte) (v >> 8), (byte) v};
-                int at = hxIndexOfFrom(h.d, p, off);
-                if (at >= 0 && at + 4 <= off + len) {
-                    scaleBits = k;
-                    nowFixed = v;
-                    break;
-                }
-            }
-            if (scaleBits == 0) {
-                log.append("tmap 里没匹配到 ratioMax 字节（当前 ").append(curRatio).append("）; ");
-                return false;
-            }
-            int newFixed = (int) Math.round(log2New * (1 << scaleBits));
-            byte[] pat = new byte[]{(byte) (nowFixed >> 24), (byte) (nowFixed >> 16),
-                    (byte) (nowFixed >> 8), (byte) nowFixed};
-            byte[] rep = new byte[]{(byte) (newFixed >> 24), (byte) (newFixed >> 16),
-                    (byte) (newFixed >> 8), (byte) newFixed};
-            int patched = 0;
-            for (int i = 0; i + 4 <= len; i++) {
-                boolean hit = true;
-                for (int k = 0; k < 4; k++) {
-                    if (h.d[off + i + k] != pat[k]) {
-                        hit = false;
-                        break;
-                    }
-                }
-                if (!hit) continue;
-                System.arraycopy(rep, 0, h.d, off + i, 4);
-                patched++;
-            }
-            if (patched == 0) {
-                log.append("tmap 里没匹配到 ratioMax 字节（当前 ").append(curRatio).append("）; ");
-                return false;
-            }
-            log.append("ratioMax ").append(curRatio).append("→").append(ratio)
-                    .append("（定点 ×2^").append(scaleBits).append("，改了 ").append(patched)
-                    .append(" 处）; ");
-            // XMP 里的两个同名字符串（"%.6f" 定宽，只在长度一致时原位替换，宁可不改也不写坏）
-            String val = String.format(java.util.Locale.US, "%.6f", log2New);
-            String valOld = String.format(java.util.Locale.US, "%.6f", log2Now);
-            int xmpChanged = 0;
-            for (String key : new String[]{"GainMapMax=\"", "HDRCapacityMax=\""}) {
-                byte[] kb = key.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
-                byte[] ob = valOld.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
-                byte[] nb = val.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
-                int i = hxIndexOf(h.d, kb);
-                while (i >= 0) {
-                    int q = i + kb.length;
-                    if (ob.length == nb.length && q + ob.length <= h.d.length) {
-                        boolean same = true;
-                        for (int k = 0; k < ob.length; k++) if (h.d[q + k] != ob[k]) same = false;
-                        if (same) {
-                            System.arraycopy(nb, 0, h.d, q, nb.length);
-                            xmpChanged++;
-                        }
-                    }
-                    i = hxIndexOfFrom(h.d, kb, q);
-                }
-            }
-            if (xmpChanged > 0) log.append("XMP 字符串改了 ").append(xmpChanged).append(" 处; ");
-            return true;
-        } catch (Throwable t) {
-            log.append("改 ratioMax 失败: ").append(t).append("; ");
-            return false;
-        }
-    }
-    private static byte[] pxReadAll(java.io.File f) {
-        try {
-            int len = (int) f.length();
-            if (len <= 0 || len > (1 << 28)) return null;
-            byte[] b = new byte[len];
-            java.io.FileInputStream in = new java.io.FileInputStream(f);
-            int n = 0;
-            while (n < len) {
-                int r = in.read(b, n, len - n);
-                if (r <= 0) break;
-                n += r;
-            }
-            in.close();
-            return (n == len) ? b : null;
-        } catch (Throwable t) {
-            return null;
-        }
-    }
-    private static boolean pxWriteBack(java.io.File f, byte[] data, StringBuilder log) {
-        java.io.File tmp = new java.io.File(f.getParentFile(), f.getName() + ".xptmp");
-        try {
-            java.io.FileOutputStream fos = new java.io.FileOutputStream(tmp);
-            fos.write(data);
-            fos.flush();
-            fos.close();
-            if (tmp.length() != data.length) {
-                log.append("临时文件长度不对，放弃写回; ");
-                tmp.delete();
-                return false;
-            }
-        } catch (Throwable t) {
-            log.append("写临时文件失败（").append(t).append("），放弃写回; ");
-            try {
-                tmp.delete();
-            } catch (Throwable ignored) {
-            }
-            return false;
-        }
-        try {
-            java.io.FileOutputStream fos = new java.io.FileOutputStream(f);
-            fos.write(data);
-            fos.flush();
-            fos.close();
-        } catch (Throwable t) {
-            log.append("就地写回失败: ").append(t).append("; ");
-            try {
-                tmp.delete();
-            } catch (Throwable ignored) {
-            }
-            return false;
-        }
-        try {
-            tmp.delete();
-        } catch (Throwable ignored) {
-        }
-        return true;
-    }
-    private static java.util.Set<String> pxListNames(java.io.File d) {
-        java.util.Set<String> s = new java.util.HashSet<>();
-        try {
-            String[] a = d.list();
-            if (a != null) java.util.Collections.addAll(s, a);
-        } catch (Throwable ignored) {
-        }
-        return s;
-    }
-    private static boolean isHeifLike(java.io.File f) {
-        try {
-            byte[] b = new byte[12];
-            java.io.FileInputStream in = new java.io.FileInputStream(f);
-            int n = in.read(b);
-            in.close();
-            return n == 12 && b[4] == 'f' && b[5] == 't' && b[6] == 'y' && b[7] == 'p';
-        } catch (Throwable t) {
-            return false;
-        }
-    }
-    private static Hx hxParse(byte[] d) {
-        try {
-            Hx h = new Hx();
-            h.d = d;
-            int[] meta = null, mdat = null;
-            for (int[] b : hxKids(d, 0, d.length)) {
-                String t = hxType(d, b[0]);
-                if (t.equals("meta")) meta = b;
-                else if (t.equals("mdat")) mdat = b;
-            }
-            if (meta == null || mdat == null) return null;
-            int ms = meta[0] + meta[2] + 4, me = meta[0] + meta[1];
-            int[] iinf = hxFind(d, ms, me, "iinf");
-            int[] iloc = hxFind(d, ms, me, "iloc");
-            int[] iref = hxFind(d, ms, me, "iref");
-            int[] pitm = hxFind(d, ms, me, "pitm");
-            int[] idat = hxFind(d, ms, me, "idat");
-            if (iinf == null || iloc == null || pitm == null) return null;
-            if (idat != null) h.idatData = idat[0] + idat[2];
-            // iinf: id -> type
-            int p = iinf[0] + 12;
-            int cnt = hxBe16(d, p);
-            p += 2;
-            for (int i = 0; i < cnt; i++) {
-                int isz = hxBe32(d, p);
-                h.types.put(hxBe16(d, p + 12), new String(d, p + 16, 4,
-                        java.nio.charset.StandardCharsets.ISO_8859_1));
-                p += isz;
-            }
-            // pitm
-            h.pitm = (d[pitm[0] + 8] == 0) ? hxBe16(d, pitm[0] + 12) : hxBe32(d, pitm[0] + 12);
-            // iref dimg
-            if (iref != null) {
-                for (int[] b : hxKids(d, iref[0] + iref[2] + 4, iref[0] + iref[1])) {
-                    if (!hxType(d, b[0]).equals("dimg")) continue;
-                    int frm = hxBe16(d, b[0] + 8), n = hxBe16(d, b[0] + 10);
-                    int[] ids = new int[n];
-                    for (int i = 0; i < n; i++) ids[i] = hxBe16(d, b[0] + 12 + 2 * i);
-                    h.dimg.put(frm, ids);
-                    h.dimgPos.put(frm, new int[]{b[0] + 12, n});
-                }
-            }
-            // iloc
-            int ver = d[iloc[0] + 8];
-            int q = iloc[0] + 12;
-            int b1 = d[q] & 255, b2 = d[q + 1] & 255;
-            q += 2;
-            int n2 = (ver < 2) ? hxBe16(d, q) : hxBe32(d, q);
-            q += (ver < 2) ? 2 : 4;
-            int offsz = b1 >> 4, lensz = b1 & 15, basesz = b2 >> 4, idxsz = b2 & 15;
-            for (int i = 0; i < n2; i++) {
-                int id = (ver < 2) ? hxBe16(d, q) : hxBe32(d, q);
-                q += (ver < 2) ? 2 : 4;
-                int cm = 0;
-                if (ver == 1 || ver == 2) {
-                    cm = hxBe16(d, q);
-                    q += 2;
-                }
-                q += 2;
-                int base = 0;
-                for (int k = 0; k < basesz; k++) base = (base << 8) | (d[q + k] & 255);
-                q += basesz;
-                int ec = hxBe16(d, q);
-                q += 2;
-                int off = 0, len = 0;
-                for (int e = 0; e < ec; e++) {
-                    if (idxsz > 0) q += idxsz;
-                    int opos = q, o1 = 0;
-                    for (int k = 0; k < offsz; k++) o1 = (o1 << 8) | (d[q + k] & 255);
-                    q += offsz;
-                    int lpos = q, l1 = 0;
-                    for (int k = 0; k < lensz; k++) l1 = (l1 << 8) | (d[q + k] & 255);
-                    q += lensz;
-                    if (e == 0) {
-                        off = base + o1;
-                        len = l1;
-                        if (cm == 0 && offsz > 0 && lensz > 0) {
-                            h.extField.put(id, new int[]{opos, offsz, lpos, lensz});
-                        }
-                    }
-                }
-                h.ext.put(id, new int[]{cm, off, len});
-            }
-            return h;
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "HEIF 解析失败: " + t);
-            return null;
-        }
-    }
-    private static java.util.List<int[]> hxKids(byte[] d, int start, int end) {
-        java.util.List<int[]> out = new java.util.ArrayList<>();
-        int o = start;
-        while (o + 8 <= end) {
-            long sz = hxBe32(d, o) & 0xFFFFFFFFL;
-            int hdr = 8;
-            if (sz == 1) {
-                sz = 0;
-                for (int i = 0; i < 8; i++) sz = (sz << 8) | (d[o + 8 + i] & 255);
-                hdr = 16;
-            } else if (sz == 0) {
-                sz = end - o;
-            }
-            if (sz < hdr || o + sz > end) break;
-            out.add(new int[]{o, (int) sz, hdr});
-            o += (int) sz;
-        }
-        return out;
-    }
-    private static String hxType(byte[] d, int off) {
-        return new String(d, off + 4, 4, java.nio.charset.StandardCharsets.ISO_8859_1);
-    }
-    private static int[] hxFind(byte[] d, int start, int end, String name) {
-        for (int[] b : hxKids(d, start, end)) {
-            String t = new String(d, b[0] + 4, 4, java.nio.charset.StandardCharsets.ISO_8859_1);
-            if (t.equals(name)) return b;
-        }
-        return null;
-    }
-    private static int hxBe16(byte[] b, int o) {
-        return ((b[o] & 255) << 8) | (b[o + 1] & 255);
-    }
-    private static int hxBe32(byte[] b, int o) {
-        return ((b[o] & 255) << 24) | ((b[o + 1] & 255) << 16) | ((b[o + 2] & 255) << 8) | (b[o + 3] & 255);
-    }
-    private static void hxBe32Put(byte[] b, int o, int v) {
-        b[o] = (byte) (v >>> 24);
-        b[o + 1] = (byte) (v >>> 16);
-        b[o + 2] = (byte) (v >>> 8);
-        b[o + 3] = (byte) v;
-    }
-    private static int hxIndexOf(byte[] d, byte[] pat) {
-        return hxIndexOfFrom(d, pat, 0);
-    }
-    private static int hxIndexOfFrom(byte[] d, byte[] pat, int from) {
-        outer:
-        for (int i = Math.max(0, from); i + pat.length <= d.length; i++) {
-            for (int k = 0; k < pat.length; k++) {
-                if (d[i + k] != pat[k]) continue outer;
-            }
-            return i;
-        }
-        return -1;
-    }
-    private static int[] hxIspeOfSize(Hx h, int w, int hh) {
-        try {
-            byte[] d = h.d;
-            int[] meta = null;
-            for (int[] b : hxKids(d, 0, d.length)) {
-                if (hxType(d, b[0]).equals("meta")) {
-                    meta = b;
-                    break;
-                }
-            }
-            if (meta == null) return null;
-            int ms = meta[0] + meta[2] + 4, me = meta[0] + meta[1];
-            int[] iprp = hxFind(d, ms, me, "iprp");
-            if (iprp == null) return null;
-            int[] ipco = hxFind(d, iprp[0] + 8, iprp[0] + iprp[1], "ipco");
-            if (ipco == null) return null;
-            for (int[] b : hxKids(d, ipco[0] + 8, ipco[0] + ipco[1])) {
-                if (!hxType(d, b[0]).equals("ispe")) continue;
-                int ww = hxBe32(d, b[0] + 12), hh2 = hxBe32(d, b[0] + 16);
-                if (ww == w && hh2 == hh) return new int[]{b[0], ww, hh2};
-            }
-            return hxMainIspe(h);      // 兜底：找不到就退回"最大那个"
-        } catch (Throwable t) {
-            return null;
-        }
-    }
-    private static int[] hxMainIspe(Hx h) {
-        try {
-            byte[] d = h.d;
-            int[] meta = null;
-            for (int[] b : hxKids(d, 0, d.length)) {
-                if (hxType(d, b[0]).equals("meta")) {
-                    meta = b;
-                    break;
-                }
-            }
-            if (meta == null) return null;
-            int ms = meta[0] + meta[2] + 4, me = meta[0] + meta[1];
-            int[] iprp = hxFind(d, ms, me, "iprp");      // iprp/ipco 都是普通盒（子盒从 +8 起）
-            if (iprp == null) return null;
-            int[] ipco = hxFind(d, iprp[0] + 8, iprp[0] + iprp[1], "ipco");
-            if (ipco == null) return null;
-            int best = -1;
-            long bestArea = -1;
-            for (int[] b : hxKids(d, ipco[0] + 8, ipco[0] + ipco[1])) {
-                if (!hxType(d, b[0]).equals("ispe")) continue;
-                int w = hxBe32(d, b[0] + 12), hh = hxBe32(d, b[0] + 16);
-                long area = (long) w * hh;
-                if (area > bestArea) {
-                    bestArea = area;
-                    best = b[0];
-                }
-            }
-            if (best < 0) return null;
-            return new int[]{best, hxBe32(d, best + 12), hxBe32(d, best + 16)};
-        } catch (Throwable t) {
-            return null;
-        }
-    }
-    private static int[] hxBaseGridOutWH(Hx h) {
-        try {
-            int[] gex = h.ext.get(h.pitm);
-            if (gex == null || gex[0] != 1 || h.idatData < 0) return new int[]{-1, -1};
-            int pay = h.idatData + gex[1];
-            return new int[]{hxBe16(h.d, pay + 4), hxBe16(h.d, pay + 6)};
-        } catch (Throwable t) {
-            return new int[]{-1, -1};
-        }
-    }
 }

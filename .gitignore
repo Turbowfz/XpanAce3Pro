@@ -4,3 +4,16 @@ out/
 classes/
 *.apk.idsig
 build/
+_tmp/
+__pycache__/
+*.pyc
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.log
+# Proprietary device-stock JARs: bundled into locally built module ZIPs only.
+payload/op-compat/
+# Release ZIPs are published as Release assets, not committed (the v2.0 ZIP
+# embeds the proprietary C17 completion JARs requested for the module).
+/XpanAce3Pro-v*.zip
