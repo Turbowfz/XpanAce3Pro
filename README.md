@@ -107,7 +107,7 @@
 
 | 路径 | 说明 |
 |---|---|
-| [XpanAce3Pro-v2.0.zip](https://github.com/Turbowfz/XpanAce3Pro/releases/tag/v2.0) | **最新正式版模块**（GitHub / [Gitee Release](https://gitee.com/turbowfz/XpanAce3Pro/releases/tag/v2.0) 附件；KernelSU 直接刷入；含自动 OPCameraPro 补全） |
+| [XpanAce3Pro-v2.0.zip](https://github.com/Turbowfz/XpanAce3Pro/releases/tag/v2.0) | **最新正式版模块**（GitHub / [Gitee Release](https://gitee.com/turbowfz/XpanAce3Pro/releases) 附件；KernelSU 直接刷入；含自动 OPCameraPro 补全） |
 | `releases/` | 历史版本 zip 存档（v1.0 / v1.1 / v1.2 / v1.3），一般不用下载 |
 | `hook/` | LSPosed hook 源码（`XpanHook.java` 内含大量实测踩坑注释） |
 | `update.json` | 云更新清单（版本号 / zip 地址 / 更新日志地址） |
