@@ -647,7 +647,10 @@ xpan_unmount_role() {
     xpan_journal_parent || { xpan_log "parent context changed; journal retained: $1"; return 1; }
     xpan_mount_line || { xpan_log "covered/ambiguous mount retained: $1"; return 1; }
     if [ -z "$X_MLINE" ]; then rm -f "$X_J"; return $?; fi
-    xpan_owned "$1" || { xpan_log "foreign mount retained: $1"; return 1; }
+    # xpan_owned 的挂载行、父层与 journal 检查已在此全部成立且期间无任何变更，
+    # 只补齐剩余的哈希与 inode 对账，复用上方一次读取结果，避免重复解析 mountinfo。
+    [ "$X_MHASH" = "$X_JHASH" ] && xpan_inode "$X_TARGET" &&
+        [ "$X_INODE" = "$X_JINODE" ] || { xpan_log "foreign mount retained: $1"; return 1; }
     # No lazy/forced unmount: those can detach things outside this transaction.
     xpan_parent_mounts || return 1
     xpan_bounded umount "$X_TARGET" || return 1
@@ -991,6 +994,7 @@ xpan_tick() {
 xpan_install_cleanup() {
     local X_MIGRATE_ROLE X_MIGRATE_PATH X_MIGRATE_TOKENS
     X_MIGRATE_TOKENS='|'
+    xpan_log '开始清理旧版本残留挂载与失效状态'
     for X_MIGRATE_PATH in "$X_LIFE/current.token" "$X_ACTIVE/.xpan-instance" "$X_MOD/.xpan-instance"; do
         if xpan_read "$X_MIGRATE_PATH" && xpan_uuid "$X_VALUE"; then
             X_MIGRATE_TOKENS=$X_MIGRATE_TOKENS$X_VALUE'|'
@@ -1009,7 +1013,8 @@ xpan_install_cleanup() {
         if [ -n "$X_MLINE" ]; then
             xpan_journal "$X_MIGRATE_ROLE" || { xpan_log "无法证明旧挂载归属：$X_MIGRATE_ROLE"; return 1; }
             case "$X_MIGRATE_TOKENS" in *"|$X_JTOKEN|"*) ;; *) xpan_log "非旧实例的挂载已保留：$X_MIGRATE_ROLE"; return 1 ;; esac
-            xpan_owned "$X_MIGRATE_ROLE" && xpan_unmount_role "$X_MIGRATE_ROLE" || {
+            # xpan_unmount_role 复用上方一次读取并完整复核所有权；不再重复预检。
+            xpan_unmount_role "$X_MIGRATE_ROLE" || {
                 xpan_log "旧挂载与所有权记录不一致，未盲目卸载：$X_MIGRATE_ROLE"; return 1;
             }
         else
@@ -1071,6 +1076,21 @@ output_feature_sha256=$X_Q_FEATURE
 output_vendor_sha256=$X_Q_VENDOR" || return 1
     xpan_receipt && xpan_qualify install && xpan_current originals && xpan_parent_phase
 }
+xpan_op_size() {
+    # 只读尺寸预检，前提与 xpan_hash 一致（常规文件、非空、安全路径）；失败不留值。
+    xpan_safe_path "$1" && [ -f "$1" ] && [ -s "$1" ] || return 1
+    X_OC_SIZE=$(xpan_bounded stat -Lc '%s' "$1" 2>/dev/null) || return 1
+    case "$X_OC_SIZE" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$X_OC_SIZE" != 0 ]
+}
+xpan_op_differs() {
+    # 只读“字节必然不同”预检：两侧尺寸可读且不同 → 返回 0（可免哈希判定不同）；
+    # 否则返回 1（仍需哈希判定）。写前校验与回读校验绝不走此预检。
+    xpan_op_size "$1" || return 1
+    X_OC_SIZE_A=$X_OC_SIZE
+    xpan_op_size "$2" || return 1
+    [ "$X_OC_SIZE_A" != "$X_OC_SIZE" ]
+}
 # OPCameraPro 兼容 helper 保持顶层定义；只改附属模块，来源不足不是安装门禁。
 xpan_op_backup() {
     # 首份备份不覆盖；OP 更新后的不同旧件另存哈希后缀。
@@ -1082,11 +1102,18 @@ xpan_op_backup() {
     dest=$X_OC_BACK/$name
     xpan_safe_path "$dest" || return 1
     if [ -e "$dest" ]; then
-        xpan_hash "$dest" || return 1
-        [ "$X_HASH" != "$oldhash" ] || return 0
+        # 只读比较先比文件大小：尺寸必然不同时免哈希即可判定，节省重复整读。
+        if ! xpan_op_differs "$1" "$dest"; then
+            xpan_hash "$dest" || return 1
+            [ "$X_HASH" != "$oldhash" ] || return 0
+        fi
         dest=$dest.$oldhash
         xpan_safe_path "$dest" || return 1
-        if [ -e "$dest" ]; then xpan_hash "$dest" && [ "$X_HASH" = "$oldhash" ]; return $?; fi
+        if [ -e "$dest" ]; then
+            if xpan_op_differs "$1" "$dest"; then return 1; fi
+            xpan_hash "$dest" && [ "$X_HASH" = "$oldhash" ]
+            return $?
+        fi
     fi
     mkdir -p "${dest%/*}" 2>/dev/null || return 1
     tmp=$dest.xpan-compat.$$
@@ -1135,10 +1162,16 @@ xpan_op_is_c16_completion() {
     X_OF_A=$X_OC_FW/com.oplus.camera.unit.sdk.adapter.jar
     X_OF_UP=$(xpan_op_c16_pin unit) || return 1
     X_OF_AP=$(xpan_op_c16_pin adapter) || return 1
-    if [ -f "$X_OF_U" ] && [ ! -L "$X_OF_U" ] && xpan_hash "$X_OF_U" &&
-        [ "$X_HASH" = "$X_OF_UP" ]; then return 0; fi
-    if [ -f "$X_OF_A" ] && [ ! -L "$X_OF_A" ] && xpan_hash "$X_OF_A" &&
-        [ "$X_HASH" = "$X_OF_AP" ]; then return 0; fi
+    # 成功哈希暂存到本次调用局部变量，供同一次 op_compat 的 MANIFEST 预检复用；
+    # 期间无任何写入，写后回读校验仍走 xpan_hash 全量哈希。
+    if [ -f "$X_OF_U" ] && [ ! -L "$X_OF_U" ] && xpan_hash "$X_OF_U"; then
+        X_OC_H16_U=$X_HASH
+        [ "$X_HASH" = "$X_OF_UP" ] && return 0
+    fi
+    if [ -f "$X_OF_A" ] && [ ! -L "$X_OF_A" ] && xpan_hash "$X_OF_A"; then
+        X_OC_H16_A=$X_HASH
+        [ "$X_HASH" = "$X_OF_AP" ] && return 0
+    fi
     return 1
 }
 xpan_op_mounts() {
@@ -1178,26 +1211,9 @@ xpan_op_clean_origin() {
             opts !~ /(^|,)ro(,|$)/ || super !~ /(^|,)ro(,|$)/) exit 1 }
     '
 }
-xpan_op_stock() {
-    # 返回 X_OS_FILE / X_OS_STATUS(found、absent、unavailable)，拒绝 OP 自比较。
-    local rel prefix roots base file complete physical known
-    rel=$1
-    X_OS_FILE=; X_OS_STATUS=unavailable
-    case "$rel" in /odm/*|/product/*) ;; *) return 1 ;; esac
-    if [ "${XPAN_TEST_MODE:-}" = 1 ] && [ -n "${XPAN_TEST_STOCK_ROOT:-}" ]; then
-        physical=$XPAN_TEST_STOCK_ROOT$rel
-        xpan_op_source_safe "$XPAN_TEST_STOCK_ROOT" && [ -d "$XPAN_TEST_STOCK_ROOT" ] &&
-            xpan_op_source_safe "$physical" || return 1
-        if [ -f "$physical" ]; then X_OS_FILE=$physical; X_OS_STATUS=found; return 0; fi
-        [ -e "$physical" ] || X_OS_STATUS=absent
-        return 1
-    fi
-    prefix=
-    if [ "${XPAN_TEST_MODE:-}" = 1 ]; then
-        [ -n "${XPAN_TEST_ROOT:-}" ] || return 1
-        prefix=$XPAN_TEST_ROOT
-    fi
-    roots=$(printf '%s\n' "$X_OC_MOUNTS" | LC_ALL=C xpan_bounded awk -F '\t' -v p="$rel" '
+xpan_op_stock_roots() {
+    # 挂载候选解析：最深挂载点优先，同点取当前层；语义与 v2.0 逐文件版本一致。
+    printf '%s\n' "$X_OC_MOUNTS" | LC_ALL=C xpan_bounded awk -F '\t' -v p="$1" '
         function under(p,b) { return p==b || b=="/" || index(p,b "/")==1 }
         function path(p) { return p ~ /^\// && p !~ /[[:cntrl:][:space:],\\]/ &&
             p !~ /\/\// && p !~ /(^|\/)\.\.?($|\/)/ && (p=="/" || p !~ /\/$/) }
@@ -1217,25 +1233,130 @@ xpan_op_stock() {
             for(i=1;i<=count;i++) if(path(dirs[i]) && dirs[i]!=point)
                 print dirs[i] "\t" dirs[i] substr(p,length(point)+1) "\t" (count==1 ? 1 : 0)
         } }
-    ') || roots=
-    case "$rel" in
-        /product/framework/*) roots="$roots
-/my_product/product_overlay/framework	/my_product/product_overlay/framework/${rel#/product/framework/}	0" ;;
-        /product/lib64/*) roots="$roots
-/my_product/lib64	/my_product/lib64/${rel#/product/lib64/}	0" ;;
+    '
+}
+xpan_op_stock_memo() {
+    # 目录级缓存：同一父目录只解析一次挂载候选，并为每行预注校验结论，行内字段：
+    # base、候选目录（挂载点或 lowerdir 加本目录相对后缀）、complete、base 校验
+    # (ok/no)、候选目录原厂判定 (ok/no)、候选目录下是否还有更深挂载点 (y/n)。
+    # 候选目录下仍有挂载点时该行回退文件级原厂判定，保证与逐文件解析语义一致。
+    X_OC_STOCK_DIR=$1
+    X_OC_STOCK_ROWS=$(xpan_op_stock_roots "$1") || X_OC_STOCK_ROWS=
+    case "$1" in
+        /product/framework) X_OC_STOCK_ROWS="$X_OC_STOCK_ROWS
+/my_product/product_overlay/framework	/my_product/product_overlay/framework	0" ;;
+        /product/lib64) X_OC_STOCK_ROWS="$X_OC_STOCK_ROWS
+/my_product/lib64	/my_product/lib64	0" ;;
     esac
+    X_OC_STOCK_DEEP=$(printf '%s\n' "$X_OC_MOUNTS" | LC_ALL=C xpan_bounded awk -F '\t' -v p="$1" '
+        index($3, p "/")==1 { print $3 }
+    ') || X_OC_STOCK_DEEP=
+    X_OC_ANNOTATED=
+    while IFS="$(printf '\t')" read -r X_OC_MB X_OC_MF X_OC_MC; do
+        [ -n "$X_OC_MB" ] && [ -n "$X_OC_MF" ] || continue
+        X_OC_BV=
+        case "$X_OC_STOCK_BASES" in
+            *" "$X_OC_MB":ok "*) X_OC_BV=ok ;;
+            *" "$X_OC_MB":no "*) X_OC_BV=no ;;
+        esac
+        if [ -z "$X_OC_BV" ]; then
+            if xpan_op_source_safe "$X_OC_PREFIX$X_OC_MB" && [ -d "$X_OC_PREFIX$X_OC_MB" ] &&
+                xpan_op_clean_origin "$X_OC_MB"; then
+                X_OC_BV=ok
+            else
+                X_OC_BV=no
+            fi
+            X_OC_STOCK_BASES="$X_OC_STOCK_BASES$X_OC_MB:$X_OC_BV "
+        fi
+        if xpan_op_clean_origin "$X_OC_MF"; then X_OC_DF=ok; else X_OC_DF=no; fi
+        X_OC_DY=n
+        if printf '%s\n' "$X_OC_MOUNTS" | LC_ALL=C xpan_bounded awk -F '\t' -v p="$X_OC_MF" '
+            index($3, p "/")==1 { found=1 }
+            END { if (found) exit 0; exit 1 }
+        '; then
+            X_OC_DY=y
+        fi
+        X_OC_ANNOTATED="$X_OC_ANNOTATED$X_OC_MB	$X_OC_MF	$X_OC_MC	$X_OC_BV	$X_OC_DF	$X_OC_DY
+"
+    done <<XPAN_OP_STOCK_MEMO
+$X_OC_STOCK_ROWS
+XPAN_OP_STOCK_MEMO
+    [ -z "$X_OC_ANNOTATED" ] || X_OC_STOCK_ROWS=$X_OC_ANNOTATED
+}
+xpan_op_stock() {
+    # 返回 X_OS_FILE / X_OS_STATUS(found、absent、unavailable)，拒绝 OP 自比较。
+    # 目录级缓存：同一父目录只解析一次挂载候选与原厂判定；文件级仅做存在性与
+    # 安全复核。文件相对路径本身是挂载点或含 shell 展开敏感字符时回退逐文件解析，
+    # 保证与逐文件解析语义完全一致。
+    local rel prefix base file complete physical known dir leaf rows transform
+    rel=$1
+    X_OS_FILE=; X_OS_STATUS=unavailable
+    case "$rel" in /odm/*|/product/*) ;; *) return 1 ;; esac
+    if [ "${XPAN_TEST_MODE:-}" = 1 ] && [ -n "${XPAN_TEST_STOCK_ROOT:-}" ]; then
+        physical=$XPAN_TEST_STOCK_ROOT$rel
+        xpan_op_source_safe "$XPAN_TEST_STOCK_ROOT" && [ -d "$XPAN_TEST_STOCK_ROOT" ] &&
+            xpan_op_source_safe "$physical" || return 1
+        if [ -f "$physical" ]; then X_OS_FILE=$physical; X_OS_STATUS=found; return 0; fi
+        [ -e "$physical" ] || X_OS_STATUS=absent
+        return 1
+    fi
+    prefix=
+    if [ "${XPAN_TEST_MODE:-}" = 1 ]; then
+        [ -n "${XPAN_TEST_ROOT:-}" ] || return 1
+        prefix=$XPAN_TEST_ROOT
+    fi
+    X_OC_PREFIX=$prefix
+    dir=${rel%/*}
+    leaf=${rel#"$dir"/}
+    transform=1
+    case "$rel" in
+        *'$'*|*'`'*|*'\'*|*[[:cntrl:]]*) transform=0 ;;
+    esac
+    if [ "$transform" = 1 ]; then
+        if [ "$X_OC_STOCK_DIR" != "$dir" ]; then xpan_op_stock_memo "$dir"; fi
+        while IFS= read -r X_OC_DEEP_POINT; do
+            [ "$X_OC_DEEP_POINT" = "$rel" ] && { transform=0; break; }
+        done <<XPAN_OP_DEEP
+$X_OC_STOCK_DEEP
+XPAN_OP_DEEP
+    fi
+    if [ "$transform" = 1 ]; then
+        rows=$X_OC_STOCK_ROWS
+    else
+        rows=$(xpan_op_stock_roots "$rel") || rows=
+        case "$rel" in
+            /product/framework/*) rows="$rows
+/my_product/product_overlay/framework	/my_product/product_overlay/framework/${rel#/product/framework/}	0" ;;
+            /product/lib64/*) rows="$rows
+/my_product/lib64	/my_product/lib64/${rel#/product/lib64/}	0" ;;
+        esac
+    fi
     known=0
-    while IFS="$(printf '\t')" read -r base file complete; do
+    while IFS="$(printf '\t')" read -r base file complete bv fclean deepflag; do
         [ -n "$base" ] && [ -n "$file" ] || continue
-        xpan_op_source_safe "$prefix$base" && [ -d "$prefix$base" ] &&
-            xpan_op_source_safe "$prefix$file" && xpan_op_clean_origin "$base" &&
+        [ "$transform" = 1 ] && file=$file/$leaf
+        if [ -n "$bv" ]; then
+            [ "$bv" = ok ] || continue
+        else
+            xpan_op_source_safe "$prefix$base" && [ -d "$prefix$base" ] &&
+                xpan_op_clean_origin "$base" || continue
+        fi
+        xpan_op_source_safe "$prefix$file" || continue
+        if [ -n "$fclean" ]; then
+            if [ "$deepflag" = y ]; then
+                xpan_op_clean_origin "$file" || continue
+            else
+                [ "$fclean" = ok ] || continue
+            fi
+        else
             xpan_op_clean_origin "$file" || continue
+        fi
         physical=$prefix$file
         if [ -f "$physical" ]; then X_OS_FILE=$physical; X_OS_STATUS=found; return 0; fi
         [ ! -e "$physical" ] && [ ! -L "$physical" ] || return 1
         [ "$complete" != 1 ] || known=1
     done <<XPAN_OP_STOCK
-$roots
+$rows
 XPAN_OP_STOCK
     [ "$known" != 1 ] || X_OS_STATUS=absent
     return 1
@@ -1250,6 +1371,11 @@ xpan_op_asset() {
         xpan_hash "$target" && current=$X_HASH || { X_OC_SUM="$X_OC_SUM ${rel#/}=unreadable"; return 0; }
     fi
     if [ -n "$legacy" ] && { [ -e "$legacy" ] || [ -L "$legacy" ]; }; then
+        # 只读冲突比较先比大小：目标已哈希成功且两侧尺寸必然不同时，可直接判定
+        # hidden-conflict，免去 legacy 整文件哈希；写前校验仍全量哈希。
+        if [ -n "$current" ] && xpan_op_differs "$target" "$legacy"; then
+            X_OC_SUM="$X_OC_SUM ${rel#/}=hidden-conflict"; return 0
+        fi
         xpan_hash "$legacy" && oldhash=$X_HASH || { X_OC_SUM="$X_OC_SUM ${rel#/}=hidden-protected"; return 0; }
     fi
     xpan_op_stock "$rel" || true
@@ -1373,6 +1499,8 @@ xpan_op_compat() {
     X_OC_STATE=${X_STATE:-/data/adb/xpan-runtime}
     X_OC_BACK=$X_OC_STATE/op-compat-backup
     X_OC_SUM=; X_OC_CHANGED=0; X_OC_MOUNTS=
+    X_OC_STOCK_DIR=; X_OC_STOCK_ROWS=; X_OC_STOCK_DEEP=; X_OC_STOCK_BASES=
+    X_OC_H16_U=; X_OC_H16_A=
     if [ "${XPAN_TEST_MODE:-}" = 1 ] && [ -n "${XPAN_TEST_ROM_RELEASE:-}" ]; then
         X_OC_ROM_RELEASE=$XPAN_TEST_ROM_RELEASE
     else
@@ -1393,6 +1521,7 @@ xpan_op_compat() {
         xpan_log 'op-compat: state unavailable; completion untouched'; return 0;
     }
     X_OC_MOUNTS=$(xpan_op_mounts) || X_OC_MOUNTS=
+    xpan_log 'op-compat: 开始核对 OPCameraPro 素材与 C17 补全'
     xpan_op_is_c16_completion && X_OC_SUM=' c16-sdk=present'
     # 两个随包 C17 JAR 保持逐文件校验、备份，不增加 native SHA 门槛。
     if xpan_safe_path "$X_OC_MAN" && [ -f "$X_OC_MAN" ]; then
@@ -1406,7 +1535,16 @@ xpan_op_compat() {
             if ! xpan_safe_path "$X_OC_T" || [ ! -f "$X_OC_T" ]; then
                 X_OC_SUM="$X_OC_SUM $X_OC_NAME=absent"; continue
             fi
-            if ! xpan_hash "$X_OC_T"; then X_OC_SUM="$X_OC_SUM $X_OC_NAME=unreadable"; continue; fi
+            # 预检哈希复用 is_c16_completion 的同文件结果；不一致时才重新哈希。
+            case "$X_OC_NAME" in
+                com.oplus.camera.unit.sdk.jar) X_OC_TH=$X_OC_H16_U ;;
+                *) X_OC_TH=$X_OC_H16_A ;;
+            esac
+            if [ -n "$X_OC_TH" ] && xpan_hash_valid "$X_OC_TH"; then
+                X_HASH=$X_OC_TH
+            elif ! xpan_hash "$X_OC_T"; then
+                X_OC_SUM="$X_OC_SUM $X_OC_NAME=unreadable"; continue
+            fi
             if [ "$X_HASH" = "$X_OC_PIN" ]; then X_OC_SUM="$X_OC_SUM $X_OC_NAME=current"; continue; fi
             if ! xpan_hash "$X_OC_S" || [ "$X_HASH" != "$X_OC_PIN" ]; then
                 X_OC_SUM="$X_OC_SUM $X_OC_NAME=source-invalid"; continue
@@ -1457,6 +1595,7 @@ xpan_install() {
     xpan_safe_path "$X_MOD/lifecycle.sh" && [ -f "$X_MOD/lifecycle.sh" ] || { xpan_unlock; return 1; }
     xpan_life_unlock
     X_INSTALL_RC=0
+    xpan_log '开始安装配套 Hook APK'
     if [ "${XPAN_TEST_MODE:-}" = 1 ]; then
         sh "$X_MOD/lifecycle.sh" install "$X_MOD" "$XPAN_TEST_ROOT/uuid.source" || X_INSTALL_RC=1
     else
@@ -1469,6 +1608,7 @@ xpan_install() {
     fi
     xpan_markers && xpan_tokens && xpan_qualify install && xpan_receipt && xpan_current originals &&
         xpan_apk && xpan_parent_commit || { xpan_log 'APK 已安装但安装状态登记失败，未启用挂载'; xpan_unlock; return 1; }
+    xpan_log 'Hook APK 与实例身份登记完成'
     if [ "$X_INSTALL_REBOOT" = 1 ] || [ "$X_COMPAT_REBOOT" = 1 ] || [ "$X_PREVIOUS_REBOOT" = 1 ]; then
         xpan_write "$X_MOD/.xpan-reboot-required" "$X_BOOT_ID" || { xpan_unlock; return 1; }
         xpan_log '补全已更新，重启手机后生效；新 APK 与实例已登记，当前保持未启用'

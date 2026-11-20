@@ -53,8 +53,21 @@ say "  自动清理旧模块残留，并迁移配套 APK"
 INSTALL_OUT=$MODPATH/.install-step.log
 INSTALL_LOG=/data/local/tmp/xpan_install.log
 [ "${XPAN_TEST_MODE:-}" != 1 ] || INSTALL_LOG=$XPAN_TEST_ROOT/install.log
-INSTALL_RC=0
-sh "$MODPATH/runtime.sh" install "$MODPATH" > "$INSTALL_OUT" 2>&1 || INSTALL_RC=$?
+: > "$INSTALL_OUT"
+INSTALL_RC_FILE=$MODPATH/.install-rc.$$
+# runtime 的关键进度实时转播到安装界面；全量输出仍落 INSTALL_OUT/INSTALL_LOG。
+( sh "$MODPATH/runtime.sh" install "$MODPATH" 2>&1
+  printf '%s\n' "$?" > "$INSTALL_RC_FILE" ) |
+    while IFS= read -r INSTALL_LINE || [ -n "$INSTALL_LINE" ]; do
+        printf '%s\n' "$INSTALL_LINE" >> "$INSTALL_OUT"
+        case "$INSTALL_LINE" in
+            *"已自动清理旧"*|*"op-compat:"*|*"install rc="*|*"已自动迁移跨签名"*|\
+*"补全已更新"*|*"安装迁移完成"*|*"开始清理旧"*|*"开始安装配套"*|*"身份登记完成"*)
+                say "  ${INSTALL_LINE#xpan runtime: }" ;;
+        esac
+    done
+INSTALL_RC=$(cat "$INSTALL_RC_FILE" 2>/dev/null || printf '1')
+rm -f "$INSTALL_RC_FILE"
 while IFS= read -r INSTALL_LINE || [ -n "$INSTALL_LINE" ]; do
     printf '%s\n' "$INSTALL_LINE" >> "$INSTALL_LOG"
 done < "$INSTALL_OUT"
@@ -63,7 +76,8 @@ if [ "$INSTALL_RC" != 0 ]; then
     while IFS= read -r INSTALL_LINE || [ -n "$INSTALL_LINE" ]; do
         case "$INSTALL_LINE" in
             'xpan install: '*) INSTALL_REASON=${INSTALL_LINE#xpan install: } ;;
-            'xpan runtime: op-compat:'*|'xpan runtime: 已自动清理'*|'xpan runtime: OPCameraPro 的 C16 SDK'*) ;;
+            'xpan runtime: op-compat:'*|'xpan runtime: 已自动清理'*|'xpan runtime: OPCameraPro 的 C16 SDK'*|\
+'xpan runtime: 开始清理旧'*|'xpan runtime: 开始安装配套'*|'xpan runtime: Hook APK 与实例身份登记完成') ;;
             'xpan runtime: '*) [ -n "$INSTALL_REASON" ] || INSTALL_REASON=${INSTALL_LINE#xpan runtime: } ;;
         esac
     done < "$INSTALL_OUT"

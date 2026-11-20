@@ -651,6 +651,69 @@ class OpCompatTests(unittest.TestCase):
         self.assertEqual(self.snapshot(external), {})
         self.assertEqual(self.last_changed, 0)
 
+    def test_file_level_mount_point_falls_back_and_stays_pending(self):
+        # 文件路径本身是挂载点时回退逐文件解析：该挂载成为唯一候选，但挂载点不是
+        # 目录，候选被拒，保持 stock-pending；父目录 overlay 的 lowerdir 不得冒充原厂。
+        rel = CAMERA + "/meishe_lut/qing_tou.bin"
+        self.write(self.target(rel), b"OP asset\n")
+        self.write(self.device / rel, b"file-level mounted bytes\n")
+        self.write(self.device / "my_product/product_overlay/meishe_lut/qing_tou.bin",
+                   b"deep clean lower\n")
+        self.mounts(self.overlay(90, 2, "/odm/etc/camera/meishe_lut",
+                                 "/my_product/product_overlay/meishe_lut"),
+                    "91 90 254:12 / /odm/etc/camera/meishe_lut/qing_tou.bin ro - "
+                    "erofs /dev/block/dm-12 ro,seclabel")
+        log = self.run_compat(use_stock=False)
+        self.assertIn("stock-pending", log)
+        self.assertEqual(self.target(rel).read_bytes(), b"OP asset\n")
+        self.assertFalse(self.backup(rel).exists())
+        self.assertEqual(self.last_changed, 0)
+
+    def test_sibling_file_mount_keeps_cached_directory_resolution(self):
+        # 同目录兄弟文件上的挂载点不影响本文件：目录级缓存结果与逐文件解析一致。
+        rel = CAMERA + "/meishe_lut/qing_tou.bin"
+        self.write(self.target(rel), b"OP asset\n")
+        self.write(self.device / "my_product/product_overlay/meishe_lut/qing_tou.bin",
+                   b"deep clean lower\n")
+        self.write(self.device / "odm/etc/camera/meishe_lut/other.bin", b"other bytes\n")
+        self.mounts(self.overlay(90, 2, "/odm/etc/camera/meishe_lut",
+                                 "/my_product/product_overlay/meishe_lut"),
+                    "92 90 254:13 / /odm/etc/camera/meishe_lut/other.bin ro - "
+                    "erofs /dev/block/dm-13 ro,seclabel")
+        self.run_compat(use_stock=False)
+        self.assertEqual(self.target(rel).read_bytes(), b"deep clean lower\n")
+        self.assertEqual(self.backup(rel).read_bytes(), b"OP asset\n")
+
+    def test_conflict_size_pregate_skips_legacy_hash(self):
+        # 只读冲突比较先比大小：尺寸必然不同时无需读取 legacy 哈希即判定冲突。
+        self.write(self.cam / "meishe_lut/stock.bin", b"new OP update bytes\n")
+        self.write(self.cam / "meishe_lut.xpan-c16-hidden/stock.bin", b"old\n")
+        legacy = self.posix(self.cam / "meishe_lut.xpan-c16-hidden" / "stock.bin")
+        inject = ('xpan_bounded() { if [ "$1" = sha256sum ] && [ "$2" = "' + legacy +
+                  '" ]; then return 1; fi; timeout -s KILL 10 "$@"; }')
+        log = self.run_compat(inject=inject)
+        self.assertIn("hidden-conflict", log)
+        self.assertNotIn("hidden-protected", log)
+        self.assertEqual((self.cam / "meishe_lut/stock.bin").read_bytes(), b"new OP update bytes\n")
+        self.assertEqual((self.cam / "meishe_lut.xpan-c16-hidden/stock.bin").read_bytes(), b"old\n")
+        self.assertEqual(self.last_changed, 0)
+
+    def test_repeat_backup_size_pregate_skips_existing_dest_hash(self):
+        # 备份目标已存在且尺寸必然不同时，免哈希直接进入哈希后缀旧件判断。
+        self.install_native(clean=True)
+        old = self.target(MEISHE[0]).read_bytes()
+        self.run_compat()
+        newer_op = b"later OP release native with more bytes\n"
+        self.write(self.target(MEISHE[0]), newer_op)
+        dest = self.posix(self.backup(MEISHE[0]))
+        inject = ('xpan_bounded() { if [ "$1" = sha256sum ] && [ "$2" = "' + dest +
+                  '" ]; then return 1; fi; timeout -s KILL 10 "$@"; }')
+        log = self.run_compat(inject=inject)
+        self.assertIn(MEISHE[0] + "=synced", log)
+        self.assertEqual(self.backup(MEISHE[0]).read_bytes(), old)
+        self.assertEqual(Path(str(self.backup(MEISHE[0])) + "." + sha(newer_op)).read_bytes(), newer_op)
+        self.assertEqual(self.target(MEISHE[0]).read_bytes(), (self.stock / MEISHE[0]).read_bytes())
+
     def test_state_rom_release_is_not_overwritten_by_file_relative_path(self):
         self.install_native(clean=True)
         self.write(self.cam / "meishe_lut/stock.bin", b"old lut\n")
