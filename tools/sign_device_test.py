@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sign a current unsigned 2.0 build with the existing debug key, for local tests only.
+"""Sign a current unsigned 2.1 build with the existing debug key, for local tests only.
 
 Run with python -I. Never execute the historical build script, create a key,
 install/uninstall an app, package a module, or replace a release. Passwords are
@@ -197,8 +197,8 @@ def current_sources(inputs, report):
         fail("Current source manifest is invalid")
     android = "{http://schemas.android.com/apk/res/android}"
     identity = (xml.attrib.get("package"), xml.attrib.get(android + "versionCode"), xml.attrib.get(android + "versionName"))
-    if xml.tag != "manifest" or identity != ("com.xpanport.hook", "20", "2.0"):
-        fail("Current source manifest must identify com.xpanport.hook 20/2.0")
+    if xml.tag != "manifest" or identity != ("com.xpanport.hook", "21", "2.1"):
+        fail("Current source manifest must identify com.xpanport.hook 21/2.1")
     entry = inputs.read(ROOT / "hook/assets/xposed_init")
     if digest(manifest) != report["manifest_sha256"] or digest(entry) != report["xposed_entry_sha256"]:
         fail("Unsigned manifest or Xposed entry pins are stale")
@@ -253,9 +253,9 @@ def inspect_apk(data, entry, bh, unsigned):
 
 def verify_identity(apk, aapt):
     output = run_tool([aapt, "dump", "badging", apk], "APK identity verification")
-    identity = "package: name='com.xpanport.hook' versionCode='20' versionName='2.0'"
+    identity = "package: name='com.xpanport.hook' versionCode='21' versionName='2.1'"
     if not any(line == identity or line.startswith(identity + " ") for line in output.splitlines()):
-        fail("Actual APK identity is not com.xpanport.hook 20/2.0")
+        fail("Actual APK identity is not com.xpanport.hook 21/2.1")
     if "minSdkVersion:'24'" not in output.splitlines() or "targetSdkVersion:'35'" not in output.splitlines():
         fail("Actual APK SDK versions differ from the canonical SDK35 build")
 

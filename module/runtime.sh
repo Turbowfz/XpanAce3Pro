@@ -308,6 +308,47 @@ parsecamera_libraryfiles() {
         }
     '
 }
+xpan_sdk() {
+    X_EFFECTIVE_SDK=; X_EFFECTIVE_ADAPTER=
+    xpan_framework_hash "$X_SDK" || return 1
+    X_EFFECTIVE_SDK=$X_HASH
+    xpan_framework_hash "$X_ADAPTER" || return 1
+    X_EFFECTIVE_ADAPTER=$X_HASH
+    [ "$X_EFFECTIVE_SDK" = "$X_SDK_HASH" ] && [ "$X_EFFECTIVE_ADAPTER" = "$X_ADAPTER_HASH" ]
+}
+xpan_install_sdk() {
+    X_INSTALL_REBOOT=0
+    xpan_sdk && return 0
+    [ "$X_ID" = c17 ] || { xpan_log '当前相机 SDK 与本机配置不匹配'; return 1; }
+    case "$X_EFFECTIVE_SDK:$X_EFFECTIVE_ADAPTER" in
+        "$X_SDK_HASH:$X_ADAPTER_HASH"|"$X_SDK_HASH:ac0b595faae8d3f684aa457f223fbfb0f167f0d0e0cc461ef08dbbe52d6e61cf"|"37a13d408f7ee95b8e954c2ef11c44a0aee433da45958cc7ddb80c688e0692c6:$X_ADAPTER_HASH"|"37a13d408f7ee95b8e954c2ef11c44a0aee433da45958cc7ddb80c688e0692c6:ac0b595faae8d3f684aa457f223fbfb0f167f0d0e0cc461ef08dbbe52d6e61cf") ;;
+        *) xpan_log '当前相机 SDK 不是本机 C17 或已知的 OPCameraPro C16 补全'; return 1 ;;
+    esac
+    # 仅确认同名 C17 替换源已就位时允许待重启安装，不放宽运行期 SDK 契约。
+    local X_PENDING_DIR X_PENDING_NAME X_PENDING_PIN X_PENDING_LIVE
+    X_PENDING_DIR=${XPAN_TEST_OP_DIR:-/data/adb/modules/OPCameraPro}
+    xpan_safe_path "$X_PENDING_DIR" && [ -f "$X_PENDING_DIR/module.prop" ] &&
+        [ ! -L "$X_PENDING_DIR/module.prop" ] && grep -qx 'id=OPCameraPro' "$X_PENDING_DIR/module.prop" || {
+        xpan_log '旧 SDK 仍在生效，未找到已更新的 OPCameraPro 补全'; return 1;
+    }
+    for X_PENDING_NAME in com.oplus.camera.unit.sdk.jar com.oplus.camera.unit.sdk.adapter.jar; do
+        case "$X_PENDING_NAME" in
+            com.oplus.camera.unit.sdk.jar) X_PENDING_PIN=$X_SDK_HASH; X_PENDING_LIVE=$X_EFFECTIVE_SDK ;;
+            *) X_PENDING_PIN=$X_ADAPTER_HASH; X_PENDING_LIVE=$X_EFFECTIVE_ADAPTER ;;
+        esac
+        [ "$X_PENDING_LIVE" != "$X_PENDING_PIN" ] || continue
+        xpan_hash "$X_MOD/payload/op-compat/framework/$X_PENDING_NAME" && [ "$X_HASH" = "$X_PENDING_PIN" ] &&
+            xpan_hash "$X_PENDING_DIR/system/product/framework/$X_PENDING_NAME" && [ "$X_HASH" = "$X_PENDING_PIN" ] || {
+            xpan_log "旧 SDK 仍在生效，C17 补全尚未成功更新：$X_PENDING_NAME"; return 1;
+        }
+    done
+    X_INSTALL_REBOOT=1
+    xpan_log 'OPCameraPro 的 C16 SDK 仍由本次启动挂载；补全已更新，重启手机后生效'
+}
+xpan_reboot_ready() {
+    [ -e "$X_MOD/.xpan-reboot-required" ] || [ -L "$X_MOD/.xpan-reboot-required" ] || return 0
+    xpan_read "$X_MOD/.xpan-reboot-required" && xpan_uuid "$X_VALUE" && [ "$X_VALUE" != "$X_BOOT_ID" ]
+}
 xpan_qualify() {
     local X_R
     X_REAL_MODEL=$(xpan_bounded getprop ro.product.model 2>/dev/null) || return 1
@@ -333,8 +374,11 @@ xpan_qualify() {
     X_ADAPTER=$(printf '%s\n' "$X_LIBS" | grep '/com.oplus.camera.unit.sdk.adapter.jar$') || X_ADAPTER=
     [ -n "$X_ADAPTER" ] || X_ADAPTER=${X_SDK%/*}/com.oplus.camera.unit.sdk.adapter.jar
     [ "${X_SDK%/*}" = "${X_ADAPTER%/*}" ] || return 1
-    xpan_framework_hash "$X_SDK" && [ "$X_HASH" = "$X_SDK_HASH" ] || return 1
-    xpan_framework_hash "$X_ADAPTER" && [ "$X_HASH" = "$X_ADAPTER_HASH" ] || return 1
+    if [ "${1:-}" = install ]; then
+        xpan_install_sdk || return 1
+    else
+        xpan_sdk || return 1
+    fi
     for X_R in unit feature vendor; do
         xpan_role "$X_R"
         xpan_hash "$X_SOURCE" && [ "$X_HASH" = "$X_OUT" ] || return 1
@@ -677,17 +721,11 @@ xpan_parent_pin() {
         esac
     done < "$X_STATE/parent.context"
     [ "$X_PCOUNT" = 7 ] || return 1
-    if [ "$X_PBOOT" != "$X_BOOT_ID" ] || [ "$X_PNS" != "$X_NAMESPACE" ]; then
-        [ "${1:-}" = prepare ] && xpan_parent_approval || return 1
-        X_PARENT_RECOVERING=1
+    if [ "$X_PBOOT" != "$X_BOOT_ID" ]; then
+        xpan_parent_refresh "$X_PBOOT" || return 1
+        return 0
     fi
-    if [ "$X_PTOKEN" != "$X_TOKEN" ]; then
-        [ "${1:-}" = prepare ] && xpan_parent_approval || return 1
-        [ "$X_PBOOT" = "$X_BOOT_ID" ] && [ "$X_PNS" = "$X_NAMESPACE" ] &&
-            [ "$X_PHASH" = "$X_PARENT_HASH" ] && [ "$X_PINODE" = "$X_PARENT_INODE" ] &&
-            [ "$X_PKIND" = "$X_PARENT_KIND" ] || return 1
-        X_PARENT_RECOVERING=1
-    fi
+    [ "$X_PNS" = "$X_NAMESPACE" ] && [ "$X_PTOKEN" = "$X_TOKEN" ] || return 1
     if [ "${X_PARENT_RECOVERING:-0}" != 1 ]; then
         [ -z "$X_PARENT_HASH" ] || { [ "$X_PARENT_HASH" = "$X_PHASH" ] && [ "$X_PARENT_INODE" = "$X_PINODE" ]; } || return 1
     else
@@ -717,72 +755,38 @@ xpan_parent_start() {
     fi
     return 1
 }
-xpan_parent_approval() {
-    local X_AKEY X_AVAL X_ALINE X_ASEEN X_ACOUNT X_ABOOT X_ANS X_ATOKEN X_AHASH X_AINODE
-    xpan_safe_path "$X_MOD/payload/parent.approval" && [ -f "$X_MOD/payload/parent.approval" ] || return 1
-    [ "${XPAN_TEST_MODE:-}" = 1 ] || {
-        X_APMODE=$(xpan_bounded stat -c '%a:%u' "$X_MOD/payload/parent.approval") || return 1
-        [ "$X_APMODE" = 600:0 ] || return 1
-    }
-    X_ASEEN='|'; X_ACOUNT=0
-    X_ABOOT=; X_ANS=; X_ATOKEN=; X_AHASH=; X_AINODE=
-    while IFS= read -r X_ALINE || [ -n "$X_ALINE" ]; do
-        [ "${#X_ALINE}" -le 1024 ] || return 1
-        case "$X_ALINE" in *=*) ;; *) return 1 ;; esac
-        X_AKEY=${X_ALINE%%=*}; X_AVAL=${X_ALINE#*=}
-        case "$X_ASEEN" in *"|$X_AKEY|"*) return 1 ;; esac
-        X_ASEEN=$X_ASEEN$X_AKEY'|'; X_ACOUNT=$((X_ACOUNT+1))
-        case "$X_AKEY" in
-            parent_approval_version) [ "$X_AVAL" = 1 ] || return 1 ;;
-            boot_id) X_ABOOT=$X_AVAL; xpan_uuid "$X_AVAL" || return 1 ;;
-            namespace) X_ANS=$X_AVAL ;;
-            current_token) X_ATOKEN=$X_AVAL; xpan_uuid "$X_AVAL" || return 1 ;;
-            parent_mount_sha256) X_AHASH=$X_AVAL; xpan_hash_valid "$X_AVAL" || return 1 ;;
-            parent_inode) X_AINODE=$X_AVAL; printf '%s\n' "$X_AVAL" | grep -Eq '^[0-9]+:[0-9]+$' || return 1 ;;
-            *) return 1 ;;
-        esac
-    done < "$X_MOD/payload/parent.approval"
-    [ "$X_ACOUNT" = 6 ] && [ "$X_ABOOT" = "$X_BOOT_ID" ] && [ "$X_ANS" = "$X_NAMESPACE" ] &&
-        [ "$X_AHASH" = "$X_PARENT_HASH" ] && [ "$X_AINODE" = "$X_PARENT_INODE" ] || return 1
-    xpan_read "$X_LIFE/current.token" && [ "$X_VALUE" = "$X_ATOKEN" ] || return 1
-    xpan_read "$X_MOD/.xpan-instance" && [ "$X_VALUE" = "$X_ATOKEN" ] &&
-        X_PARENT_APPROVED_TOKEN=$X_ATOKEN
+xpan_parent_refresh() {
+    local X_REFRESH_ROLE X_REFRESH_OLD
+    X_REFRESH_OLD=$1
+    [ "$X_LOCKED:$X_LIFE_LOCKED" = 1:1 ] && xpan_tokens || return 1
+    # 跨启动只清理已失效且无当前挂载的记录，绝不借旧记录卸载本次启动的文件。
+    xpan_parent_observe "$X_INFO" "$X_STOCK" "$X_PARENT_POINT" "$X_PARTITION_POINT" || return 1
+    X_PARENT_HASH=$XP_PARENT_HASH; X_PARENT_INODE=$XP_PARENT_INODE; X_PARENT_KIND=$XP_PARENT_KIND
+    X_PARENT_V2=1; X_PARENT_INSTANCE=0
+    xpan_inactive || return 1
+    for X_REFRESH_ROLE in unit feature vendor; do
+        xpan_role "$X_REFRESH_ROLE"
+        xpan_mount_line && [ -z "$X_MLINE" ] || return 1
+        if [ -e "$X_STATE/$X_REFRESH_ROLE.mount" ] || [ -L "$X_STATE/$X_REFRESH_ROLE.mount" ]; then
+            xpan_journal "$X_REFRESH_ROLE" && [ "$X_JBOOT" = "$X_REFRESH_OLD" ] &&
+                [ "$X_JBOOT" != "$X_BOOT_ID" ] && [ "$X_JTOKEN" = "$X_TOKEN" ] || return 1
+        fi
+    done
+    xpan_parent_mounts || return 1
+    for X_REFRESH_ROLE in unit feature vendor; do
+        xpan_role "$X_REFRESH_ROLE"
+        xpan_mount_line && [ -z "$X_MLINE" ] || return 1
+        [ ! -e "$X_STATE/$X_REFRESH_ROLE.mount" ] || rm -f "$X_STATE/$X_REFRESH_ROLE.mount" || return 1
+    done
+    X_PARENT_PREVIOUS=$(xpan_bounded sha256sum "$X_STATE/parent.context") || return 1
+    X_PARENT_PREVIOUS=${X_PARENT_PREVIOUS%% *}
+    xpan_parent_commit || return 1
+    xpan_log '已自动刷新本次启动的父层上下文，运行前仍检查真实配置与 SDK'
 }
 xpan_parent_prepare() {
     xpan_parent_observe "$X_INFO" "$X_STOCK" "$X_PARENT_POINT" "$X_PARTITION_POINT" || return 1
     X_PARENT_HASH=$XP_PARENT_HASH; X_PARENT_INODE=$XP_PARENT_INODE; X_PARENT_KIND=$XP_PARENT_KIND
-    X_PARENT_INSTANCE=0; X_PARENT_V2=1
-    if [ -e "$X_STATE/parent.context" ] || [ -L "$X_STATE/parent.context" ]; then
-        xpan_read "$X_MOD/.xpan-instance" && xpan_uuid "$X_VALUE" || return 1
-        X_TOKEN=$X_VALUE
-        xpan_read "$X_LIFE/current.token" && [ "$X_VALUE" = "$X_TOKEN" ] || return 1
-        xpan_parent_pin prepare || return 1
-        if [ "${X_PARENT_RECOVERING:-0}" = 1 ]; then
-            xpan_qualify && xpan_parent_mounts || return 1
-            for X_RECOVERY_ROLE in unit feature vendor; do
-                xpan_role "$X_RECOVERY_ROLE"
-                xpan_mount_line && [ -z "$X_MLINE" ] || return 1
-                xpan_hash "$X_TARGET" && [ "$X_HASH" = "$X_ORIG" ] || return 1
-                if [ -e "$X_STATE/$X_RECOVERY_ROLE.mount" ] || [ -L "$X_STATE/$X_RECOVERY_ROLE.mount" ]; then
-                    xpan_journal "$X_RECOVERY_ROLE" && [ "$X_JBOOT" != "$X_BOOT_ID" ] || return 1
-                fi
-            done
-            xpan_parent_mounts || return 1
-            for X_OLD_ROLE in unit feature vendor; do
-                if [ -e "$X_STATE/$X_OLD_ROLE.mount" ] || [ -L "$X_STATE/$X_OLD_ROLE.mount" ]; then
-                    xpan_role "$X_OLD_ROLE"
-                    xpan_journal "$X_OLD_ROLE" && [ "$X_JBOOT" != "$X_BOOT_ID" ] || return 1
-                    xpan_mount_line && [ -z "$X_MLINE" ] || return 1
-                    xpan_hash "$X_TARGET" && [ "$X_HASH" = "$X_ORIG" ] || return 1
-                    xpan_parent_mounts && rm -f "$X_J" || return 1
-                fi
-            done
-        fi
-        X_PARENT_PREVIOUS=$(xpan_bounded sha256sum "$X_STATE/parent.context") || return 1
-        X_PARENT_PREVIOUS=${X_PARENT_PREVIOUS%% *}
-    elif [ "$X_PARENT_KIND" = ksu ]; then
-        xpan_parent_approval || return 1
-    fi
+    X_PARENT_INSTANCE=0; X_PARENT_V2=1; X_PARENT_RECOVERING=0; X_PARENT_PREVIOUS=
     for X_PR in unit feature vendor; do
         [ ! -e "$X_STATE/$X_PR.mount" ] && [ ! -L "$X_STATE/$X_PR.mount" ] || return 1
     done
@@ -953,7 +957,7 @@ xpan_tick() {
     fi
     # Validate first without oscillating the live token during healthy monitoring.
     X_READY=$(xpan_bounded getprop sys.boot_completed 2>/dev/null) || X_READY=
-    if [ "$X_READY" != 1 ] || ! { xpan_markers && xpan_tokens && xpan_qualify && xpan_receipt && xpan_apk; }; then
+    if [ "$X_READY" != 1 ] || ! { xpan_markers && xpan_tokens && xpan_reboot_ready && xpan_qualify && xpan_receipt && xpan_apk; }; then
         xpan_inactive
         xpan_cleanup
         xpan_unlock
@@ -984,11 +988,49 @@ xpan_tick() {
     xpan_unlock
     return 0
 }
-xpan_prepare() {
-    xpan_parent_prepare && xpan_markers && xpan_qualify && xpan_current originals || {
-        xpan_log 'install requires exact unmounted originals and actual qualified SDK; orig-only update refused'
-        return 1
+xpan_install_cleanup() {
+    local X_MIGRATE_ROLE X_MIGRATE_PATH X_MIGRATE_TOKENS
+    X_MIGRATE_TOKENS='|'
+    for X_MIGRATE_PATH in "$X_LIFE/current.token" "$X_ACTIVE/.xpan-instance" "$X_MOD/.xpan-instance"; do
+        if xpan_read "$X_MIGRATE_PATH" && xpan_uuid "$X_VALUE"; then
+            X_MIGRATE_TOKENS=$X_MIGRATE_TOKENS$X_VALUE'|'
+        fi
+    done
+    xpan_parent_observe "$X_INFO" "$X_STOCK" "$X_PARENT_POINT" "$X_PARTITION_POINT" || {
+        xpan_log '无法读取当前挂载父层，未撤销任何旧挂载'; return 1;
     }
+    X_PARENT_HASH=$XP_PARENT_HASH; X_PARENT_INODE=$XP_PARENT_INODE; X_PARENT_KIND=$XP_PARENT_KIND
+    X_PARENT_INSTANCE=1; X_PARENT_V2=1
+    xpan_inactive || { xpan_log '无法清除旧实例的启用状态'; return 1; }
+    # 先用旧记录撤销自己的挂载，再清失效状态；保留新模块文件和 OPC 备份。
+    for X_MIGRATE_ROLE in vendor feature unit; do
+        xpan_role "$X_MIGRATE_ROLE"
+        xpan_mount_line || { xpan_log "挂载被其他模块覆盖，保留原记录：$X_MIGRATE_ROLE"; return 1; }
+        if [ -n "$X_MLINE" ]; then
+            xpan_journal "$X_MIGRATE_ROLE" || { xpan_log "无法证明旧挂载归属：$X_MIGRATE_ROLE"; return 1; }
+            case "$X_MIGRATE_TOKENS" in *"|$X_JTOKEN|"*) ;; *) xpan_log "非旧实例的挂载已保留：$X_MIGRATE_ROLE"; return 1 ;; esac
+            xpan_owned "$X_MIGRATE_ROLE" && xpan_unmount_role "$X_MIGRATE_ROLE" || {
+                xpan_log "旧挂载与所有权记录不一致，未盲目卸载：$X_MIGRATE_ROLE"; return 1;
+            }
+        else
+            X_MIGRATE_PATH=$X_STATE/$X_MIGRATE_ROLE.mount
+            xpan_safe_path "$X_MIGRATE_PATH" || return 1
+            [ ! -e "$X_MIGRATE_PATH" ] || { [ -f "$X_MIGRATE_PATH" ] && rm -f "$X_MIGRATE_PATH"; } || return 1
+        fi
+    done
+    for X_MIGRATE_PATH in "$X_STATE/parent.context" "$X_MOD/payload/parent.approval" \
+        "$X_MOD/payload/parent.inputs" "$X_MOD/.xpan-apk-identity" "$X_MOD/.xpan-reboot-required"; do
+        xpan_safe_path "$X_MIGRATE_PATH" || return 1
+        [ ! -e "$X_MIGRATE_PATH" ] || { [ -f "$X_MIGRATE_PATH" ] && rm -f "$X_MIGRATE_PATH"; } || return 1
+    done
+    X_PARENT_HASH=; X_PARENT_INODE=; X_PARENT_KIND=; X_PARENT_INSTANCE=0
+    xpan_log '已自动清理旧 Xpan 挂载与失效状态，保留新模块和兼容备份'
+}
+xpan_prepare() {
+    xpan_parent_prepare || { xpan_log '无法自动刷新安装父层，当前挂载尚未清理'; return 1; }
+    xpan_markers || { xpan_log '安装目录不可用，或已有另一份待更新模块'; return 1; }
+    xpan_qualify install || { xpan_log '本机相机配置或实际 SDK 不符合原有支持契约'; return 1; }
+    xpan_current originals || { xpan_log '当前相机配置不是未挂载的原厂文件，其他模块的挂载未清理'; return 1; }
     xpan_hash "$X_MOD/payload/XpanHook.apk" || return 1
     X_APK_HASH=$X_HASH
     # Only owned payload modes and labels are changed, never stock targets.
@@ -1027,46 +1069,60 @@ original_vendor_sha256=$X_O_VENDOR
 output_unit_sha256=$X_Q_UNIT
 output_feature_sha256=$X_Q_FEATURE
 output_vendor_sha256=$X_Q_VENDOR" || return 1
-    xpan_receipt && xpan_qualify && xpan_current originals && xpan_parent_phase
+    xpan_receipt && xpan_qualify install && xpan_current originals && xpan_parent_phase
 }
-# OPCameraPro completion helpers: top-level so Android sh never nests definitions.
+# OPCameraPro 兼容 helper 保持顶层定义；只改附属模块，来源不足不是安装门禁。
 xpan_op_backup() {
-    # $1 target file, $2 relative backup name; exact copy, never overwrites.
-    [ -f "$1" ] && [ ! -L "$1" ] || return 1
+    # 首份备份不覆盖；OP 更新后的不同旧件另存哈希后缀。
+    local name dest oldhash tmp
     xpan_hash "$1" || return 1
-    X_OB_H=$X_HASH
-    X_OB_D=$X_OC_BACK
-    case "$2" in
-        */*) X_OB_D=$X_OC_BACK/${2%/*} ;;
-    esac
-    mkdir -p "$X_OB_D" 2>/dev/null || return 1
-    [ -e "$X_OC_BACK/$2" ] && return 0
-    X_OB_T=$X_OB_D/.${2##*/}.$$
-    (set -C; xpan_bounded cat "$1" > "$X_OB_T") || { rm -f "$X_OB_T"; return 1; }
-    chmod 0644 "$X_OB_T" 2>/dev/null
-    mv -f "$X_OB_T" "$X_OC_BACK/$2" 2>/dev/null || { rm -f "$X_OB_T"; return 1; }
-    xpan_hash "$X_OC_BACK/$2" && [ "$X_HASH" = "$X_OB_H" ]
+    oldhash=$X_HASH; name=$2
+    case "$name" in ''|/*|*..*|*' '*|*'\\'*|*'
+'*) return 1 ;; esac
+    dest=$X_OC_BACK/$name
+    xpan_safe_path "$dest" || return 1
+    if [ -e "$dest" ]; then
+        xpan_hash "$dest" || return 1
+        [ "$X_HASH" != "$oldhash" ] || return 0
+        dest=$dest.$oldhash
+        xpan_safe_path "$dest" || return 1
+        if [ -e "$dest" ]; then xpan_hash "$dest" && [ "$X_HASH" = "$oldhash" ]; return $?; fi
+    fi
+    mkdir -p "${dest%/*}" 2>/dev/null || return 1
+    tmp=$dest.xpan-compat.$$
+    xpan_safe_path "$tmp" && [ ! -e "$tmp" ] || return 1
+    (set -C; xpan_bounded cat "$1" > "$tmp") || { rm -f "$tmp"; return 1; }
+    if ! { chmod 0644 "$tmp" && xpan_hash "$tmp" && [ "$X_HASH" = "$oldhash" ] && mv -n "$tmp" "$dest"; }; then
+        rm -f "$tmp"; return 1
+    fi
+    rm -f "$tmp"
+    xpan_hash "$dest" && [ "$X_HASH" = "$oldhash" ]
 }
 xpan_op_put() {
-    # $1 source, $2 target, $3 expected hash after the atomic write.
-    [ -f "$1" ] && [ ! -L "$1" ] || return 1
-    X_OP_TMP=$2.xpan-compat.$$
-    if ! { xpan_bounded cat "$1" > "$X_OP_TMP" 2>/dev/null &&
-            chmod 0644 "$X_OP_TMP" 2>/dev/null &&
-            mv -f "$X_OP_TMP" "$2" 2>/dev/null; }; then
-        rm -f "$X_OP_TMP" 2>/dev/null
-        return 1
+    # 先校验临时副本再原子替换；回读失败用原文件硬链接回滚。
+    local tmp keep oldhash
+    X_OP_WRITTEN=0
+    xpan_hash_valid "$3" && xpan_hash "$1" && [ "$X_HASH" = "$3" ] && xpan_safe_path "$2" || return 1
+    [ ! -e "$2" ] || [ -f "$2" ] || return 1
+    tmp=$2.xpan-compat.$$; keep=$2.xpan-compat-old.$$
+    xpan_safe_path "$tmp" && xpan_safe_path "$keep" && [ ! -e "$tmp" ] && [ ! -e "$keep" ] || return 1
+    (set -C; xpan_bounded cat "$1" > "$tmp") || { rm -f "$tmp"; return 1; }
+    if ! { chmod 0644 "$tmp" && xpan_hash "$tmp" && [ "$X_HASH" = "$3" ]; }; then rm -f "$tmp"; return 1; fi
+    oldhash=
+    if [ -e "$2" ]; then
+        xpan_hash "$2" && oldhash=$X_HASH && ln "$2" "$keep" 2>/dev/null || { rm -f "$tmp"; return 1; }
     fi
-    xpan_hash "$2" && [ "$X_HASH" = "$3" ]
+    if ! { xpan_safe_path "$2" && mv -f "$tmp" "$2" 2>/dev/null; }; then rm -f "$tmp" "$keep"; return 1; fi
+    X_OP_WRITTEN=1
+    if xpan_hash "$2" && [ "$X_HASH" = "$3" ]; then rm -f "$keep"; return 0; fi
+    if [ -n "$oldhash" ]; then
+        mv -f "$keep" "$2" 2>/dev/null && X_OP_WRITTEN=0
+    else
+        rm -f "$2" 2>/dev/null && X_OP_WRITTEN=0
+    fi
+    return 1
 }
-# OPCameraPro's attached module also carries C16-era filter and tone assets.
-# Mounted over this C17 ROM they shadow the C17 engine: selecting any filter
-# renders a black preview. Renaming them (every file kept, fully reversible)
-# lets the stock C17 assets show through on the next boot. Allowlist only:
-# directories meishe_lut, filters_lut, basictone and files named
-# gamma_*_conf.json. config/, is_mount, the SDK jars and every other file are
-# never moved. The renames are armed only while the attached module still ships
-# its known C16 completion, so a future OP update to C17 assets stays untouched.
+# C16 JAR 指纹只作日志观察，不能代表 native/素材已升级，也不激活整目录隐藏。
 xpan_op_c16_pin() {
     case "$1" in
         unit) printf '%s' "${XPAN_TEST_OP_C16_UNIT:-37a13d408f7ee95b8e954c2ef11c44a0aee433da45958cc7ddb80c688e0692c6}" ;;
@@ -1085,162 +1141,296 @@ xpan_op_is_c16_completion() {
         [ "$X_HASH" = "$X_OF_AP" ]; then return 0; fi
     return 1
 }
-xpan_op_hide_c16_filters() {
-    X_OF_CAM=$X_OC_DIR/system/odm/etc/camera
-    [ -d "$X_OF_CAM" ] && [ ! -L "$X_OF_CAM" ] || return 0
-    X_OF_ARM=0
-    xpan_op_is_c16_completion && X_OF_ARM=1
-    X_OF_N=0
-    X_OF_BAD=0
-    for X_OF_NAME in meishe_lut filters_lut basictone; do
-        X_OF_ONE=$X_OF_CAM/$X_OF_NAME
-        X_OF_OLD=$X_OF_ONE.xpan-c16-hidden
-        if [ -e "$X_OF_OLD" ] || [ -L "$X_OF_OLD" ]; then
-            X_OF_N=$((X_OF_N + 1))
-        elif [ "$X_OF_ARM" = 1 ] && [ -d "$X_OF_ONE" ] && [ ! -L "$X_OF_ONE" ]; then
-            if mv "$X_OF_ONE" "$X_OF_OLD" 2>/dev/null; then
-                X_OF_N=$((X_OF_N + 1))
-                X_OC_CHANGED=1
-            else
-                X_OF_BAD=$((X_OF_BAD + 1))
-            fi
-        fi
-    done
-    for X_OF_OLD in "$X_OF_CAM"/gamma_*_conf.json.xpan-c16-hidden; do
-        [ -e "$X_OF_OLD" ] || [ -L "$X_OF_OLD" ] || continue
-        X_OF_N=$((X_OF_N + 1))
-    done
-    for X_OF_ONE in "$X_OF_CAM"/gamma_*_conf.json; do
-        [ -f "$X_OF_ONE" ] && [ ! -L "$X_OF_ONE" ] || continue
-        case "${X_OF_ONE##*/}" in gamma_*_conf.json) ;; *) continue ;; esac
-        X_OF_OLD=$X_OF_ONE.xpan-c16-hidden
-        [ -e "$X_OF_OLD" ] || [ -L "$X_OF_OLD" ] && continue
-        if [ "$X_OF_ARM" = 1 ]; then
-            if mv "$X_OF_ONE" "$X_OF_OLD" 2>/dev/null; then
-                X_OF_N=$((X_OF_N + 1))
-                X_OC_CHANGED=1
-            else
-                X_OF_BAD=$((X_OF_BAD + 1))
-            fi
-        fi
-    done
-    if [ "$X_OF_N" != 0 ]; then
-        X_OC_SUM="$X_OC_SUM c16-filter-assets=hidden($X_OF_N)"
-        [ "$X_OF_BAD" = 0 ] && [ "$X_OC_CHANGED" = 1 ] &&
-            xpan_log 'op-compat: C16 filter/tone assets hidden; stock C17 assets apply after reboot'
+xpan_op_mounts() {
+    # 一次读取既有 mountinfo；仅提取来源，不扩展父层授权协议。
+    [ -f "${X_INFO:-/proc/self/mountinfo}" ] && [ ! -L "${X_INFO:-/proc/self/mountinfo}" ] || return 1
+    LC_ALL=C xpan_bounded awk -v BINMODE=3 '
+        function path(p) { return p ~ /^\// && p !~ /[[:cntrl:][:space:]:,]/ &&
+            p !~ /\/\// && p !~ /(^|\/)\.\.?($|\/)/ && (p=="/" || p !~ /\/$/) }
+        { bytes+=length($0)+1
+          if(bytes>1048576 || NR>8192 || length($0)>4096 || NF<10) exit 1
+          sep=7; while(sep<=NF && $sep!="-") sep++
+          if(NF!=sep+3 || $1 !~ /^[1-9][0-9]*$/ || seen[$1]++ ||
+             !path($4) || !path($5)) exit 1
+          print $1 "\t" $4 "\t" $5 "\t" $6 "\t" $(sep+1) "\t" $(sep+2) "\t" $(sep+3)
+        }
+    ' "${X_INFO:-/proc/self/mountinfo}"
+}
+xpan_op_source_safe() {
+    xpan_safe_path "$1" || return 1
+    case "$1" in
+        "$X_OC_DIR"|"$X_OC_DIR"/*|"$X_MOD"|"$X_MOD"/*|/data|/data/*|/mnt/vendor|/mnt/vendor/*|*/data/adb/modules/*|*/data/adb/modules_update/*) return 1 ;;
+    esac
+    if [ "${XPAN_TEST_MODE:-}" = 1 ] && [ -n "${XPAN_TEST_ROOT:-}" ]; then
+        case "$1" in "$XPAN_TEST_ROOT/data"|"$XPAN_TEST_ROOT/data"/*|"$XPAN_TEST_ROOT/mnt/vendor"|"$XPAN_TEST_ROOT/mnt/vendor"/*) return 1 ;; esac
     fi
-    [ "$X_OF_BAD" = 0 ] || X_OC_SUM="$X_OC_SUM c16-filter-assets=hide-failed($X_OF_BAD)"
     return 0
 }
-# Mirror OPCameraPro's attached-module completion to this phone's C17 originals.
-# Gate: only a C17 ROM. No attached module, unknown identity, unknown hashes,
-# symlinks and failed copies stay untouched. Every replaced file is backed up
-# under $X_STATE/op-compat-backup. KernelSU mounts module files early, so a
-# changed file takes effect on the next boot; the log states that.
+xpan_op_clean_origin() {
+    # 最深挂载点优先，同点取当前层；有效 overlay 和模块 bind 不是原厂。
+    [ -n "$X_OC_MOUNTS" ] || return 1
+    printf '%s\n' "$X_OC_MOUNTS" | LC_ALL=C xpan_bounded awk -F '\t' -v p="$1" '
+        function under(p,b) { return p==b || b=="/" || index(p,b "/")==1 }
+        under(p,$3) && (length($3)>depth || (length($3)==depth && $1+0>id)) {
+            depth=length($3); id=$1+0; root=$2; opts=$4; fs=$5; source=$6; super=$7
+        }
+        END { if(!depth || root!="/" || fs !~ /^(erofs|ext4)$/ || source !~ /^\/dev\/block\// ||
+            opts !~ /(^|,)ro(,|$)/ || super !~ /(^|,)ro(,|$)/) exit 1 }
+    '
+}
+xpan_op_stock() {
+    # 返回 X_OS_FILE / X_OS_STATUS(found、absent、unavailable)，拒绝 OP 自比较。
+    local rel prefix roots base file complete physical known
+    rel=$1
+    X_OS_FILE=; X_OS_STATUS=unavailable
+    case "$rel" in /odm/*|/product/*) ;; *) return 1 ;; esac
+    if [ "${XPAN_TEST_MODE:-}" = 1 ] && [ -n "${XPAN_TEST_STOCK_ROOT:-}" ]; then
+        physical=$XPAN_TEST_STOCK_ROOT$rel
+        xpan_op_source_safe "$XPAN_TEST_STOCK_ROOT" && [ -d "$XPAN_TEST_STOCK_ROOT" ] &&
+            xpan_op_source_safe "$physical" || return 1
+        if [ -f "$physical" ]; then X_OS_FILE=$physical; X_OS_STATUS=found; return 0; fi
+        [ -e "$physical" ] || X_OS_STATUS=absent
+        return 1
+    fi
+    prefix=
+    if [ "${XPAN_TEST_MODE:-}" = 1 ]; then
+        [ -n "${XPAN_TEST_ROOT:-}" ] || return 1
+        prefix=$XPAN_TEST_ROOT
+    fi
+    roots=$(printf '%s\n' "$X_OC_MOUNTS" | LC_ALL=C xpan_bounded awk -F '\t' -v p="$rel" '
+        function under(p,b) { return p==b || b=="/" || index(p,b "/")==1 }
+        function path(p) { return p ~ /^\// && p !~ /[[:cntrl:][:space:],\\]/ &&
+            p !~ /\/\// && p !~ /(^|\/)\.\.?($|\/)/ && (p=="/" || p !~ /\/$/) }
+        under(p,$3) { if(length($3)>depth) { depth=length($3); n=0 }
+            if(length($3)==depth) rows[++n]=$0 }
+        END { for(pass=1;pass<=n;pass++) {
+            best=0; for(i=1;i<=n;i++) if(!(i in done)) {
+                split(rows[i],a,"\t"); if(a[1]+0>best) { best=a[1]+0; chosen=i }
+            }
+            done[chosen]=1; split(rows[chosen],a,"\t"); point=a[3]
+            if(a[5]!="overlay") { print point "\t" p "\t1"; continue }
+            if(a[2]!="/") continue
+            count=split(a[7],opts,","); lower=""; fields=0
+            for(i=1;i<=count;i++) if(index(opts[i],"lowerdir=")==1) { lower=substr(opts[i],10); fields++ }
+            if(fields!=1) continue
+            count=split(lower,dirs,":")
+            for(i=1;i<=count;i++) if(path(dirs[i]) && dirs[i]!=point)
+                print dirs[i] "\t" dirs[i] substr(p,length(point)+1) "\t" (count==1 ? 1 : 0)
+        } }
+    ') || roots=
+    case "$rel" in
+        /product/framework/*) roots="$roots
+/my_product/product_overlay/framework	/my_product/product_overlay/framework/${rel#/product/framework/}	0" ;;
+        /product/lib64/*) roots="$roots
+/my_product/lib64	/my_product/lib64/${rel#/product/lib64/}	0" ;;
+    esac
+    known=0
+    while IFS="$(printf '\t')" read -r base file complete; do
+        [ -n "$base" ] && [ -n "$file" ] || continue
+        xpan_op_source_safe "$prefix$base" && [ -d "$prefix$base" ] &&
+            xpan_op_source_safe "$prefix$file" && xpan_op_clean_origin "$base" &&
+            xpan_op_clean_origin "$file" || continue
+        physical=$prefix$file
+        if [ -f "$physical" ]; then X_OS_FILE=$physical; X_OS_STATUS=found; return 0; fi
+        [ ! -e "$physical" ] && [ ! -L "$physical" ] || return 1
+        [ "$complete" != 1 ] || known=1
+    done <<XPAN_OP_STOCK
+$roots
+XPAN_OP_STOCK
+    [ "$known" != 1 ] || X_OS_STATUS=absent
+    return 1
+}
+xpan_op_asset() {
+    # $1 原路径，$2 v2.0 隐藏旧件（可为空），$3 设备相对路径。
+    local target legacy rel oldhash current stockhash source
+    target=$1; legacy=$2; rel=$3
+    xpan_safe_path "$target" || { X_OC_SUM="$X_OC_SUM ${rel#/}=protected"; return 0; }
+    current=; oldhash=
+    if [ -e "$target" ]; then
+        xpan_hash "$target" && current=$X_HASH || { X_OC_SUM="$X_OC_SUM ${rel#/}=unreadable"; return 0; }
+    fi
+    if [ -n "$legacy" ] && { [ -e "$legacy" ] || [ -L "$legacy" ]; }; then
+        xpan_hash "$legacy" && oldhash=$X_HASH || { X_OC_SUM="$X_OC_SUM ${rel#/}=hidden-protected"; return 0; }
+    fi
+    xpan_op_stock "$rel" || true
+    source=$X_OS_FILE; stockhash=
+    if [ -n "$source" ]; then
+        xpan_hash "$source" && stockhash=$X_HASH || { X_OC_SUM="$X_OC_SUM ${rel#/}=stock-unreadable"; return 0; }
+    fi
+    if [ -n "$current" ] && [ "$current" = "$stockhash" ]; then return 0; fi
+    if [ -n "$current" ] && [ -n "$oldhash" ] && [ "$current" != "$oldhash" ]; then
+        X_OC_SUM="$X_OC_SUM ${rel#/}=hidden-conflict"; return 0
+    fi
+    if [ -z "$stockhash" ]; then
+        if [ "$X_OS_STATUS" != absent ]; then X_OC_SUM="$X_OC_SUM ${rel#/}=stock-pending"; return 0; fi
+        [ -z "$current" ] && [ -n "$oldhash" ] || return 0
+        source=$legacy; stockhash=$oldhash
+    fi
+    if [ -n "$current" ] && ! xpan_op_backup "$target" "mirror$rel"; then
+        X_OC_SUM="$X_OC_SUM ${rel#/}=backup-failed"; return 0
+    fi
+    xpan_safe_path "${target%/*}" && mkdir -p "${target%/*}" 2>/dev/null || return 0
+    if xpan_op_put "$source" "$target" "$stockhash"; then
+        X_OC_CHANGED=1
+        if [ "$source" = "$legacy" ]; then
+            X_OC_SUM="$X_OC_SUM ${rel#/}=extra-restored"
+        else
+            X_OC_SUM="$X_OC_SUM ${rel#/}=mirror-diff,synced"
+        fi
+    else
+        [ "${X_OP_WRITTEN:-0}" != 1 ] || X_OC_CHANGED=1
+        X_OC_SUM="$X_OC_SUM ${rel#/}=sync-failed"
+    fi
+}
+xpan_op_hide_c16_filters() {
+    # 不再整目录隐藏，也不由 C16 JAR 激活；同名原厂优先，独有增量保留。
+    local cam name dir hidden list file target rel legacy
+    cam=$X_OC_DIR/system/odm/etc/camera
+    xpan_safe_path "$cam" && [ -d "$cam" ] || return 0
+    for name in meishe_lut filters_lut basictone; do
+        dir=$cam/$name; hidden=$dir.xpan-c16-hidden
+        for file in "$dir" "$hidden"; do
+            xpan_safe_path "$file" && [ -d "$file" ] || continue
+            list=$X_OC_STATE/op-compat.list.$$
+            xpan_safe_path "$list" && [ ! -e "$list" ] || continue
+            (set -C; xpan_bounded find "$file" -type f > "$list" 2>/dev/null) || { rm -f "$list"; continue; }
+            while IFS= read -r target; do
+                legacy=
+                case "$target" in
+                    "$hidden"/*)
+                        legacy=$target; target=$dir/${target#"$hidden"/}
+                        [ ! -e "$target" ] && [ ! -L "$target" ] || continue ;;
+                    "$dir"/*) legacy=$hidden/${target#"$dir"/} ;;
+                    *) continue ;;
+                esac
+                rel=${target#"$X_OC_DIR/system"}
+                xpan_op_asset "$target" "$legacy" "$rel"
+            done < "$list"
+            rm -f "$list"
+        done
+    done
+    for file in "$cam"/gamma_*_conf.json "$cam"/gamma_*_conf.json.xpan-c16-hidden; do
+        [ -f "$file" ] && [ ! -L "$file" ] || continue
+        target=$file; legacy=$file.xpan-c16-hidden
+        case "$file" in *.xpan-c16-hidden)
+            target=${file%.xpan-c16-hidden}; legacy=$file
+            [ ! -e "$target" ] && [ ! -L "$target" ] || continue ;;
+        esac
+        rel=${target#"$X_OC_DIR/system"}
+        xpan_op_asset "$target" "$legacy" "$rel"
+    done
+}
+xpan_op_native() {
+    # 双 Meishe 无净来源时只改名模块副本；BasicTone 仅有原厂对应才同步。
+    local rel target hidden source stockhash current
+    for rel in /odm/lib64/libmsnativefilter.so /product/lib64/libMsEffectSdk.so /odm/lib64/libBasicTonePhoto.so; do
+        target=$X_OC_DIR/system$rel; hidden=$target.xpan-c16-hidden
+        xpan_safe_path "$target" && xpan_safe_path "$hidden" || {
+            X_OC_SUM="$X_OC_SUM ${rel#/}=protected"; continue;
+        }
+        [ -e "$target" ] || [ -e "$hidden" ] || continue
+        current=
+        if [ -e "$target" ]; then
+            xpan_hash "$target" && current=$X_HASH || { X_OC_SUM="$X_OC_SUM ${rel#/}=unreadable"; continue; }
+        fi
+        xpan_op_stock "$rel" || true
+        source=$X_OS_FILE; stockhash=
+        if [ -n "$source" ]; then xpan_hash "$source" && stockhash=$X_HASH || stockhash=; fi
+        if [ -n "$stockhash" ]; then
+            if [ "$current" = "$stockhash" ]; then X_OC_SUM="$X_OC_SUM ${rel#/}=current"; continue; fi
+            if [ -n "$current" ]; then
+                xpan_op_backup "$target" "mirror$rel" || { X_OC_SUM="$X_OC_SUM ${rel#/}=backup-failed"; continue; }
+            else
+                xpan_op_backup "$hidden" "mirror$rel" || { X_OC_SUM="$X_OC_SUM ${rel#/}=backup-failed"; continue; }
+            fi
+            if xpan_op_put "$source" "$target" "$stockhash"; then
+                X_OC_CHANGED=1; X_OC_SUM="$X_OC_SUM ${rel#/}=synced"
+            else
+                [ "${X_OP_WRITTEN:-0}" != 1 ] || X_OC_CHANGED=1
+                X_OC_SUM="$X_OC_SUM ${rel#/}=sync-failed"
+            fi
+            continue
+        fi
+        X_OC_SUM="$X_OC_SUM ${rel#/}=stock-pending"
+        [ "$rel" != /odm/lib64/libBasicTonePhoto.so ] || continue
+        [ -n "$current" ] || { X_OC_SUM="$X_OC_SUM native-hidden=current"; continue; }
+        if [ -e "$hidden" ]; then X_OC_SUM="$X_OC_SUM ${rel#/}=hidden-conflict"; continue; fi
+        xpan_op_backup "$target" "mirror$rel" || { X_OC_SUM="$X_OC_SUM ${rel#/}=backup-failed"; continue; }
+        if mv -n "$target" "$hidden" 2>/dev/null && [ ! -e "$target" ] && [ -f "$hidden" ]; then
+            X_OC_CHANGED=1; X_OC_SUM="$X_OC_SUM ${rel#/}=native-hidden"
+        else
+            X_OC_SUM="$X_OC_SUM ${rel#/}=hide-failed"
+        fi
+    done
+}
+# 仅 C17 + exact OPCameraPro 身份；未知原厂来源只记录，不作为安装门禁。
 xpan_op_compat() {
-    X_OC_DIR=${XPAN_TEST_OP_DIR:-/data/adb/modules/OPCameraPro}
+    X_OC_DIR=/data/adb/modules/OPCameraPro
+    if [ "${XPAN_TEST_MODE:-}" = 1 ] && [ -n "${XPAN_TEST_OP_DIR:-}" ]; then X_OC_DIR=$XPAN_TEST_OP_DIR; fi
     X_OC_FW=$X_OC_DIR/system/product/framework
     X_OC_SRC=$X_MOD/payload/op-compat
     X_OC_MAN=$X_OC_SRC/MANIFEST
     X_OC_STATE=${X_STATE:-/data/adb/xpan-runtime}
     X_OC_BACK=$X_OC_STATE/op-compat-backup
-    X_OC_SUM=
-    X_OC_CHANGED=0
+    X_OC_SUM=; X_OC_CHANGED=0; X_OC_MOUNTS=
     if [ "${XPAN_TEST_MODE:-}" = 1 ] && [ -n "${XPAN_TEST_ROM_RELEASE:-}" ]; then
-        X_OC_REL=$XPAN_TEST_ROM_RELEASE
+        X_OC_ROM_RELEASE=$XPAN_TEST_ROM_RELEASE
     else
-        X_OC_REL=$(xpan_bounded getprop ro.build.version.release 2>/dev/null) || X_OC_REL=
+        X_OC_ROM_RELEASE=$(xpan_bounded getprop ro.build.version.release 2>/dev/null) || X_OC_ROM_RELEASE=
     fi
-    case "$X_OC_REL" in
+    case "$X_OC_ROM_RELEASE" in
         17|17.*) ;;
-        *) xpan_log "op-compat: rom release '$X_OC_REL' is not C17; completion untouched"; return 0 ;;
+        *) xpan_log "op-compat: rom release '$X_OC_ROM_RELEASE' is not C17; completion untouched"; return 0 ;;
     esac
-    [ -f "$X_OC_DIR/module.prop" ] && [ ! -L "$X_OC_DIR/module.prop" ] || {
-        xpan_log 'op-compat: no OPCameraPro attached module; nothing to do'
-        return 0
+    xpan_safe_path "$X_OC_DIR/module.prop" && [ -f "$X_OC_DIR/module.prop" ] || {
+        xpan_log 'op-compat: no OPCameraPro attached module; nothing to do'; return 0;
     }
-    X_OC_ID=$(xpan_bounded sed -n 's/^id=//p' "$X_OC_DIR/module.prop" 2>/dev/null | head -n 1) || X_OC_ID=
-    [ "$X_OC_ID" = OPCameraPro ] || {
-        xpan_log 'op-compat: attached module identity mismatch; untouched'
-        return 0
+    [ "$(xpan_bounded grep -c '^id=' "$X_OC_DIR/module.prop")" = 1 ] &&
+        xpan_bounded grep -qx 'id=OPCameraPro' "$X_OC_DIR/module.prop" || {
+        xpan_log 'op-compat: attached module identity mismatch; untouched'; return 0;
     }
-    [ -d "$X_OC_FW" ] || {
-        xpan_log 'op-compat: attached module has no framework directory; untouched'
-        return 0
+    xpan_safe_path "$X_OC_STATE" && mkdir -p "$X_OC_STATE" 2>/dev/null || {
+        xpan_log 'op-compat: state unavailable; completion untouched'; return 0;
     }
-    # C16 filter LUTs must not shadow the C17 engine before any file work.
-    xpan_op_hide_c16_filters
-    # Bundled stock C17 files always win for their exact names.
-    if [ -f "$X_OC_MAN" ] && [ ! -L "$X_OC_MAN" ]; then
+    X_OC_MOUNTS=$(xpan_op_mounts) || X_OC_MOUNTS=
+    xpan_op_is_c16_completion && X_OC_SUM=' c16-sdk=present'
+    # 两个随包 C17 JAR 保持逐文件校验、备份，不增加 native SHA 门槛。
+    if xpan_safe_path "$X_OC_MAN" && [ -f "$X_OC_MAN" ]; then
         while IFS="$(printf '\t')" read -r X_OC_NAME X_OC_PIN; do
             [ -n "$X_OC_NAME" ] || continue
-            case "$X_OC_NAME" in */*|*..*) X_OC_SUM="$X_OC_SUM bundled-unsafe"; continue ;; esac
-            [ -n "$X_OC_PIN" ] || { X_OC_SUM="$X_OC_SUM $X_OC_NAME=manifest-invalid"; continue; }
-            X_OC_T=$X_OC_FW/$X_OC_NAME
-            X_OC_S=$X_OC_SRC/framework/$X_OC_NAME
-            if [ ! -f "$X_OC_T" ] || [ -L "$X_OC_T" ]; then
+            case "$X_OC_NAME" in com.oplus.camera.unit.sdk.jar|com.oplus.camera.unit.sdk.adapter.jar) ;;
+                *) X_OC_SUM="$X_OC_SUM bundled-unsafe"; continue ;;
+            esac
+            xpan_hash_valid "$X_OC_PIN" || { X_OC_SUM="$X_OC_SUM $X_OC_NAME=manifest-invalid"; continue; }
+            X_OC_T=$X_OC_FW/$X_OC_NAME; X_OC_S=$X_OC_SRC/framework/$X_OC_NAME
+            if ! xpan_safe_path "$X_OC_T" || [ ! -f "$X_OC_T" ]; then
                 X_OC_SUM="$X_OC_SUM $X_OC_NAME=absent"; continue
             fi
-            if ! xpan_hash "$X_OC_T"; then
-                X_OC_SUM="$X_OC_SUM $X_OC_NAME=unreadable"; continue
-            fi
-            if [ "$X_HASH" = "$X_OC_PIN" ]; then
-                X_OC_SUM="$X_OC_SUM $X_OC_NAME=current"; continue
-            fi
-            if [ ! -f "$X_OC_S" ] || [ -L "$X_OC_S" ] || ! xpan_hash "$X_OC_S" ||
-                [ "$X_HASH" != "$X_OC_PIN" ]; then
+            if ! xpan_hash "$X_OC_T"; then X_OC_SUM="$X_OC_SUM $X_OC_NAME=unreadable"; continue; fi
+            if [ "$X_HASH" = "$X_OC_PIN" ]; then X_OC_SUM="$X_OC_SUM $X_OC_NAME=current"; continue; fi
+            if ! xpan_hash "$X_OC_S" || [ "$X_HASH" != "$X_OC_PIN" ]; then
                 X_OC_SUM="$X_OC_SUM $X_OC_NAME=source-invalid"; continue
             fi
-            if ! xpan_op_backup "$X_OC_T" "$X_OC_NAME"; then
-                X_OC_SUM="$X_OC_SUM $X_OC_NAME=backup-failed"; continue
-            fi
+            if ! xpan_op_backup "$X_OC_T" "$X_OC_NAME"; then X_OC_SUM="$X_OC_SUM $X_OC_NAME=backup-failed"; continue; fi
             if ! xpan_op_put "$X_OC_S" "$X_OC_T" "$X_OC_PIN"; then
+                [ "${X_OP_WRITTEN:-0}" != 1 ] || X_OC_CHANGED=1
                 X_OC_SUM="$X_OC_SUM $X_OC_NAME=replace-failed"; continue
             fi
-            X_OC_CHANGED=1
-            X_OC_SUM="$X_OC_SUM $X_OC_NAME=replaced"
+            X_OC_CHANGED=1; X_OC_SUM="$X_OC_SUM $X_OC_NAME=replaced"
         done < "$X_OC_MAN"
     else
-        xpan_log 'op-compat: bundled C17 manifest missing; only mirror sync remains'
+        xpan_log 'op-compat: bundled C17 manifest missing; stock sync only'
     fi
-    # Every other completion file that mirrors a device path is compared with
-    # the live C17 stock: equal stays, different is backed up and synced.
-    for X_OC_TREE in product/framework odm/etc/camera; do
-        X_OC_BASE=$X_OC_DIR/system/$X_OC_TREE
-        [ -d "$X_OC_BASE" ] || continue
-        X_OC_LIST=$X_OC_STATE/op-compat.list
-        xpan_bounded find "$X_OC_BASE" -type f 2>/dev/null > "$X_OC_LIST" || continue
-        while IFS= read -r X_OC_T; do
-            [ -n "$X_OC_T" ] || continue
-            X_OC_REL=${X_OC_T#"$X_OC_DIR/system"}
-            case "$X_OC_REL" in /product/*|/odm/*) ;; *) continue ;; esac
-            X_OC_STOCK=$X_OC_REL
-            if [ "${XPAN_TEST_MODE:-}" = 1 ] && [ -n "${XPAN_TEST_STOCK_ROOT:-}" ]; then
-                X_OC_STOCK=$XPAN_TEST_STOCK_ROOT$X_OC_REL
-            fi
-            [ -f "$X_OC_STOCK" ] && [ ! -L "$X_OC_STOCK" ] || continue
-            xpan_hash "$X_OC_T" && X_OC_OH=$X_HASH || continue
-            xpan_hash "$X_OC_STOCK" && X_OC_SH=$X_HASH || continue
-            [ "$X_OC_OH" = "$X_OC_SH" ] && continue
-            X_OC_SUM="$X_OC_SUM ${X_OC_REL#/}=mirror-diff"
-            if ! xpan_op_backup "$X_OC_T" "mirror${X_OC_REL}"; then
-                X_OC_SUM="$X_OC_SUM backup-failed"; continue
-            fi
-            if ! xpan_op_put "$X_OC_STOCK" "$X_OC_T" "$X_OC_SH"; then
-                X_OC_SUM="$X_OC_SUM sync-failed"; continue
-            fi
-            X_OC_CHANGED=1
-            X_OC_SUM="$X_OC_SUM synced"
-        done < "$X_OC_LIST"
-        rm -f "$X_OC_LIST" 2>/dev/null
-    done
-    xpan_write "$X_OC_STATE/op.compat" "compat_version=2
+    # 已是 C17 JAR 也处理遗留 native 和 v2.0 隐藏素材。
+    xpan_op_native
+    xpan_op_hide_c16_filters
+    xpan_write "$X_OC_STATE/op.compat" "compat_version=3
 boot_id=${X_BOOT_ID:-unknown}
-rom_release=$X_OC_REL
+rom_release=$X_OC_ROM_RELEASE
 detail=$X_OC_SUM
 changed=$X_OC_CHANGED" 2>/dev/null || true
     if [ "$X_OC_CHANGED" = 1 ]; then
-        xpan_log "op-compat: C17 completion written:$X_OC_SUM; reboot makes it effective"
+        xpan_log "op-compat: C17 completion written:$X_OC_SUM; reboot makes it effective; filters not device-verified"
     else
         xpan_log "op-compat: no change:$X_OC_SUM"
     fi
@@ -1248,10 +1438,22 @@ changed=$X_OC_CHANGED" 2>/dev/null || true
 }
 
 xpan_install() {
-    xpan_lock || { xpan_log 'install lock busy'; return 1; }
-    # A rejected orig-only update must NOT dismantle already existing mounts.
+    local X_COMPAT_REBOOT X_PREVIOUS_REBOOT X_REBOOT_PATH
+    xpan_lock || { xpan_log '安装锁被旧任务占用，未并发修改模块'; return 1; }
+    X_PREVIOUS_REBOOT=0
+    for X_REBOOT_PATH in "$X_MOD/.xpan-reboot-required" "$X_ACTIVE/.xpan-reboot-required"; do
+        if xpan_read "$X_REBOOT_PATH" && xpan_uuid "$X_VALUE" && [ "$X_VALUE" = "$X_BOOT_ID" ]; then
+            X_PREVIOUS_REBOOT=1
+        fi
+    done
+    xpan_markers && xpan_install_cleanup || { xpan_unlock; return 1; }
+    xpan_op_compat || true
+    X_COMPAT_REBOOT=${X_OC_CHANGED:-0}
+    # 补全是否待重启是本次启动的事实；后续安装失败也不能丢失这个标记。
+    if [ "$X_COMPAT_REBOOT" = 1 ] || [ "$X_PREVIOUS_REBOOT" = 1 ]; then
+        xpan_write "$X_MOD/.xpan-reboot-required" "$X_BOOT_ID" || { xpan_unlock; return 1; }
+    fi
     xpan_prepare || { xpan_unlock; return 1; }
-    xpan_inactive || { xpan_unlock; return 1; }
     xpan_safe_path "$X_MOD/lifecycle.sh" && [ -f "$X_MOD/lifecycle.sh" ] || { xpan_unlock; return 1; }
     xpan_life_unlock
     X_INSTALL_RC=0
@@ -1260,13 +1462,20 @@ xpan_install() {
     else
         sh "$X_MOD/lifecycle.sh" install "$X_MOD" || X_INSTALL_RC=1
     fi
-    xpan_life_lock || { xpan_unlock; return 1; }
-    [ "$X_INSTALL_RC" = 0 ] && xpan_markers && xpan_tokens && xpan_qualify &&
-        xpan_receipt && xpan_current originals && xpan_apk && xpan_parent_commit || { xpan_unlock; return 1; }
+    xpan_life_lock || { xpan_log 'APK 阶段后无法重新取得安装锁'; xpan_unlock; return 1; }
+    if [ "$X_INSTALL_RC" != 0 ]; then
+        xpan_unlock
+        return 1
+    fi
+    xpan_markers && xpan_tokens && xpan_qualify install && xpan_receipt && xpan_current originals &&
+        xpan_apk && xpan_parent_commit || { xpan_log 'APK 已安装但安装状态登记失败，未启用挂载'; xpan_unlock; return 1; }
+    if [ "$X_INSTALL_REBOOT" = 1 ] || [ "$X_COMPAT_REBOOT" = 1 ] || [ "$X_PREVIOUS_REBOOT" = 1 ]; then
+        xpan_write "$X_MOD/.xpan-reboot-required" "$X_BOOT_ID" || { xpan_unlock; return 1; }
+        xpan_log '补全已更新，重启手机后生效；新 APK 与实例已登记，当前保持未启用'
+    fi
     xpan_safe_path "$X_MOD/payload/parent.inputs" && rm -f "$X_MOD/payload/parent.inputs" || { xpan_unlock; return 1; }
     xpan_unlock
-    xpan_op_compat || true
-    xpan_log 'strict APK phase complete; configs remain unmounted/inactive until qualified service tick; select LSPosed manually'
+    xpan_log '安装迁移完成；配置由服务按真实 SDK 检查后启用，LSPosed 作用域保持用户设置'
 }
 xpan_main() {
     [ "$#" = 2 ] || return 1
@@ -1319,6 +1528,12 @@ xpan_main() {
             xpan_lock || return 1
             xpan_worker_bind || { xpan_unlock; return 1; }
             X_TOKEN=$X_WORKER_TOKEN
+            xpan_op_compat || true
+            if [ "${X_OC_CHANGED:-0}" = 1 ]; then
+                xpan_write "$X_MOD/.xpan-reboot-required" "$X_BOOT_ID" || { xpan_unlock; return 1; }
+                xpan_inactive || { xpan_unlock; return 1; }
+                xpan_log '补全已更新，重启手机后生效；本次启动保持未启用'
+            fi
             xpan_parent_start || { xpan_inactive; xpan_unlock; return 1; }
             X_PARENT_SEALED_HASH=$X_PARENT_HASH
             X_PARENT_SEALED_INODE=$X_PARENT_INODE
@@ -1326,7 +1541,6 @@ xpan_main() {
             xpan_unlock
             # Long-lived functions survive removal of MODPATH and can clean only
             # this bound instance while its lifecycle authority remains current.
-            xpan_op_compat || true
             while :; do
                 X_SERVICE_RC=0
                 xpan_tick || X_SERVICE_RC=$?

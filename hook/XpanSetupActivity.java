@@ -24,7 +24,7 @@ public final class XpanSetupActivity extends Activity {
     private static final String STATE_TEXT =
             "启用、作用域及 Hook 注入状态：未验证。配套模块安装状态：未知。";
     private static final String GUIDE_TEXT =
-            "1. v2.0 模块与 Hook APK 必须配套使用。单独装 APK 不能替代模块。\n\n"
+            "1. v2.1 模块与 Hook APK 必须配套使用。单独装 APK 不能替代模块。\n\n"
             + "2. 在 LSPosed 中手动启用 XPanForAce3Pro，作用域仅勾选 com.oplus.camera（系统相机）。\n\n"
             + "3. 打开系统相机，进入 XPAN，再检查实际效果。\n\n"
             + "目标：8192×3024，仅 1×，XDR 上限至少 8×。\n\n"
@@ -33,7 +33,7 @@ public final class XpanSetupActivity extends Activity {
             + "注意：此页只是指南，不是激活或效果检测；查看步骤不代表完成设置。未知版本不作兼容承诺，"
             + "实际画幅及硬件/实拍 XDR 效果需在对应设备上实机验收。";
     private static final String MANUAL_STEPS =
-            "1. 自行确认安装的是配套的 v2.0 模块与 Hook APK。\n\n"
+            "1. 自行确认安装的是配套的 v2.1 模块与 Hook APK。\n\n"
             + "2. 自行打开 LSPosed 管理器，在模块列表找到 XPanForAce3Pro，手动启用。\n\n"
             + "3. 在作用域中仅勾选 com.oplus.camera（系统相机），在管理器中核对后进入相机的 XPAN。\n\n"
             + "界面不同请按所用管理器的官方说明操作。本页不自动安装、重启或修改 LSPosed 设置。";

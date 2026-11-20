@@ -16,7 +16,7 @@ xpan_abort() {
     exit 1
 }
 
-say "XpanAce3Pro v2.0 安装程序"
+say "XpanAce3Pro v2.1 安装程序"
 say "一加 Ace 3 Pro 哈苏 X-Pan 模块"
 
 step "检查模块文件"
@@ -49,15 +49,33 @@ esac
 say "  机型 PJX110，相机 $CAMERA_VER"
 
 step "校验本机配置与 SDK，并安装配套 Hook APK"
+say "  自动清理旧模块残留，并迁移配套 APK"
 INSTALL_OUT=$MODPATH/.install-step.log
-if sh "$MODPATH/runtime.sh" install "$MODPATH" > "$INSTALL_OUT" 2>&1; then
-    :
-else
+INSTALL_LOG=/data/local/tmp/xpan_install.log
+[ "${XPAN_TEST_MODE:-}" != 1 ] || INSTALL_LOG=$XPAN_TEST_ROOT/install.log
+INSTALL_RC=0
+sh "$MODPATH/runtime.sh" install "$MODPATH" > "$INSTALL_OUT" 2>&1 || INSTALL_RC=$?
+while IFS= read -r INSTALL_LINE || [ -n "$INSTALL_LINE" ]; do
+    printf '%s\n' "$INSTALL_LINE" >> "$INSTALL_LOG"
+done < "$INSTALL_OUT"
+if [ "$INSTALL_RC" != 0 ]; then
+    INSTALL_REASON=
+    while IFS= read -r INSTALL_LINE || [ -n "$INSTALL_LINE" ]; do
+        case "$INSTALL_LINE" in
+            'xpan install: '*) INSTALL_REASON=${INSTALL_LINE#xpan install: } ;;
+            'xpan runtime: op-compat:'*|'xpan runtime: 已自动清理'*|'xpan runtime: OPCameraPro 的 C16 SDK'*) ;;
+            'xpan runtime: '*) [ -n "$INSTALL_REASON" ] || INSTALL_REASON=${INSTALL_LINE#xpan runtime: } ;;
+        esac
+    done < "$INSTALL_OUT"
     rm -f "$INSTALL_OUT"
-    xpan_abort "本机配置或 SDK 校验未通过；详细原因见 /data/local/tmp/xpan_install.log"
+    xpan_abort "${INSTALL_REASON:-安装迁移未完成}；详细日志：$INSTALL_LOG"
 fi
 rm -f "$INSTALL_OUT"
-say "  配置与 SDK 校验通过"
+if [ -s "$MODPATH/.xpan-reboot-required" ]; then
+    say "  补全已更新，重启手机后生效"
+else
+    say "  配置与 SDK 校验通过，配套 APK 已安装"
+fi
 
 step "核对安装结果"
 [ -s "$MODPATH/.xpan-instance" ] || xpan_abort "安装实例编号未生成"
@@ -68,8 +86,12 @@ step "完成"
 say ""
 say "接下来两步："
 say "  1. 打开 LSPosed，勾选 XpanAce3Pro，作用域选“相机”"
-say "  2. 重启相机（不是重启手机）"
+if [ -s "$MODPATH/.xpan-reboot-required" ]; then
+    say "  2. 重启手机，使兼容补全与旧挂载清理生效"
+else
+    say "  2. 重启相机（不是重启手机）"
+fi
 say ""
 say "提示：若检测到 OPCameraPro 附件模块，本模块会自动换用兼容 C17 的补全文件，"
-say "      并隐去其 C16 滤镜素材；都需重启手机后生效，原文件会自动备份。"
-say "      卸载本模块会清理本模块的 Hook APK。"
+say "      让本机 C17 滤镜库与同名素材优先，保留 OP 增量；需重启手机后生效。"
+say "      被替换文件会自动备份，卸载本模块会清理本模块的 Hook APK。"

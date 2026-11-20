@@ -71,8 +71,8 @@ class SetupActivitySourceTests(unittest.TestCase):
     def test_manifest_launches_only_the_guide_and_retains_module_identity(self):
         manifest = ET.parse(ROOT / "hook/AndroidManifest.xml").getroot()
         self.assertEqual(manifest.get("package"), "com.xpanport.hook")
-        self.assertEqual(manifest.get(NS + "versionCode"), "20")
-        self.assertEqual(manifest.get(NS + "versionName"), "2.0")
+        self.assertEqual(manifest.get(NS + "versionCode"), "21")
+        self.assertEqual(manifest.get(NS + "versionName"), "2.1")
         self.assertEqual(manifest.find("uses-sdk").get(NS + "minSdkVersion"), "24")
         app = manifest.find("application")
         self.assertEqual(app.get(NS + "label"), "XPanForAce3Pro")
@@ -343,7 +343,7 @@ public final class SetupActivityHarness {
     check(app.packageManager.calls == 1 && app.packageManager.lastFlags == 0
         && "com.oplus.camera".equals(app.packageManager.lastPackage), "Wrong package query");
     unverified(app);
-    for (String text : new String[]{"PJX110", "未知", "7.x", "v2.0", "模块", "APK", "配套",
+    for (String text : new String[]{"PJX110", "未知", "7.x", "v2.1", "模块", "APK", "配套",
         "LSPosed", "com.oplus.camera", "XPAN", "C16", "C17", "6.020.876", "7.013.51",
         "ROM", "配置", "SDK", "adapter", "校验", "8192×3024", "1×", "8×", "目标", "指南", "实机"})
       contains(visible(app), text);

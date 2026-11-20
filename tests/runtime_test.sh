@@ -63,6 +63,8 @@ fixture() {
     printf 'mnt:[4026531841]\n' > "$XPAN_TEST_ROOT/ns"
     printf 'fixture signed APK bytes\n' > "$ACTIVE/payload/XpanHook.apk"
     cp "$ACTIVE/payload/XpanHook.apk" "$XPAN_TEST_ROOT/data/app/fixture/com.xpanport.hook/base.apk"
+    printf '17\n' > "$XPAN_TEST_ROOT/props/ro.build.version.release"
+    unset XPAN_TEST_OP_DIR XPAN_TEST_ROM_RELEASE XPAN_TEST_STOCK_ROOT
     printf 'PJX110\n' > "$XPAN_TEST_ROOT/props/ro.product.model"
     grep '^build_fingerprint=' "$ACTIVE/payload/profiles/$PROFILE/profile.props" | cut -d= -f2- > "$XPAN_TEST_ROOT/props/ro.build.fingerprint"
     grep '^camera_version=' "$ACTIVE/payload/profiles/$PROFILE/profile.props" | cut -d= -f2- > "$XPAN_TEST_ROOT/camera-version"
@@ -137,7 +139,7 @@ case "$CMD" in
     sha256sum)
         [ ! -f "$R/hash-fail" ] || exit 1
         case "${1:-}" in
-            */framework/com.oplus.camera.unit.sdk.jar|*/framework/com.oplus.camera.unit.sdk.adapter.jar)
+            *com.oplus.camera.unit.sdk.jar|*com.oplus.camera.unit.sdk.adapter.jar|*com.oplus.camera.unit.sdk.jar.xpan-compat.*|*com.oplus.camera.unit.sdk.adapter.jar.xpan-compat.*)
                 case "$(cat "$1")" in
                     c16-sdk) H=37a13d408f7ee95b8e954c2ef11c44a0aee433da45958cc7ddb80c688e0692c6 ;;
                     c16-adapter) H=ac0b595faae8d3f684aa457f223fbfb0f167f0d0e0cc461ef08dbbe52d6e61cf ;;
@@ -279,16 +281,12 @@ ok() {
 generic_parent() {
     printf '90 1 0:136 / %s rw,relatime shared:76 - overlay KSU\\040 ro,seclabel,lowerdir=/mnt/vendor/u3ve5haz7/odm/etc:/odm/etc\n' "$XPAN_TEST_ROOT" >> "$XPAN_TEST_ROOT/mountinfo"
 }
-generic_approval() {
-    # Explicit fixture opt-in, observed independently of runtime installation.
+parent_observation() {
     /usr/bin/sh -c '
         . "$1" || exit 1
         xpan_parent_observe "$2/mountinfo" "$2/stock" "$2" / || exit 1
-        [ "$XP_PARENT_KIND" = ksu ] || exit 1
-        printf "parent_approval_version=1\nboot_id=%s\nnamespace=%s\ncurrent_token=%s\nparent_mount_sha256=%s\nparent_inode=%s\n" \
-            "$(cat "$2/boot-id")" "$(cat "$2/ns")" \
-            "$(cat "$2/data/adb/xpan-lifecycle/current.token")" "$XP_PARENT_HASH" "$XP_PARENT_INODE"
-    ' sh "$ACTIVE/parent-context.sh" "$XPAN_TEST_ROOT" > "$ACTIVE/payload/parent.approval" || fail 'cannot observe generic approval fixture'
+        printf "parent_mount_sha256=%s\nparent_inode=%s\n" "$XP_PARENT_HASH" "$XP_PARENT_INODE"
+    ' sh "$ACTIVE/parent-context.sh" "$XPAN_TEST_ROOT" > "$XPAN_TEST_ROOT/parent.observed" || fail 'cannot observe fixture parent'
 }
 field() { /usr/bin/awk -v k="$2" 'index($0,k "=")==1 {print substr($0,length(k)+2)}' "$1"; }
 keys() {
@@ -305,7 +303,7 @@ parent_protocol() {
         [ "$(field "$STATE/parent.context" boot_id)" = "$(<"$XPAN_TEST_ROOT/boot-id")" ] &&
         [ "$(field "$STATE/parent.context" namespace)" = "$(<"$XPAN_TEST_ROOT/ns")" ] &&
         [ "$(field "$STATE/parent.context" token)" = "$(<"$XPAN_TEST_ROOT/uuid.source")" ] &&
-        [ "$(field "$STATE/parent.context" parent_mount_sha256)" = "$(field "$ACTIVE/payload/parent.approval" parent_mount_sha256)" ] &&
+        [ "$(field "$STATE/parent.context" parent_mount_sha256)" = "$(field "$XPAN_TEST_ROOT/parent.observed" parent_mount_sha256)" ] &&
         [ "$(field "$STATE/parent.context" parent_inode)" = "$(/usr/bin/stat -Lc '%d:%i' "$XPAN_TEST_ROOT/stock")" ] || fail 'bad parent pin binding'
     for role in unit feature vendor; do
         keys "$STATE/$role.mount" 'ownership_version boot_id namespace target mount_sha256 inode token parent_mount_sha256 parent_inode'
@@ -336,6 +334,19 @@ foreign() {
     mv "$XPAN_TEST_ROOT/stock/$name" "$XPAN_TEST_ROOT/originals/live.$name"
     ln "$XPAN_TEST_ROOT/foreign.$name" "$XPAN_TEST_ROOT/stock/$name"
     printf '900 1 0:900 %s %s rw - mock foreign rw\n' "$XPAN_TEST_ROOT/foreign.$name" "$XPAN_TEST_ROOT/stock/$name" >> "$XPAN_TEST_ROOT/mountinfo"
+}
+op_fixture() {
+    export XPAN_TEST_OP_DIR=$XPAN_TEST_ROOT/data/adb/modules/OPCameraPro
+    export XPAN_TEST_STOCK_ROOT=$XPAN_TEST_ROOT
+    mkdir -p "$XPAN_TEST_OP_DIR/system/product/framework" "$ACTIVE/payload/op-compat/framework"
+    printf 'id=OPCameraPro\nversion=fixture\n' > "$XPAN_TEST_OP_DIR/module.prop"
+    printf 'c16-sdk\n' > "$XPAN_TEST_OP_DIR/system/product/framework/com.oplus.camera.unit.sdk.jar"
+    printf 'c16-adapter\n' > "$XPAN_TEST_OP_DIR/system/product/framework/com.oplus.camera.unit.sdk.adapter.jar"
+    printf 'c17-sdk\n' > "$ACTIVE/payload/op-compat/framework/com.oplus.camera.unit.sdk.jar"
+    printf 'c17-adapter\n' > "$ACTIVE/payload/op-compat/framework/com.oplus.camera.unit.sdk.adapter.jar"
+    printf 'com.oplus.camera.unit.sdk.jar\td2b20133252414e26ac7c68255c76fa61cf41826c3b63d423a14c1187af42899\ncom.oplus.camera.unit.sdk.adapter.jar\t7418d59955746d8aca56438a5e0e26e1f08ff6ae4d0cacc22057d0041b12aac4\n' > "$ACTIVE/payload/op-compat/MANIFEST"
+    printf 'c16-sdk\n' > "$XPAN_TEST_ROOT/product/framework/com.oplus.camera.unit.sdk.jar"
+    printf 'c16-adapter\n' > "$XPAN_TEST_ROOT/product/framework/com.oplus.camera.unit.sdk.adapter.jar"
 }
 worker_script() {
     # Source trusted project functions into this local fixture only, without its CLI.
@@ -407,27 +418,27 @@ parent_scenarios() {
 
     fixture
     generic_parent
-    run install; expect 1; off; no_mounts; no_mutation; no_pm_install
-    [ ! -e "$STATE/parent.context" ] || fail 'generic install created pin without approval'
-    [ "$(<"$ACTIVE/.xpan-instance")" != "$(<"$XPAN_TEST_ROOT/uuid.source")" ] || fail 'unapproved install rotated token'
-    ok 'generic install without explicit parent approval rejects before PM'
+    rm "$ACTIVE/.xpan-instance" "$ACTIVE/.xpan-apk-identity" "$LIFE/current.token"
+    run install; expect 0; off; no_mounts; no_mutation
+    [ -f "$STATE/parent.context" ] || fail 'fresh KSU install did not register parent'
+    [ "$(<"$ACTIVE/.xpan-instance")" = "$(<"$XPAN_TEST_ROOT/uuid.source")" ] || fail 'fresh KSU install did not generate instance'
+    [ ! -e "$ACTIVE/payload/parent.approval" ] || fail 'fresh KSU install introduced manual approval'
+    ok 'normal fresh KSU install observes parent automatically without existing token or approval'
 
     fixture
     generic_parent
-    generic_approval
-    keys "$ACTIVE/payload/parent.approval" 'parent_approval_version boot_id namespace current_token parent_mount_sha256 parent_inode'
+    parent_observation
     PARENT_ROW=$(/usr/bin/awk -v p="$XPAN_TEST_ROOT" '$5==p {print}' "$XPAN_TEST_ROOT/mountinfo")
     run install; expect 0; off; no_mounts; no_mutation
     grep -q '^pm install -r ' "$XPAN_TEST_ROOT/commands" || fail 'generic install skipped strict APK lifecycle'
-    [ "$(<"$ACTIVE/.xpan-instance")" = "$(<"$XPAN_TEST_ROOT/uuid.source")" ] &&
-        [ "$(field "$ACTIVE/payload/parent.approval" current_token)" != "$(<"$ACTIVE/.xpan-instance")" ] || fail 'parent pin did not bind a new instance'
+    [ "$(<"$ACTIVE/.xpan-instance")" = "$(<"$XPAN_TEST_ROOT/uuid.source")" ] || fail 'parent did not bind a new instance'
     : > "$XPAN_TEST_ROOT/commands"
     run; expect 0; on; no_pm_install
     parent_protocol
     BEFORE=$(hash "$XPAN_TEST_ROOT/mountinfo")
     PIN_BEFORE=$(hash "$STATE/parent.context")
     journals_save
-    rm "$ACTIVE/payload/parent.approval"
+    [ ! -e "$ACTIVE/payload/parent.approval" ] || fail 'manual parent approval unexpectedly created'
     : > "$XPAN_TEST_ROOT/commands"
     run; expect 0; on; no_mutation; no_pm_install
     ! grep -q '^setprop debug.xpan.active 0' "$XPAN_TEST_ROOT/commands" || fail 'generic healthy tick flickered readiness'
@@ -437,12 +448,12 @@ parent_scenarios() {
     parent_preserved
     [ "$(hash "$STATE/parent.context")" = "$PIN_BEFORE" ] || fail 'stop replaced parent pin'
     for role in unit feature vendor; do [ ! -e "$STATE/$role.mount" ] || fail 'stop retained owned v2 journal'; done
-    ok 'approved generic install binds new pin, v2 tick is healthy, stop preserves parent'
+    ok 'automatic KSU install binds new parent, v2 tick is healthy, stop preserves parent'
 
     for fault in exact-config duplicate deeper writable unknown; do
         fixture
         generic_parent
-        generic_approval
+        parent_observation
         case "$fault" in
             exact-config) printf '99 90 0:99 / %s rw - mock foreign rw\n' "$XPAN_TEST_ROOT/stock" >> "$XPAN_TEST_ROOT/mountinfo" ;;
             duplicate) generic_parent ;;
@@ -457,10 +468,73 @@ parent_scenarios() {
         ok "generic $fault parent rejects installation before PM or bind mutation"
     done
 
+    for mode in boot service install; do
+        fixture
+        generic_parent
+        run install; expect 0
+        run; expect 0; on
+        for name in camera_unit_config camera_unit_feature_config.protobuf oplus_camera_config; do
+            "$XPAN_TEST_ROOT/bin/umount" "$XPAN_TEST_ROOT/stock/$name"
+        done
+        printf '12345678-1234-4234-8234-000000000007\n' > "$XPAN_TEST_ROOT/boot-id"
+        printf 'mnt:[4026531999]\n' > "$XPAN_TEST_ROOT/ns"
+        /usr/bin/awk -v p="$XPAN_TEST_ROOT" '$5==p {$1=91} {print}' "$XPAN_TEST_ROOT/mountinfo" > "$XPAN_TEST_ROOT/mountinfo.new"
+        mv "$XPAN_TEST_ROOT/mountinfo.new" "$XPAN_TEST_ROOT/mountinfo"
+        : > "$XPAN_TEST_ROOT/commands"
+        case "$mode" in
+            boot) run boot; expect 0; off; no_mounts; no_pm_install; run; expect 0; on ;;
+            service)
+                worker_script 'xpan_lock || exit 1
+xpan_parent_start || exit 1
+xpan_unlock
+xpan_tick || exit 1
+exit 0'
+                expect 0; on; no_pm_install ;;
+            install)
+                printf '12345678-1234-4234-8234-000000000008\n' > "$XPAN_TEST_ROOT/uuid.source"
+                run install; expect 0; off; no_mounts
+                run; expect 0; on ;;
+        esac
+        [ "$(field "$STATE/parent.context" boot_id)" = "$(<"$XPAN_TEST_ROOT/boot-id")" ] &&
+            [ "$(field "$STATE/parent.context" namespace)" = "$(<"$XPAN_TEST_ROOT/ns")" ] || fail 'parent did not refresh current boot/namespace'
+        ! grep -q '^umount ' "$XPAN_TEST_ROOT/commands" || fail 'stale boot journal authorized a current unmount'
+        ok "KSU cross-boot $mode automatically refreshes parent without manual approval"
+    done
+
+    fixture
+    generic_parent
+    run install; expect 0
+    run; expect 0; on
+    mkdir -p "$STATE/op-compat-backup" "${STAGED%/*}"
+    printf 'old compat backup\n' > "$STATE/op-compat-backup/keep"
+    cp -R "$ACTIVE" "$STAGED"
+    printf '12345678-1234-4234-8234-000000000008\n' > "$XPAN_TEST_ROOT/uuid.source"
+    RC=0
+    /usr/bin/sh "$SUITE/module/runtime.sh" install "$STAGED" > "$XPAN_TEST_ROOT/stdout" 2>&1 || RC=$?
+    expect 0; off; no_mounts
+    [ "$(<"$STAGED/.xpan-instance")" = "$(<"$LIFE/current.token")" ] || fail 'staged token not current'
+    [ "$(<"$ACTIVE/.xpan-instance")" != "$(<"$STAGED/.xpan-instance")" ] || fail 'old active instance overwritten'
+    grep -qx 'old compat backup' "$STATE/op-compat-backup/keep" || fail 'compat backup lost during migration'
+    rm -rf "$ACTIVE"
+    mv "$STAGED" "$ACTIVE"
+    run; expect 0; on
+    ok 'staged replacement automatically cleans only old owned mounts and keeps new bundle/compat backup'
+
+    fixture
+    generic_parent
+    : > "$XPAN_TEST_ROOT/install-fail"
+    run install; expect 1; off; no_mounts
+    [ ! -e "$STATE/parent.context" ] || fail 'failed PM transaction published parent'
+    rm "$XPAN_TEST_ROOT/install-fail"
+    printf '12345678-1234-4234-8234-000000000008\n' > "$XPAN_TEST_ROOT/uuid.source"
+    run install; expect 0; off; no_mounts
+    run; expect 0; on
+    ok 'retry after failed PM token rotation recovers without parent approval deadlock'
+
     for fault in corrupt symlink missing; do
         fixture
         generic_parent
-        generic_approval
+        parent_observation
         run install; expect 0
         run; expect 0; on
         journals_save
@@ -482,7 +556,7 @@ parent_scenarios() {
     for fault in mount-id stock-inode; do
         fixture
         generic_parent
-        generic_approval
+        parent_observation
         run install; expect 0
         run; expect 0; on
         journals_save
@@ -502,7 +576,7 @@ parent_scenarios() {
 
     fixture
     generic_parent
-    generic_approval
+    parent_observation
     run install; expect 0
     run; expect 0; on
     for role in unit feature vendor; do
@@ -534,7 +608,7 @@ parent_scenarios() {
     for fault in mount publish pm; do
         fixture
         generic_parent
-        generic_approval
+        parent_observation
         if [ "$fault" = pm ]; then
             : > "$XPAN_TEST_ROOT/parent-drift.pm"
             run install; expect 1; off; no_mounts; no_mutation
@@ -761,12 +835,103 @@ ok 'unmount failure retains ownership for next inactive retry'
 fixture
 run; expect 0; on
 : > "$XPAN_TEST_ROOT/commands"
-run_customize; expect 1; on; no_mutation; no_pm_install
-ok 'orig-only customization refuses active output, preserves existing mounts and APK'
+run_customize; expect 0; off; no_mounts
+[ "$(grep -c '^umount ' "$XPAN_TEST_ROOT/commands")" = 3 ] || fail 'installer did not retract three old owned binds'
+[ "$(<"$ACTIVE/.xpan-instance")" = "$(<"$XPAN_TEST_ROOT/uuid.source")" ] || fail 'reinstall did not rotate old instance'
+run; expect 0; on
+ok 'customize automatically retracts only old Xpan owned mounts and installs fresh instance'
 fixture
 foreign camera_unit_config "$ACTIVE/payload/profiles/c17/camera_unit_config"
 run_customize; expect 1; no_mutation; no_pm_install
 ok 'customize rejects foreign output rather than relaxing unchanged lifecycle originals'
+
+fixture
+op_fixture
+run_customize; expect 0; off; no_mounts
+[ -s "$ACTIVE/.xpan-reboot-required" ] || fail 'pending SDK install did not register reboot'
+grep -Fq '补全已更新，重启手机后生效' "$XPAN_TEST_ROOT/stdout" || fail 'pending install did not explain reboot'
+grep -qx c17-sdk "$XPAN_TEST_OP_DIR/system/product/framework/com.oplus.camera.unit.sdk.jar" || fail 'compat helper not called before SDK qualification'
+grep -qx c16-sdk "$STATE/op-compat-backup/com.oplus.camera.unit.sdk.jar" || fail 'old OP SDK backup not retained'
+[ -s "$ACTIVE/.xpan-apk-identity" ] || fail 'pending install did not verify APK'
+run; expect 1; off; no_mounts; no_mutation
+printf '12345678-1234-4234-8234-000000000007\n' > "$XPAN_TEST_ROOT/boot-id"
+printf 'mnt:[4026531999]\n' > "$XPAN_TEST_ROOT/ns"
+cp "$XPAN_TEST_OP_DIR/system/product/framework/"*.jar "$XPAN_TEST_ROOT/product/framework/"
+run boot; expect 0; off; no_mounts
+run; expect 0; on
+ok 'OP C16 mounted SDK installs APK as pending reboot, real C17 SDK required before activation'
+
+for mode in active staged old-boot; do
+    fixture
+    op_fixture
+    run install; expect 0; off; no_mounts
+    cp "$XPAN_TEST_OP_DIR/system/product/framework/"*.jar "$XPAN_TEST_ROOT/product/framework/"
+    printf '12345678-1234-4234-8234-000000000008\n' > "$XPAN_TEST_ROOT/uuid.source"
+    case "$mode" in
+        active) TARGET=$ACTIVE ;;
+        staged)
+            mkdir -p "${STAGED%/*}"
+            cp -R "$ACTIVE" "$STAGED"
+            rm "$STAGED/.xpan-reboot-required"
+            TARGET=$STAGED ;;
+        old-boot)
+            printf '12345678-1234-4234-8234-000000000007\n' > "$XPAN_TEST_ROOT/boot-id"
+            TARGET=$ACTIVE ;;
+    esac
+    RC=0
+    /usr/bin/sh "$SUITE/module/runtime.sh" install "$TARGET" > "$XPAN_TEST_ROOT/stdout" 2>&1 || RC=$?
+    expect 0; off; no_mounts
+    if [ "$mode" = old-boot ]; then
+        [ ! -e "$TARGET/.xpan-reboot-required" ] || fail 'past reboot marker survived successful current SDK install'
+    else
+        [ "$(<"$TARGET/.xpan-reboot-required")" = "$(<"$XPAN_TEST_ROOT/boot-id")" ] || fail 'same-boot reinstall lost pending state'
+    fi
+    if [ "$mode" = staged ]; then rm -rf "$ACTIVE"; mv "$STAGED" "$ACTIVE"; fi
+    : > "$XPAN_TEST_ROOT/commands"
+    run
+    if [ "$mode" = old-boot ]; then expect 0; on; else expect 1; off; no_mounts; fi
+    ok "$mode reinstall retains only current-boot pending state without reintroducing manual approval"
+done
+
+fixture
+op_fixture
+cp "$XPAN_TEST_OP_DIR/system/product/framework/"*.jar "$XPAN_TEST_ROOT/product/framework/"
+SERVICE_CASE=$XPAN_TEST_ROOT/service-case.sh
+/usr/bin/grep -v '^xpan_main "\$@"$' "$SUITE/module/runtime.sh" > "$SERVICE_CASE"
+printf '\nsleep() { exit 0; }\nxpan_main service "$XPAN_TEST_ROOT/data/adb/modules/XpanAce3Pro"\n' >> "$SERVICE_CASE"
+RC=0
+/usr/bin/sh "$SERVICE_CASE" > "$XPAN_TEST_ROOT/stdout" 2>&1 || RC=$?
+expect 0; off; no_mounts
+[ "$(<"$ACTIVE/.xpan-reboot-required")" = "$(<"$XPAN_TEST_ROOT/boot-id")" ] || fail 'service helper changes did not arm pending reboot'
+no_pm_install
+ok 'service compatibility update under both locks arms reboot marker before any activation'
+
+for fault in no-source unknown-sdk source-corrupt; do
+    fixture
+    op_fixture
+    case "$fault" in
+        no-source) rm "$ACTIVE/payload/op-compat/framework/com.oplus.camera.unit.sdk.jar" ;;
+        unknown-sdk) printf 'unknown-sdk\n' > "$XPAN_TEST_ROOT/product/framework/com.oplus.camera.unit.sdk.jar" ;;
+        source-corrupt) printf 'unapproved C17\n' > "$ACTIVE/payload/op-compat/framework/com.oplus.camera.unit.sdk.adapter.jar" ;;
+    esac
+    run_customize; expect 1; off; no_mounts; no_pm_install
+    [ "$(<"$ACTIVE/.xpan-reboot-required")" = "$(<"$XPAN_TEST_ROOT/boot-id")" ] || fail 'partial compatibility update lost reboot fact after rejected SDK install'
+    ok "OP $fault cannot bypass actual SDK contract; partial update keeps pending reboot"
+done
+
+# 补全已写入后的安装失败，不得在同一次启动的重试中丢失待重启事实。
+fixture
+op_fixture
+: > "$XPAN_TEST_ROOT/install-fail"
+run install; expect 1; off; no_mounts
+[ "$(<"$ACTIVE/.xpan-reboot-required")" = "$(<"$XPAN_TEST_ROOT/boot-id")" ] || fail 'PM failure lost compatibility reboot marker'
+cp "$XPAN_TEST_OP_DIR/system/product/framework/"*.jar "$XPAN_TEST_ROOT/product/framework/"
+rm "$XPAN_TEST_ROOT/install-fail"
+printf '12345678-1234-4234-8234-000000000008\n' > "$XPAN_TEST_ROOT/uuid.source"
+run install; expect 0; off; no_mounts
+[ "$(<"$ACTIVE/.xpan-reboot-required")" = "$(<"$XPAN_TEST_ROOT/boot-id")" ] || fail 'PM retry lost current-boot pending compatibility'
+run; expect 1; off; no_mounts
+ok 'failed PM after compatibility update retains reboot marker across same-boot retry'
 
 # Joint runtime/lifecycle fixture stays inside the project test root.
 fixture

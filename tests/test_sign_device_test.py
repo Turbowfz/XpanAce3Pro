@@ -73,7 +73,7 @@ keytool -genkeypair --alias unused-placeholder
 "$BT/apksigner.bat" verify --verbose out/XpanHook.apk
 '''
 VERIFY = "Verifies\nNumber of signers: 1\nSigner #1 certificate SHA-256 digest: " + sdt.CERTIFICATE + "\n"
-BADGING = "package: name='com.xpanport.hook' versionCode='20' versionName='2.0' platformBuildVersionCode='35'\nminSdkVersion:'24'\ntargetSdkVersion:'35'\n"
+BADGING = "package: name='com.xpanport.hook' versionCode='21' versionName='2.1' platformBuildVersionCode='35'\nminSdkVersion:'24'\ntargetSdkVersion:'35'\n"
 
 
 class ConfigTests(unittest.TestCase):
@@ -164,7 +164,7 @@ class SigningFlowTests(unittest.TestCase):
         self.calls = []
         self.badging, self.verify = BADGING, VERIFY
         write(self.root / "hook/XpanHook.java", b"package com.xpanport.hook; class XpanHook {}\n")
-        manifest = b'<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.xpanport.hook" android:versionCode="20" android:versionName="2.0"/>\n'
+        manifest = b'<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.xpanport.hook" android:versionCode="21" android:versionName="2.1"/>\n'
         write(self.root / "hook/AndroidManifest.xml", manifest)
         write(self.root / "hook/assets/xposed_init", b"com.xpanport.hook.XpanHook\n")
         write(self.build / "dex/classes.dex", self.dex)
@@ -340,7 +340,7 @@ class SigningFlowTests(unittest.TestCase):
         self.assert_no_sign()
 
     def test_wrong_actual_identity_denied_before_sign(self):
-        self.badging = BADGING.replace("versionCode='20'", "versionCode='13'")
+        self.badging = BADGING.replace("versionCode='21'", "versionCode='20'")
         with self.assertRaises(sdt.DeviceTestError):
             self.sign()
         self.assert_no_sign()

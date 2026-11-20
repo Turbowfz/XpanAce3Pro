@@ -244,6 +244,8 @@ class RealStockTests(unittest.TestCase):
             out = Path(tmp) / "new"
             mp.publish(out, profiles, self.originals, receipts)
             manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["module_version"], "2.1")
+            self.assertEqual(manifest["module_version_code"], 21)
             self.assertEqual(set(manifest["profiles"]), {"c16", "c17"})
             self.assertFalse((out / "system").exists())
             for platform in profiles:

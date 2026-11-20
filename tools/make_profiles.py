@@ -340,7 +340,7 @@ def publish(out_dir, profiles, originals, receipts):
             fail("E_OUTPUT", "publication receipt does not qualify")
     manifest = {
         "manifest_version": 1, "recipe_id": "PJX110-Xpan-v2-native-crop-v1",
-        "module_version": "2.0", "module_version_code": 20,
+        "module_version": "2.1", "module_version_code": 21,
         "profiles": receipts,
         "sdk_app_evidence": {name: {"size": pin[0], "sha256": pin[1]} for name, pin in EVIDENCE.items()},
         "runtime_policies_not_implemented_by_profiles": {

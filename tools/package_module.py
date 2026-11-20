@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Package verified v2.0 inputs offline; never sign, install, or publish.
+"""Package verified v2.1 inputs offline; never sign, install, or publish.
 
-Run with python -I. --output must be a NEW _tmp/.../XpanAce3Pro-v2.0.zip
+Run with python -I. --output must be a NEW _tmp/.../XpanAce3Pro-v2.1.zip
 with an existing parent. Signed is the default; --unsigned-development accepts
 only an unsigned build and emits a deliberately NOT INSTALLABLE/UNSIGNED bundle.
 --signed-device-test accepts only the existing pinned debug certificate; it is
@@ -29,7 +29,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 CERTIFICATE = "9a6d86924f7071a39558596be0e0cb80176e41188b550a0e88f8f57eeeba2fa8"
 DEVICE_TEST_CERTIFICATE = "916348b3987d0f557f6aa6ae480822c18a91aeba2b9e46cbf4af30b295e43f9c"
-FILENAME = "XpanAce3Pro-v2.0.zip"
+FILENAME = "XpanAce3Pro-v2.1.zip"
 RECIPE = "PJX110-Xpan-v2-native-crop-v1"
 ROOT_SCRIPTS = ("customize.sh", "runtime.sh", "lifecycle.sh", "post-fs-data.sh", "service.sh", "uninstall.sh", "parent-context.sh")
 APK_UNINSTALL = "payload/uninstall-apk.sh"
@@ -233,8 +233,8 @@ def module_entries(inputs):
     result = {name: inputs.read(ROOT / "module" / name) for name in required}
     identity = props(result["module.prop"], "module.prop")
     if (identity.get("id"), identity.get("version"), identity.get("versionCode")) not in {
-            ("XpanAce3Pro", "v2.0", "20"), ("XpanAce3Pro", "2.0", "20")}:
-        fail("Wrong module id/version: XpanAce3Pro v2.0/20 is required")
+            ("XpanAce3Pro", "v2.1", "21"), ("XpanAce3Pro", "2.1", "21")}:
+        fail("Wrong module id/version: XpanAce3Pro v2.1/21 is required")
     # Root wrapper first revokes this instance's runtime/mount eligibility;
     # the unchanged Hook helper is phase two, never the root uninstall entry.
     result[APK_UNINSTALL] = inputs.read(ROOT / "hook/uninstall.sh")
@@ -294,8 +294,8 @@ def current_manifest(inputs):
         fail(f"Invalid source Android manifest: {exc}")
     android = "{http://schemas.android.com/apk/res/android}"
     identity = (root.attrib.get("package"), root.attrib.get(android + "versionCode"), root.attrib.get(android + "versionName"))
-    if root.tag != "manifest" or identity != ("com.xpanport.hook", "20", "2.0"):
-        fail("Wrong current APK package/version: com.xpanport.hook 2.0/20 is required")
+    if root.tag != "manifest" or identity != ("com.xpanport.hook", "21", "2.1"):
+        fail("Wrong current APK package/version: com.xpanport.hook 2.1/21 is required")
     return data
 
 
@@ -337,9 +337,9 @@ def verify_signature(apk, expected_certificate=CERTIFICATE):
 def verify_identity(apk):
     aapt = regular(sdk_tools() / "aapt2.exe")
     output = run_verify([aapt, "dump", "badging", apk])
-    identity = "package: name='com.xpanport.hook' versionCode='20' versionName='2.0'"
+    identity = "package: name='com.xpanport.hook' versionCode='21' versionName='2.1'"
     if not any(line == identity or line.startswith(identity + " ") for line in output.splitlines()):
-        fail("Actual APK package/version differs from the canonical 2.0/20 manifest")
+        fail("Actual APK package/version differs from the canonical 2.1/21 manifest")
 
 
 def inspect_apk(data, entry, unsigned):
@@ -448,7 +448,7 @@ def profile_entries(inputs, profiles_dir):
         fail("Profile manifest is stale: it differs from current _tmp/profile-build/manifest.json")
     manifest = json_object(data, "profile manifest")
     if (manifest.get("manifest_version"), manifest.get("recipe_id"), manifest.get("module_version"),
-            manifest.get("module_version_code")) != (1, RECIPE, "2.0", 20):
+            manifest.get("module_version_code")) != (1, RECIPE, "2.1", 21):
         fail("Wrong profile recipe/module version")
     if manifest.get("hal_tested") is not False or set(manifest.get("profiles", {})) != {"c16", "c17"}:
         fail("Both exact, non-HAL-claimed C16/C17 profiles are required")
@@ -587,7 +587,7 @@ def pack(build_dir, profiles_dir, output, unsigned_development=False, signed_dev
     generator_hashes = {f"tools/{name}": digest(inputs.read(Path(__file__).with_name(name)))
                         for name in ("package_module.py", "build_hook.py", "make_profiles.py", "config_patch.py")}
     provenance = {
-        "package_manifest_version": 1, "module_id": "XpanAce3Pro", "version": "2.0", "version_code": 20,
+        "package_manifest_version": 1, "module_id": "XpanAce3Pro", "version": "2.1", "version_code": 21,
         "status": "NOT INSTALLABLE/UNSIGNED" if unsigned_development else "SIGNED/DEVICE TEST ONLY" if signed_device_test else "SIGNED/CERTIFICATE VERIFIED",
         "installable": not unsigned_development,
         "device_test_only": signed_device_test,

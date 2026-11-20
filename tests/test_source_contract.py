@@ -121,8 +121,8 @@ class SourceContractTests(unittest.TestCase):
 
     def test_development_module_description_does_not_claim_eight_x_complete(self):
         module = (ROOT / "module/module.prop").read_text(encoding="utf-8")
-        self.assertIn("version=v2.0\n", module)
-        self.assertIn("versionCode=20\n", module)
+        self.assertIn("version=v2.1\n", module)
+        self.assertIn("versionCode=21\n", module)
         self.assertIn("XDR 8x 和相框增益仍待修复", module)
         changelog = (ROOT / "changelog.md").read_text(encoding="utf-8")
         self.assertIn("C16 实机未生效", changelog)
@@ -135,8 +135,9 @@ class SourceContractTests(unittest.TestCase):
                        'MODEL" = PJX110', "6.020.876|7.013.51",
                        'sh "$MODPATH/runtime.sh" install "$MODPATH"'):
             self.assertIn(marker, customize)
-        for forbidden in ("sleep ", "reboot", "pm uninstall", "lspctl", "setenforce"):
+        for forbidden in ("sleep ", "pm uninstall", "lspctl", "setenforce"):
             self.assertNotIn(forbidden, customize)
+        self.assertNotRegex(customize, r"(?m)^\s*(?:exec\s+)?(?:/system/bin/)?reboot(?:\s|$)")
         # A local abort() would shadow the installer framework's command and
         # recurse through command -v abort; the private name keeps exit code 1.
         self.assertNotIn("\nabort() {", customize)
@@ -161,6 +162,19 @@ class SourceContractTests(unittest.TestCase):
         self.assertIn('"payload/op-compat/framework/com.oplus.camera.unit.sdk.adapter.jar"', package)
         self.assertIn("Bundled C17 completion is not the approved stock original", package)
         self.assertIn('*OP_COMPAT', package)
+
+    def test_v21_install_refreshes_old_state_and_precedes_sdk_qualification(self):
+        runtime = (ROOT / "module/runtime.sh").read_text(encoding="utf-8")
+        install = runtime.split("\nxpan_install() {", 1)[1].split("\nxpan_main() {", 1)[0]
+        self.assertIn("xpan_install_cleanup", install)
+        self.assertLess(install.index("xpan_install_cleanup"), install.index("xpan_prepare"))
+        self.assertLess(install.index("xpan_op_compat || true"), install.index("xpan_prepare"))
+        self.assertIn("xpan_parent_refresh() {", runtime)
+        self.assertNotIn("xpan_parent_approval() {", runtime)
+        self.assertIn("xpan_reboot_ready", runtime)
+        self.assertIn(".xpan-reboot-required", runtime)
+        self.assertNotIn("OPCameraPro/disable", install)
+        self.assertNotIn("setenforce", install)
 
     def test_build_does_not_compile_duplicate_source_or_generate_keys(self):
         source = (ROOT / "tools/build_hook.py").read_text(encoding="utf-8")

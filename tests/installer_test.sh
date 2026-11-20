@@ -148,7 +148,17 @@ case "$*" in
         IFS= read -r ACTION < "$R/install-mode"
         case "$ACTION" in
             failure) printf 'Failure [INSTALL_FAILED_INTERNAL_ERROR]\n'; exit 1 ;;
-            wrong-key) printf 'Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: signatures do not match]\n'; exit 1 ;;
+            wrong-key)
+                if [ ! -f "$R/signature-old-removed" ]; then
+                    printf 'PackageInstaller: updating com.xpanport.hook\n' >&2
+                    printf 'Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: signatures do not match]\n'; exit 1
+                fi ;;
+            retry-failure)
+                if [ ! -f "$R/signature-old-removed" ]; then
+                    printf 'Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: signatures do not match]\n'
+                else printf 'Failure [INSTALL_FAILED_INTERNAL_ERROR: retry failed]\n'; fi
+                exit 1 ;;
+            mismatch-text) printf 'Error: INSTALL_FAILED_UPDATE_INCOMPATIBLE appeared in diagnostic text\n'; exit 1 ;;
             full-failure) printf 'Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE]\nSuccess\n'; exit 0 ;;
             misleading) printf 'Unsuccessful: not Success\n'; exit 0 ;;
             nonzero-success) printf 'Success\n'; exit 1 ;;
@@ -177,6 +187,20 @@ case "$*" in
         else
             [ -f "$R/keep-user-selection" ] || printf '1\n' > "$R/installed.0"
         fi
+        printf 'Success\n'
+        ;;
+    'uninstall com.xpanport.hook')
+        [ -d "$R/data/adb/xpan-lifecycle/lock" ] || exit 86
+        IFS= read -r CURRENT < "$R/data/adb/xpan-lifecycle/current.token"
+        B=$R/data/adb/xpan-lifecycle/apk-backup/$CURRENT
+        [ -f "$B/base.apk" ] && [ -f "$B/identity" ] && [ -f "$B/receipt" ] || exit 86
+        IFS= read -r GEN < "$R/generation"
+        cmp -s "$B/base.apk" "$R/data/app/$GEN/com.xpanport.hook/base.apk" || exit 86
+        printf 'complete-backup-before-uninstall\n' >> "$R/protocol.calls"
+        IFS= read -r ACTION < "$R/uninstall-mode"
+        if [ "$ACTION" = failure ]; then printf 'Failure [DELETE_FAILED_INTERNAL_ERROR]\n'; exit 1; fi
+        rm -f "$R/installed.0" "$R/installed.10"
+        : > "$R/signature-old-removed"
         printf 'Success\n'
         ;;
     'uninstall -k com.xpanport.hook')
@@ -249,7 +273,7 @@ verified() {
     [ "$(<"$STATE/current.token")" = "$(<"$MODPATH/.xpan-instance")" ] || fail 'token mismatch'
     assert_no_file "$STATE/lock"
     grep -Fq 'lock+fresh-token-before-pm' "$XPAN_TEST_ROOT/protocol.calls" || fail 'PM protocol missing'
-    assert_no_uninstall
+    [ "${1:-}" = migrated ] || assert_no_uninstall
 }
 prepare_job() {
     printf 'failure\n' > "$XPAN_TEST_ROOT/uninstall-mode"
@@ -323,7 +347,7 @@ printf "#!/bin/sh\nXPAN_JOB_TOKEN='%s'\n" "$(<"$STAGED/.xpan-instance")" > "$JOB
 run_job "$XPAN_TEST_ROOT/old-worker.sh"; expect_rc 0; assert_file "$JOB"; assert_no_uninstall
 ok 'qualified staged install cancels only old job; staged token job retained'
 
-for mode in failure wrong-key full-failure misleading nonzero-success; do
+for mode in failure full-failure misleading nonzero-success mismatch-text; do
     fixture
     prepare_job
     printf '%064d\n' 0 > "$ACTIVE/.xpan-apk-identity"
@@ -337,6 +361,48 @@ for mode in failure wrong-key full-failure misleading nonzero-success; do
     : > "$XPAN_TEST_ROOT/pm.calls"
     run_job "$XPAN_TEST_ROOT/old-worker.sh"; expect_rc 0; assert_no_uninstall
     ok "install $mode fails fully, preserves old APK/data, retains cancellation token"
+done
+
+fixture
+prepare_job
+printf 'success\n' > "$XPAN_TEST_ROOT/uninstall-mode"
+printf 'old APK signed by prior certificate\n' > "$XPAN_TEST_ROOT/data/app/old/com.xpanport.hook/base.apk"
+OLD_APK=$(hash "$XPAN_TEST_ROOT/data/app/old/com.xpanport.hook/base.apk")
+printf 'wrong-key\n' > "$XPAN_TEST_ROOT/install-mode"
+run_install; expect_rc 0; verified migrated; assert_no_file "$JOB"
+BACKUP=$STATE/apk-backup/$(<"$XPAN_TEST_ROOT/uuid.source")
+assert_file "$BACKUP/base.apk"; assert_file "$BACKUP/identity"; assert_file "$BACKUP/receipt"
+[ "$(hash "$BACKUP/base.apk")" = "$OLD_APK" ] || fail 'cross-signature backup bytes changed'
+[ "$(grep -c '^uninstall com.xpanport.hook$' "$XPAN_TEST_ROOT/pm.calls")" = 1 ] || fail 'cross-signature migration did not uninstall exactly once'
+[ "$(grep -c '^install -r ' "$XPAN_TEST_ROOT/pm.calls")" = 2 ] || fail 'cross-signature migration did not retry exactly once'
+assert_log 'PackageInstaller: updating com.xpanport.hook'
+assert_log 'INSTALL_FAILED_UPDATE_INCOMPATIBLE'
+grep -Fq complete-backup-before-uninstall "$XPAN_TEST_ROOT/protocol.calls" || fail 'old APK removed before complete backup'
+: > "$XPAN_TEST_ROOT/pm.calls"
+run_job "$XPAN_TEST_ROOT/old-worker.sh"; expect_rc 0; assert_no_uninstall
+assert_file "$XPAN_TEST_ROOT/installed.0"
+ok 'real cross-signature failure backs up only old Hook APK, migrates and protects new instance'
+
+for fault in retry-failure remove-failure missing-apk split-path identity-race backup-blocked; do
+    fixture
+    printf 'wrong-key\n' > "$XPAN_TEST_ROOT/install-mode"
+    case "$fault" in
+        retry-failure) printf 'retry-failure\n' > "$XPAN_TEST_ROOT/install-mode" ;;
+        remove-failure) printf 'failure\n' > "$XPAN_TEST_ROOT/uninstall-mode" ;;
+        missing-apk) rm "$XPAN_TEST_ROOT/data/app/old/com.xpanport.hook/base.apk" ;;
+        split-path|identity-race) : > "$XPAN_TEST_ROOT/$fault" ;;
+        backup-blocked) printf 'occupied backup path\n' > "$STATE/apk-backup" ;;
+    esac
+    run_install; expect_rc 1; assert_no_file "$ACTIVE/.xpan-apk-identity"
+    case "$fault" in
+        retry-failure|remove-failure)
+            assert_file "$STATE/apk-backup/$(<"$XPAN_TEST_ROOT/uuid.source")/base.apk"
+            assert_log '备份保留'
+            ;;
+        *) assert_no_uninstall; assert_file "$XPAN_TEST_ROOT/installed.0" ;;
+    esac
+    [ "$(<"$STATE/current.token")" = "$(<"$XPAN_TEST_ROOT/uuid.source")" ] || fail 'migration failure lost cancellation token'
+    ok "cross-signature $fault preserves backup or old APK and does not publish new identity"
 done
 
 for fault in missing-receipt missing-output wrong-output wrong-original pending unknown-key duplicate-key; do
@@ -488,9 +554,48 @@ while IFS= read -r LINE; do
     fi
 done < "$SCRIPT_DIR/uninstall_test.sh"
 [ "$(hash "$JOB")" = 0261785d42aadaf66423999f8478f409202b86046df4848bb03eb45fb0dd1952 ] || fail 'legacy fixture hash changed'
-run_install; expect_rc 1; unchanged_token; assert_no_install; assert_file "$JOB"
-assert_log 'legacy cleanup worker ignores lock/tokens'
-ok 'lockless legacy worker blocks installation instead of claiming deletion stops its race'
+run_install; expect_rc 0; verified; assert_no_file "$JOB"
+assert_file "$STATE/legacy-cleanup.$(<"$XPAN_TEST_ROOT/uuid.source")"
+[ "$(hash "$STATE/legacy-cleanup.$(<"$XPAN_TEST_ROOT/uuid.source")")" = 0261785d42aadaf66423999f8478f409202b86046df4848bb03eb45fb0dd1952 ] || fail 'legacy archive bytes changed'
+assert_log '旧无锁清理任务已结束'
+ok 'exact lockless legacy cleanup is archived automatically without manual approval'
+
+fixture
+IN_LEGACY=0
+while IFS= read -r LINE; do
+    if [ "$IN_LEGACY" = 1 ]; then
+        [ "$LINE" != LEGACY ] || break
+        printf '%s\n' "$LINE" >> "$JOB"
+    elif [[ "$LINE" == *"cat >"*"<<'LEGACY'"* ]]; then
+        IN_LEGACY=1
+    fi
+done < "$SCRIPT_DIR/uninstall_test.sh"
+mkdir -p "$XPAN_TEST_ROOT/proc/123"
+printf '/system/bin/sh\000%s\000' "$JOB" > "$XPAN_TEST_ROOT/proc/123/cmdline"
+printf '#!/bin/sh\nrm -f "$XPAN_TEST_ROOT/proc/123/cmdline"\nprintf "legacy-worker-finished\\n" >> "$XPAN_TEST_ROOT/protocol.calls"\n' > "$XPAN_TEST_ROOT/bin/sleep"
+chmod +x "$XPAN_TEST_ROOT/bin/sleep"
+run_install; expect_rc 0; verified; assert_no_file "$JOB"
+grep -Fq legacy-worker-finished "$XPAN_TEST_ROOT/protocol.calls" || fail 'did not wait for running legacy copy'
+ok 'automatic migration waits for already-running legacy cleanup instead of killing app processes'
+
+fixture
+IN_LEGACY=0
+while IFS= read -r LINE; do
+    if [ "$IN_LEGACY" = 1 ]; then
+        [ "$LINE" != LEGACY ] || break
+        printf '%s\n' "$LINE" >> "$JOB"
+    elif [[ "$LINE" == *"cat >"*"<<'LEGACY'"* ]]; then
+        IN_LEGACY=1
+    fi
+done < "$SCRIPT_DIR/uninstall_test.sh"
+mkdir -p "$XPAN_TEST_ROOT/proc/123"
+printf '/system/bin/sh\000%s\000' "$JOB" > "$XPAN_TEST_ROOT/proc/123/cmdline"
+run_install; expect_rc 1; assert_no_install; unchanged_token; assert_no_file "$JOB"
+assert_file "$STATE/legacy-cleanup.$(<"$XPAN_TEST_ROOT/uuid.source")"
+run_install; expect_rc 1; assert_no_install; unchanged_token
+rm "$XPAN_TEST_ROOT/proc/123/cmdline"
+run_install; expect_rc 0; verified
+ok 'retries cannot bypass an archived legacy worker still running; installation resumes after exit'
 
 fixture
 # Cross-protocol test of early-boot uninstall using identity published by helper.

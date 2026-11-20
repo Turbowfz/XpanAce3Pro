@@ -14,6 +14,7 @@ __pycache__/
 *.log
 # Proprietary device-stock JARs: bundled into locally built module ZIPs only.
 payload/op-compat/
-# Release ZIPs are published as Release assets, not committed (the v2.0 ZIP
-# embeds the proprietary C17 completion JARs requested for the module).
+# Release ZIPs are published as Release assets, not committed (the v2.0/v2.1
+# ZIPs embed the proprietary C17 completion JARs requested for the module).
 /XpanAce3Pro-v*.zip
+/releases/XpanAce3Pro-v2.0.zip

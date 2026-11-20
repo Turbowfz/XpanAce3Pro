@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # Standalone APK install phase, called by runtime.sh after device qualification.
 # Usage: sh lifecycle.sh install /data/adb/{modules,modules_update}/XpanAce3Pro
-# No config generation, mounts, signing, APK removal, or LSPosed enablement here.
+# 不挂载配置、不签名、不修改相机数据或 LSPosed；跨签名仅迁移本模块 APK。
 # runtime.sh keeps SKIPMOUNT=true, qualifies the exact profile and SDK, then
 # stages the verified configs and creates this phase's thirteen-key receipt.
 #
@@ -18,8 +18,7 @@
 # Ownership contract shared with hook/uninstall.sh:
 # mkdir xpan-lifecycle/lock (never steal); validate all inputs; atomically rotate
 # current.token BEFORE pm install; set .xpan-instance; cancel ONLY the old token's
-# cleanup job. The exact legacy worker has no lock/token checks: refuse installation
-# while that artifact exists (deleting it cannot stop an already-running copy).
+# cleanup job. 精确旧无锁脚本先撤销并等待其运行副本退出，不杀相机或其他进程。
 # Keep lock through PM and identity publication. Failure retains the new cancellation token, never
 # rolls it back. A token is NOT readiness: .xpan-apk-identity is written only
 # after exact PM success and installed-byte/path/user/identity verification.
@@ -387,6 +386,100 @@ legacy_job_present() {
     file_hash "$JOB" || return 1
     [ "$HASH" = 0261785d42aadaf66423999f8478f409202b86046df4848bb03eb45fb0dd1952 ]
 }
+legacy_job_cancel() {
+    local LEGACY_PROC LEGACY_CMD LEGACY_WAIT LEGACY_LIMIT LEGACY_DELAY LEGACY_BUSY
+    if legacy_job_present; then
+        [ ! -e "$STATE/legacy-cleanup.$TOKEN" ] && [ ! -L "$STATE/legacy-cleanup.$TOKEN" ] || return 1
+        mv "$JOB" "$STATE/legacy-cleanup.$TOKEN" && chmod 0600 "$STATE/legacy-cleanup.$TOKEN" || return 1
+        log '已自动撤销旧无锁清理脚本，等待正在运行的旧副本结束；不终止相机或其他进程'
+    fi
+    # 即使上次等待超时且脚本已归档，复装也必须继续等旧副本退出。
+    LEGACY_PROC=/proc; LEGACY_LIMIT=900; LEGACY_DELAY=1
+    if [ "${XPAN_TEST_MODE:-}" = 1 ]; then
+        LEGACY_PROC=$XPAN_TEST_ROOT/proc; LEGACY_LIMIT=3; LEGACY_DELAY=0
+    fi
+    LEGACY_WAIT=0
+    while :; do
+        LEGACY_BUSY=0
+        for LEGACY_CMD in "$LEGACY_PROC"/[0-9]*/cmdline; do
+            [ -f "$LEGACY_CMD" ] || continue
+            bounded tr '\000' '\n' < "$LEGACY_CMD" | grep -Fqx "$JOB" && LEGACY_BUSY=1
+        done
+        [ "$LEGACY_BUSY" = 1 ] || break
+        LEGACY_WAIT=$((LEGACY_WAIT+1))
+        [ "$LEGACY_WAIT" -lt "$LEGACY_LIMIT" ] || { log '旧无锁清理进程尚未结束，未安装新 APK；旧脚本已归档'; return 1; }
+        sleep "$LEGACY_DELAY" || return 1
+    done
+    log '旧无锁清理任务已结束，可以安全安装新实例'
+}
+pm_success() {
+    [ "$RESULT" = 0 ] && [ "$OUT" = Success ]
+}
+pm_signature_mismatch() {
+    [ "$RESULT" != 0 ] || return 1
+    printf '%s\n' "$OUT" | LC_ALL=C awk '
+        /^Failure \[INSTALL_FAILED_UPDATE_INCOMPATIBLE(:[^][]*)?\]$/ { mismatch++; next }
+        /^Success$/ || /^Failure \[/ { other=1 }
+        END { if (mismatch!=1 || other) exit 1 }
+    '
+}
+backup_old_apk() {
+    local BACKUP_SOURCE BACKUP_HASH BACKUP_USERS BACKUP_PATH BACKUP_OLD_ID
+    package_users && package_identity || return 1
+    BACKUP_OLD_ID=$IDENTITY
+    BACKUP_SOURCE=$CODE_PATH/base.apk
+    [ "${XPAN_TEST_MODE:-}" != 1 ] || BACKUP_SOURCE=$XPAN_TEST_ROOT$BACKUP_SOURCE
+    file_hash "$BACKUP_SOURCE" || { log '旧 APK 不可读取，未移除旧应用'; return 1; }
+    BACKUP_HASH=$HASH; BACKUP_USERS=
+    for USER in $USERS; do
+        LIST=$(pm_run list packages --user "$USER" "$PKG" 2>&1) || { log "旧 APK 用户查询失败：$LIST"; return 1; }
+        case "$LIST" in '') continue ;; "package:$PKG") ;; *) log "旧 APK 用户查询异常：$LIST"; return 1 ;; esac
+        BACKUP_PATH=$(pm_run path --user "$USER" "$PKG" 2>&1) || { log "旧 APK 路径查询失败：$BACKUP_PATH"; return 1; }
+        [ "$BACKUP_PATH" = "package:$CODE_PATH/base.apk" ] || { log "旧 APK 不是唯一独立包，未移除：$BACKUP_PATH"; return 1; }
+        BACKUP_USERS=$BACKUP_USERS" $USER"
+    done
+    [ -n "$BACKUP_USERS" ] || { log '未找到实际安装的旧 Hook APK，未自动卸载'; return 1; }
+    [ ! -L "$STATE/apk-backup" ] || return 1
+    mkdir -p "$STATE/apk-backup" || return 1
+    APK_BACKUP=$STATE/apk-backup/$TOKEN
+    mkdir "$APK_BACKUP" || return 1
+    chmod 0700 "$STATE/apk-backup" "$APK_BACKUP" || return 1
+    cp "$BACKUP_SOURCE" "$APK_BACKUP/base.apk" && chmod 0600 "$APK_BACKUP/base.apk" &&
+        file_hash "$APK_BACKUP/base.apk" && [ "$HASH" = "$BACKUP_HASH" ] || {
+        log "旧 APK 备份失败，未移除旧应用：$APK_BACKUP"; return 1;
+    }
+    atomic_write "$APK_BACKUP/identity" "$ID_LINES" &&
+        atomic_write "$APK_BACKUP/receipt" "apk_package=$PKG
+apk_sha256=$BACKUP_HASH
+users=$BACKUP_USERS
+source=$CODE_PATH/base.apk" || return 1
+    package_identity && [ "$IDENTITY" = "$BACKUP_OLD_ID" ] &&
+        file_hash "$BACKUP_SOURCE" && [ "$HASH" = "$BACKUP_HASH" ] || {
+        log "旧 APK 在备份期间变化，未移除；备份保留：$APK_BACKUP"; return 1;
+    }
+    log "跨签名旧 Hook APK 已完整备份：$APK_BACKUP/base.apk"
+}
+install_apk() {
+    parent_phase || fail 'parent changed before PM install; cancellation token retained'
+    OUT=$(pm_run install -r "$APK" 2>&1)
+    RESULT=$?
+    log "install rc=$RESULT: $OUT"
+    pm_success && return 0
+    pm_signature_mismatch || fail "APK 安装失败：$OUT；cancellation token retained，未自动卸载"
+    backup_old_apk || fail '跨签名旧 APK 备份未完成，未卸载旧应用；cancellation token retained'
+    parent_phase && profile && check_files || fail "跨签名迁移前输入变化，未卸载；备份保留：$APK_BACKUP"
+    # -k 会保留旧签名约束，跨签名只能移除这个已备份的独立 Hook 包。
+    OUT=$(pm_run uninstall "$PKG" 2>&1)
+    RESULT=$?
+    log "signature migration uninstall rc=$RESULT: $OUT"
+    pm_success || fail "旧 Hook APK 移除失败：$OUT；备份保留：$APK_BACKUP；cancellation token retained"
+    parent_phase && profile && check_files || fail "跨签名重装前输入变化；备份保留：$APK_BACKUP"
+    OUT=$(pm_run install -r "$APK" 2>&1)
+    RESULT=$?
+    log "signature migration install rc=$RESULT: $OUT"
+    pm_success || fail "新 Hook APK 重装失败：$OUT；备份保留：$APK_BACKUP；cancellation token retained"
+    log "已自动迁移跨签名 Hook APK，旧包备份保留：$APK_BACKUP"
+}
 
 [ "$#" = 2 ] || { [ "${XPAN_TEST_MODE:-}" = 1 ] && [ "$#" = 3 ]; } || exit 1
 [ "$1" = install ] || exit 1
@@ -405,7 +498,6 @@ CONFIGS=$MODPATH/payload/qualified-config
 mkdir -p "$STATE" || fail 'cannot create lifecycle state'
 mkdir "$LOCK" 2>/dev/null || fail 'lifecycle lock busy; no installation attempted'
 HAVE_LOCK=1
-legacy_job_present && fail 'legacy cleanup worker ignores lock/tokens; migration requires separate stopped-worker confirmation'
 load_inputs || fail 'config generation not ready: missing/invalid qualified three-output receipt'
 parent_phase && profile && check_files && parent_phase || fail 'config generation not ready or ROM/profile/input/parent changed; no installation attempted'
 package_users || fail 'PM unavailable; no installation attempted'
@@ -429,6 +521,7 @@ if [ -e "$MODPATH/.xpan-instance" ]; then
     [ "$TOKEN" != "$VALUE" ] || fail 'UUID reused module token'
 fi
 # Recheck before rotation; no token is published before valid current outputs.
+legacy_job_cancel || fail '旧无锁清理任务迁移未完成，未安装新 APK'
 parent_phase && profile && check_files && parent_phase || fail 'inputs or parent changed before token rotation'
 atomic_write "$STATE/current.token" "$TOKEN" || fail 'cannot atomically rotate current token'
 atomic_write "$MODPATH/.xpan-instance" "$TOKEN" || fail 'cannot publish module token; cancellation token retained'
@@ -438,13 +531,8 @@ if old_job_owned; then
     log 'cancelled matching old cleanup job'
 fi
 
-# Never uninstall to resolve certificate mismatch; -r preserves data/settings.
-# Do not downgrade (-d), force-enable, invoke an enabler, or touch LSP databases.
-parent_phase || fail 'parent changed before PM install; cancellation token retained'
-OUT=$(pm_run install -r "$APK" 2>&1)
-RESULT=$?
-log "install rc=$RESULT: $OUT"
-[ "$RESULT" = 0 ] && [ "$OUT" = Success ] || fail 'APK install failed/unverified; cancellation token retained, no automatic uninstall'
+# 不降级、不强制启用、不操作 LSP 数据库；只有真实跨签名错误自动迁移。
+install_apk
 parent_phase && profile && check_files && verify_install && parent_phase || fail 'post-install verification failed; no APK identity published'
 atomic_write "$MODPATH/.xpan-apk-identity" "$IDENTITY" || fail 'cannot publish verified APK identity'
 log 'APK phase verified; config/mount integration and LSPosed selection remain separate'

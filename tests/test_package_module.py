@@ -86,9 +86,9 @@ class PackagerTests(unittest.TestCase):
         self.identity = mock.patch.object(pm, "verify_identity", return_value=None).start()
         self.signature = mock.patch.object(pm, "verify_signature", side_effect=pm.PackageError("not a verified signed fixture")).start()
         self.module = self.root / "module"
-        self.changelog = b"# Changelog\n\n## v2.0\n- Development.\n\n## v1.3\n- High pixel.\n\n## v1.2\n- Sizes.\n\n## v1.1\n- Fixes.\n\n## v1.0\n- Initial.\n"
+        self.changelog = b"# Changelog\n\n## v2.1\n- Development.\n\n## v1.3\n- High pixel.\n\n## v1.2\n- Sizes.\n\n## v1.1\n- Fixes.\n\n## v1.0\n- Initial.\n"
         write(self.root / "changelog.md", self.changelog)
-        write(self.module / "module.prop", b"id=XpanAce3Pro\nname=Synthetic fixture\nversion=v2.0\nversionCode=20\n")
+        write(self.module / "module.prop", b"id=XpanAce3Pro\nname=Synthetic fixture\nversion=v2.1\nversionCode=21\n")
         self.script = b"#!/system/bin/sh\n# synthetic source; not an installer\nexit 0\n"
         for name in pm.ROOT_SCRIPTS:
             write(self.module / name, self.script)
@@ -106,7 +106,7 @@ sh "$MODDIR/runtime.sh" uninstall "$MODDIR" ||
         write(self.root / "hook/CameraProfile.java", b"package com.xpanport.hook; class CameraProfile {}\n")
         self.manifest = b'''<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
- package="com.xpanport.hook" android:versionCode="20" android:versionName="2.0" />
+ package="com.xpanport.hook" android:versionCode="21" android:versionName="2.1" />
 '''
         write(self.root / "hook/AndroidManifest.xml", self.manifest)
         write(self.root / "hook/assets/xposed_init", b"com.xpanport.hook.XpanHook\n")
@@ -166,7 +166,7 @@ sh "$MODDIR/runtime.sh" uninstall "$MODDIR" ||
             write(self.profiles / f"payload/profiles/{platform}/profile.props", pm.mp.profile_props(platform, receipt))
             json_write(self.profiles / f"profiles/{platform}/receipt.json", pm.mp.asset_receipt(platform, receipt))
         self.profile_manifest = {
-            "manifest_version": 1, "recipe_id": pm.RECIPE, "module_version": "2.0", "module_version_code": 20,
+            "manifest_version": 1, "recipe_id": pm.RECIPE, "module_version": "2.1", "module_version_code": 21,
             "profiles": self.receipts,
             "sdk_app_evidence": {name: {"size": pin[0], "sha256": pin[1]} for name, pin in pm.mp.EVIDENCE.items()},
             "runtime_policies_not_implemented_by_profiles": {"final_output_width": 8192, "zoom_ratios": [1.0],
@@ -225,11 +225,12 @@ sh "$MODDIR/runtime.sh" uninstall "$MODDIR" ||
         self.signature.assert_not_called()
 
     def test_device_test_module_retains_identity_but_never_advertises_release_update(self):
-        data = b"id=XpanAce3Pro\nversion=v2.0\nversionCode=20\nupdateJson=https://example.invalid/update.json\ndescription=fixture\n"
+        data = b"id=XpanAce3Pro\nversion=v2.1\nversionCode=21\nupdateJson=https://example.invalid/update.json\ndescription=fixture\n"
         marked = pm.device_test_module(data)
         identity = pm.props(marked, "module.prop")
         self.assertEqual(identity["id"], "XpanAce3Pro")
-        self.assertEqual(identity["versionCode"], "20")
+        self.assertEqual(identity["version"], "v2.1")
+        self.assertEqual(identity["versionCode"], "21")
         self.assertNotIn("updateJson", identity)
         self.assertIn("仅本机验收", identity["description"])
         self.assertEqual(data.splitlines()[3], b"updateJson=https://example.invalid/update.json")
@@ -248,7 +249,7 @@ sh "$MODDIR/runtime.sh" uninstall "$MODDIR" ||
 
     def test_unsigned_bundle_exact_whitelist_permissions_and_noninstallable_provenance(self):
         result = self.pack()
-        self.assertEqual(result.name, "XpanAce3Pro-v2.0.zip")
+        self.assertEqual(result.name, "XpanAce3Pro-v2.1.zip")
         self.signature.assert_not_called()
         self.identity.assert_called_once_with(self.build / "XpanHook-aligned.apk")
         with zipfile.ZipFile(result) as archive:
@@ -270,6 +271,8 @@ sh "$MODDIR/runtime.sh" uninstall "$MODDIR" ||
                 self.assertEqual(stat.S_IFMT(info.external_attr >> 16), stat.S_IFREG)
                 self.assertEqual(info.compress_type, zipfile.ZIP_DEFLATED)
             provenance = json.loads(archive.read("provenance.json"))
+            self.assertEqual(provenance["version"], "2.1")
+            self.assertEqual(provenance["version_code"], 21)
             self.assertEqual(provenance["status"], "NOT INSTALLABLE/UNSIGNED")
             self.assertIs(provenance["installable"], False)
             self.assertIsNone(provenance["build"]["certificate_sha256"])
@@ -348,7 +351,8 @@ sh "$MODDIR/runtime.sh" uninstall "$MODDIR" ||
         for output in (self.root / pm.FILENAME, self.root / "desktopfinal" / pm.FILENAME,
                        self.root / "_tmp" / pm.FILENAME,
                        self.root / "_tmp" / "desktopfinal" / pm.FILENAME,
-                       self.output.with_name("XpanAce3Pro-v2.0-dev.zip")):
+                       self.output.with_name("XpanAce3Pro-v2.1-dev.zip"),
+                       self.output.with_name("XpanAce3Pro-v2.0.zip")):
             with self.subTest(output=output):
                 output.parent.mkdir(exist_ok=True)
                 with self.assertRaises(pm.PackageError):
@@ -430,8 +434,10 @@ sh "$MODDIR/runtime.sh" uninstall "$MODDIR" ||
     def test_stale_manifest_and_wrong_apk_source_version_rejected(self):
         write(self.root / "hook/AndroidManifest.xml", self.manifest + b"\n")
         self.rejected()
-        for before, after in ((b'versionCode="20"', b'versionCode="13"'),
-                              (b'versionName="2.0"', b'versionName="1.3"'),
+        for before, after in ((b'versionCode="21"', b'versionCode="20"'),
+                              (b'versionName="2.1"', b'versionName="2.0"'),
+                              (b'versionCode="21"', b'versionCode="13"'),
+                              (b'versionName="2.1"', b'versionName="1.3"'),
                               (b'com.xpanport.hook', b'com.other.fake')):
             with self.subTest(after=after):
                 changed = self.manifest.replace(before, after)
@@ -445,7 +451,8 @@ sh "$MODDIR/runtime.sh" uninstall "$MODDIR" ||
         path = self.module / "module.prop"
         original = path.read_bytes()
         for data in (original.replace(b"id=XpanAce3Pro", b"id=Other"),
-                     original.replace(b"v2.0", b"v1.3"), original.replace(b"versionCode=20", b"versionCode=13"),
+                     original.replace(b"v2.1", b"v2.0"), original.replace(b"versionCode=21", b"versionCode=20"),
+                     original.replace(b"v2.1", b"v1.3"), original.replace(b"versionCode=21", b"versionCode=13"),
                      original + b"id=XpanAce3Pro\n", original.replace(b"\n", b"\r\n")):
             with self.subTest(data=data):
                 write(path, data)
@@ -457,7 +464,8 @@ sh "$MODDIR/runtime.sh" uninstall "$MODDIR" ||
     def test_wrong_profile_recipe_evidence_version_target_or_props_rejected(self):
         original = copy.deepcopy(self.profile_manifest)
         variants = []
-        for key, value in (("module_version", "1.3"), ("module_version_code", 13),
+        for key, value in (("module_version", "2.0"), ("module_version_code", 20),
+                           ("module_version", "1.3"), ("module_version_code", 13),
                            ("recipe_id", "caller-qualified"), ("hal_tested", True)):
             variant = copy.deepcopy(original)
             variant[key] = value
@@ -819,12 +827,14 @@ class ArchiveAndVerifierTests(unittest.TestCase):
             tools = Path(tmp)
             write(tools / "aapt2.exe", b"never executed")
             with mock.patch.object(pm, "sdk_tools", return_value=tools), mock.patch.object(pm, "run_verify") as run:
-                for output in ("package: name='com.xpanport.hook' versionCode='13' versionName='1.3'",
-                               "package: name='com.fake' versionCode='20' versionName='2.0'"):
+                for output in ("package: name='com.xpanport.hook' versionCode='20' versionName='2.1'",
+                               "package: name='com.xpanport.hook' versionCode='21' versionName='2.0'",
+                               "package: name='com.xpanport.hook' versionCode='13' versionName='1.3'",
+                               "package: name='com.fake' versionCode='21' versionName='2.1'"):
                     run.return_value = output
                     with self.assertRaises(pm.PackageError):
                         pm.verify_identity(tools / "fake.apk")
-                run.return_value = "package: name='com.xpanport.hook' versionCode='20' versionName='2.0' platformBuildVersionName='15'\n"
+                run.return_value = "package: name='com.xpanport.hook' versionCode='21' versionName='2.1' platformBuildVersionName='15'\n"
                 pm.verify_identity(tools / "fake.apk")
                 self.assertEqual(run.call_args.args[0][1:3], ["dump", "badging"])
 

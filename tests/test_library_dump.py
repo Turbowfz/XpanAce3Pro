@@ -57,6 +57,7 @@ class LibraryDumpTests(unittest.TestCase):
         source = (ROOT / "module/runtime.sh").read_text(encoding="utf-8")
         cls.parser = named_function(source, "parsecamera_libraryfiles")
         cls.bounded = named_function(source, "xpan_bounded")
+        cls.sdk = named_function(source, "xpan_sdk")
         cls.qualify = named_function(source, "xpan_qualify")
         cls.temp = tempfile.TemporaryDirectory(prefix="xpan-library-test.", dir=ROOT / "_tmp")
         cls.addClassCleanup(cls.temp.cleanup)
@@ -215,7 +216,7 @@ class LibraryDumpTests(unittest.TestCase):
         script = self.work / "qualify.sh"
         qualify = self.qualify.replace("xpan_bounded getprop", "qualification_input getprop")
         qualify = qualify.replace("xpan_bounded dumpsys", "qualification_input dumpsys")
-        script.write_text(self.bounded + self.parser + qualify + r"""
+        script.write_text(self.bounded + self.parser + self.sdk + qualify + r"""
 qualification_input() {
     case "$1:$2" in
         getprop:ro.product.model) printf 'PJX110\n' ;;
@@ -277,7 +278,7 @@ xpan_qualify
                     with self.subTest(mismatch=mismatch, diagnostic=diagnostic):
                         result = self.run_script(script, diagnostic)
                         self.assertNotEqual(result.returncode, 0)
-                        expected = [SDK] if mismatch == "c16-sdk" else [SDK, ADAPTER]
+                        expected = [SDK, ADAPTER]
                         self.assertEqual(result.stdout, "".join(p + "\n" for p in expected))
             finally:
                 self.env.pop("TEST_HASH", None)
