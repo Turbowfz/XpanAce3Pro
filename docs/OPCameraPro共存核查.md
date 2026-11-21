@@ -65,7 +65,9 @@ Xpan仍核验当前实际unit共享库路径、两份SDK内容、三份配置与
 
 ## 2026-11-15 C17 补全换装实验：兼容结论
 
-用户要求把 OP 附加模块的补全文件从 C16 全部换成 C17 测试兼容。**没有使用一加13 donor 包**（异机 SDK 变体会破坏本机相机），全部使用本机自己的原厂 C17 原件（`d2b20133…`/`7418d599…`，来源 `/my_product/product_overlay/framework`）。
+用户要求把 OP 附加模块的补全文件从 C16 全部换成 C17。2026-11-21 用户进一步明确：**补全必须用一加13（PJZ110）的原件，不用本机 Ace 3 Pro 原件**，否则 OP 覆盖层等于本机原厂、等于白补全。当前随包为 一加13 `my_product/product_overlay/framework` unit `d2b20133…`（5,377,971B）与 adapter `7418d599…`（2,948,231B）。一加13 原件保留在 `_tmp/inputs/OnePlus13_C17/unit-reference-20261114-02/` 供后续研究。
+
+静态风险（已如实记录）：一加13 SDK 为 7.006.123，本机相机 7.013.51。对本机相机 34 个 dex 反汇编后比对，相机实际引用 1100 个 SDK 成员，一加13 SDK 缺 35 个（`com/oplus/camera/aitranslate/OplusAITranslate` 整类、`CombineLutProcessUnitSDK`、`PaletteColorRow` 8 个 getter、`CameraDeviceInterface.getOperationMode`、`CameraUnitInterface.getCameraUnitSDKVersion` 等）。是否触发运行期崩溃需重启实测。
 
 ### 执行过程
 

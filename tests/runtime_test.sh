@@ -145,6 +145,7 @@ case "$CMD" in
                     c16-adapter) H=ac0b595faae8d3f684aa457f223fbfb0f167f0d0e0cc461ef08dbbe52d6e61cf ;;
                     c17-sdk) H=d2b20133252414e26ac7c68255c76fa61cf41826c3b63d423a14c1187af42899 ;;
                     c17-adapter) H=7418d59955746d8aca56438a5e0e26e1f08ff6ae4d0cacc22057d0041b12aac4 ;;
+
                     *) exec /usr/bin/sha256sum "$@" ;;
                 esac
                 printf '%s  %s\n' "$H" "$1" ;;

@@ -167,7 +167,18 @@ xpan_inactive() {
     [ "$X_OFF" = 0 ]
 }
 xpan_lock() {
-    mkdir "$X_STATE/lock" 2>/dev/null || return 1
+    if ! mkdir "$X_STATE/lock" 2>/dev/null; then
+        # 上次运行被 SIGKILL（例如调试时 timeout -s KILL）会留下空锁目录；
+        # 开机 service 因此直接退出、active 永远为 0。只有 owner 明确记录且
+        # 对应进程已不存在时才回收，绝不抢活锁。
+        X_OWNER=$(cat "$X_STATE/lock.owner" 2>/dev/null) || X_OWNER=
+        case "$X_OWNER" in ''|*[!0-9]*) return 1 ;; esac
+        [ ! -d "/proc/$X_OWNER" ] || return 1
+        rmdir "$X_STATE/lock" 2>/dev/null || return 1
+        rm -f "$X_STATE/lock.owner" 2>/dev/null || return 1
+        mkdir "$X_STATE/lock" 2>/dev/null || return 1
+    fi
+    printf '%s\n' "$$" > "$X_STATE/lock.owner" 2>/dev/null || true
     X_LOCKED=1
     xpan_life_lock || { xpan_unlock; return 1; }
 }
@@ -181,7 +192,10 @@ xpan_life_unlock() {
 }
 xpan_unlock() {
     xpan_life_unlock
-    [ "$X_LOCKED" = 0 ] || rmdir "$X_STATE/lock" 2>/dev/null
+    if [ "$X_LOCKED" = 0 ]; then :; else
+        rm -f "$X_STATE/lock.owner" 2>/dev/null
+        rmdir "$X_STATE/lock" 2>/dev/null
+    fi
     X_LOCKED=0
 }
 xpan_exit() {
@@ -329,7 +343,7 @@ xpan_install_sdk() {
     X_PENDING_DIR=${XPAN_TEST_OP_DIR:-/data/adb/modules/OPCameraPro}
     xpan_safe_path "$X_PENDING_DIR" && [ -f "$X_PENDING_DIR/module.prop" ] &&
         [ ! -L "$X_PENDING_DIR/module.prop" ] && grep -qx 'id=OPCameraPro' "$X_PENDING_DIR/module.prop" || {
-        xpan_log '旧 SDK 仍在生效，未找到已更新的 OPCameraPro 补全'; return 1;
+        xpan_log '旧 SDK 仍在生效，未找到已更新的 OPCameraPro 补全'; return 1
     }
     for X_PENDING_NAME in com.oplus.camera.unit.sdk.jar com.oplus.camera.unit.sdk.adapter.jar; do
         case "$X_PENDING_NAME" in
@@ -339,7 +353,7 @@ xpan_install_sdk() {
         [ "$X_PENDING_LIVE" != "$X_PENDING_PIN" ] || continue
         xpan_hash "$X_MOD/payload/op-compat/framework/$X_PENDING_NAME" && [ "$X_HASH" = "$X_PENDING_PIN" ] &&
             xpan_hash "$X_PENDING_DIR/system/product/framework/$X_PENDING_NAME" && [ "$X_HASH" = "$X_PENDING_PIN" ] || {
-            xpan_log "旧 SDK 仍在生效，C17 补全尚未成功更新：$X_PENDING_NAME"; return 1;
+            xpan_log "旧 SDK 仍在生效，C17 补全尚未成功更新：$X_PENDING_NAME"; return 1
         }
     done
     X_INSTALL_REBOOT=1

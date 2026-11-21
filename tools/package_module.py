@@ -40,6 +40,7 @@ LIMIT = 4 * 1024 * 1024
 APK_LIMIT = 32 * 1024 * 1024
 OP_LIMIT = 16 * 1024 * 1024
 # Bundled device-stock C17 completion for OPCameraPro's attached module.
+# 一加13 补全（3873cc99/5ddf19ea）曾实测：XPAN 可进但拍照卡死，已回退。
 # Path -> (exact size, exact SHA-256 of this phone's stock original).
 OP_COMPAT = {
     "payload/op-compat/framework/com.oplus.camera.unit.sdk.jar":
