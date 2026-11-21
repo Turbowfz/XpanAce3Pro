@@ -13,7 +13,13 @@ trap 'rm -rf -- "$SUITE"' EXIT
 export XPAN_TEST_MODE=1
 unset XPAN_JOB_TOKEN XPAN_JOB_IDENTITY
 COUNT=0
-fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+fail() {
+    printf 'FAIL: %s\n' "$*" >&2
+    [ ! -f "${XPAN_TEST_ROOT:-}/stdout" ] || cat "${XPAN_TEST_ROOT}/stdout" >&2
+    [ ! -f "${XPAN_TEST_ROOT:-}/uninstall.log" ] || cat "${XPAN_TEST_ROOT}/uninstall.log" >&2
+    [ ! -f "${XPAN_TEST_ROOT:-}/pm.calls" ] || cat "${XPAN_TEST_ROOT}/pm.calls" >&2
+    exit 1
+}
 assert_file() { [ -f "$1" ] || fail "missing $1"; }
 assert_no_file() { [ ! -e "$1" ] || fail "unexpected $1"; }
 assert_log() { grep -Fq "$1" "$XPAN_TEST_ROOT/uninstall.log" || fail "missing log: $1"; }
@@ -50,6 +56,10 @@ fixture() {
 #!/bin/sh
 printf '0\n'
 FAKE
+    cat > "$XPAN_TEST_ROOT/bin/getprop" <<'FAKE'
+#!/bin/sh
+[ "$1" = sys.boot_completed ] && printf '1\n'
+FAKE
     cat > "$XPAN_TEST_ROOT/bin/pm" <<'FAKE'
 #!/bin/sh
 R=$XPAN_TEST_ROOT
@@ -76,7 +86,21 @@ case "$*" in
         USER=$4
         if [ -f "$R/installed.$USER" ]; then printf 'package:com.xpanport.hook\n'; fi
         ;;
+    'list packages --user '*" com.oplus.camera")
+        USER=$4
+        [ ! -f "$R/camera-absent.$USER" ] || exit 0
+        printf 'package:com.oplus.camera\n'
+        ;;
+    'clear --user '*" com.oplus.camera")
+        USER=$3
+        [ "$MODE" != clear-failure ] || { printf 'Error: clear failed\n'; exit 1; }
+        : > "$R/camera-cleared.$USER"
+        printf 'Success\n'
+        ;;
     'uninstall -k com.xpanport.hook')
+        printf 'legacy -k invocation is no longer accepted\n' >&2; exit 85
+        ;;
+    'uninstall com.xpanport.hook')
         IFS= read -r ACTION < "$R/uninstall-mode"
         case "$ACTION" in
             failure) printf 'Failure [DELETE_FAILED_INTERNAL_ERROR]\n'; exit 1 ;;
@@ -239,8 +263,8 @@ fixture
 printf '1\n' > "$XPAN_TEST_ROOT/installed.10"
 rm -f "$XPAN_TEST_ROOT/installed.0"
 run_hook; expect_rc 0; assert_no_file "$JOB"; assert_no_file "$XPAN_TEST_ROOT/installed.10"
-[ "$(grep -c '^list packages --user 10 ' "$XPAN_TEST_ROOT/pm.calls")" = 2 ] || fail 'secondary user not verified'
-ok 'secondary/work-profile-only install removed globally with -k'
+[ "$(grep -c '^list packages --user 10 com.xpanport.hook$' "$XPAN_TEST_ROOT/pm.calls")" = 2 ] || fail 'secondary user not verified'
+ok 'secondary/work-profile-only install removed globally without -k'
 
 fixture
 : > "$XPAN_TEST_ROOT/multiuser"
@@ -407,5 +431,91 @@ run_hook; expect_rc 1; assert_file "$JOB"
 grep -qx '# unrelated module job' "$JOB" || fail 'overwrote unrelated job'
 assert_log 'refuse to overwrite'
 ok 'failed cleanup does not overwrite an unrelated service job'
+
+fixture
+: > "$XPAN_TEST_ROOT/multiuser"
+printf '1\n' > "$XPAN_TEST_ROOT/installed.10"
+printf 'success\n' > "$XPAN_TEST_ROOT/uninstall-mode"
+cp "$SOURCE" "$ACTIVE/payload/uninstall-apk.sh" 2>/dev/null || { mkdir -p "$ACTIVE/payload"; cp "$SOURCE" "$ACTIVE/payload/uninstall-apk.sh"; }
+printf '%s\n' 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef > "$ACTIVE/.xpan-apk-identity"
+GUARD_ID=$(printf 'codePath=/data/app/old/com.xpanport.hook\nfirstInstallTime=2026-11-13 12:00:00\nlastUpdateTime=2026-11-13 12:00:00-old\n' | sha256sum)
+printf '%s\n' "${GUARD_ID%% *}" > "$ACTIVE/.xpan-apk-identity"
+XPAN_ARM=1 XPAN_ARM_LOCKED=1 XPAN_TEST_ROOT=$XPAN_TEST_ROOT /usr/bin/sh "$ACTIVE/payload/uninstall-apk.sh" >/dev/null 2>&1 || fail 'guard arm failed'
+GUARDJOB=$XPAN_TEST_ROOT/data/adb/service.d/xpan_guard.sh
+assert_file "$GUARDJOB"
+grep -qx "XPAN_JOB_MODE='guard'" "$GUARDJOB" || fail 'guard mode not published'
+RC=0; /usr/bin/sh "$GUARDJOB" >/dev/null 2>&1 || RC=$?
+expect_rc 0; assert_file "$GUARDJOB"; assert_no_uninstall
+ok 'boot guard keeps job while module directory still exists'
+
+fixture
+: > "$XPAN_TEST_ROOT/multiuser"
+printf '1\n' > "$XPAN_TEST_ROOT/installed.10"
+printf 'success\n' > "$XPAN_TEST_ROOT/uninstall-mode"
+mkdir -p "$ACTIVE/payload"
+GUARDJOB=$XPAN_TEST_ROOT/data/adb/service.d/xpan_guard.sh
+cp "$SOURCE" "$ACTIVE/payload/uninstall-apk.sh"
+printf '%s\n' 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef > "$ACTIVE/.xpan-apk-identity"
+GUARD_ID=$(printf 'codePath=/data/app/old/com.xpanport.hook\nfirstInstallTime=2026-11-13 12:00:00\nlastUpdateTime=2026-11-13 12:00:00-old\n' | sha256sum)
+printf '%s\n' "${GUARD_ID%% *}" > "$ACTIVE/.xpan-apk-identity"
+XPAN_ARM=1 XPAN_ARM_LOCKED=1 XPAN_TEST_ROOT=$XPAN_TEST_ROOT /usr/bin/sh "$ACTIVE/payload/uninstall-apk.sh" >/dev/null 2>&1 || fail 'guard arm failed'
+rm -rf "$ACTIVE"
+RC=0; /usr/bin/sh "$GUARDJOB" >/dev/null 2>&1 || RC=$?
+expect_rc 0
+assert_no_file "$GUARDJOB"
+assert_no_file "$XPAN_TEST_ROOT/installed.0"
+assert_no_file "$XPAN_TEST_ROOT/installed.10"
+assert_file "$XPAN_TEST_ROOT/camera-cleared.0"
+assert_file "$XPAN_TEST_ROOT/camera-cleared.10"
+assert_log 'camera clear user=0'
+ok 'boot guard cleans after module removal even when uninstall.sh never ran'
+
+fixture
+printf 'success\n' > "$XPAN_TEST_ROOT/uninstall-mode"
+mkdir -p "$ACTIVE/payload"
+GUARDJOB=$XPAN_TEST_ROOT/data/adb/service.d/xpan_guard.sh
+cp "$SOURCE" "$ACTIVE/payload/uninstall-apk.sh"
+printf '%s\n' 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef > "$ACTIVE/.xpan-apk-identity"
+GUARD_ID=$(printf 'codePath=/data/app/old/com.xpanport.hook\nfirstInstallTime=2026-11-13 12:00:00\nlastUpdateTime=2026-11-13 12:00:00-old\n' | sha256sum)
+printf '%s\n' "${GUARD_ID%% *}" > "$ACTIVE/.xpan-apk-identity"
+XPAN_ARM=1 XPAN_ARM_LOCKED=1 XPAN_TEST_ROOT=$XPAN_TEST_ROOT /usr/bin/sh "$ACTIVE/payload/uninstall-apk.sh" >/dev/null 2>&1 || fail 'guard arm failed'
+printf 'instance-new\n' > "$STATE/current.token"
+rm -rf "$ACTIVE"
+: > "$XPAN_TEST_ROOT/pm.calls"
+RC=0; /usr/bin/sh "$GUARDJOB" >/dev/null 2>&1 || RC=$?
+expect_rc 0; assert_file "$GUARDJOB"; assert_no_uninstall
+assert_file "$XPAN_TEST_ROOT/installed.0"
+ok 'boot guard with stale token cannot touch a reinstalled instance'
+
+fixture
+: > "$XPAN_TEST_ROOT/multiuser"
+printf '1\n' > "$XPAN_TEST_ROOT/installed.10"
+printf 'success\n' > "$XPAN_TEST_ROOT/uninstall-mode"
+mkdir -p "$ACTIVE/payload"
+GUARDJOB=$XPAN_TEST_ROOT/data/adb/service.d/xpan_guard.sh
+cp "$SOURCE" "$ACTIVE/payload/uninstall-apk.sh"
+GUARD_ID=$(printf 'codePath=/data/app/old/com.xpanport.hook\nfirstInstallTime=2026-11-13 12:00:00\nlastUpdateTime=2026-11-13 12:00:00-old\n' | sha256sum)
+printf '%s\n' "${GUARD_ID%% *}" > "$ACTIVE/.xpan-apk-identity"
+# OPCameraPro 改动现场：SDK 被换、mirror 素材被换、原厂同名文件被改成 hidden。
+OC=$XPAN_TEST_ROOT/data/adb/modules/OPCameraPro
+BACK=$XPAN_TEST_ROOT/data/adb/xpan-runtime/op-compat-backup
+mkdir -p "$OC/system/product/framework" "$OC/system/odm/etc/camera/meishe_lut" "$BACK/mirror/odm/etc/camera/meishe_lut"
+printf 'op-sdk-original\n' > "$BACK/com.oplus.camera.unit.sdk.jar"
+printf 'xpan-sdk-c17\n' > "$OC/system/product/framework/com.oplus.camera.unit.sdk.jar"
+printf 'op-lut-original\n' > "$BACK/mirror/odm/etc/camera/meishe_lut/a.bin"
+printf 'xpan-lut\n' > "$OC/system/odm/etc/camera/meishe_lut/a.bin"
+printf 'op-hidden-original\n' > "$OC/system/odm/etc/camera/meishe_lut/b.bin.xpan-c16-hidden"
+# 用户后改且无备份的路径必须原样保留。
+printf 'user-changed\n' > "$OC/system/odm/etc/camera/meishe_lut/c.bin"
+XPAN_ARM=1 XPAN_ARM_LOCKED=1 XPAN_TEST_ROOT=$XPAN_TEST_ROOT /usr/bin/sh "$ACTIVE/payload/uninstall-apk.sh" >/dev/null 2>&1 || fail 'guard arm failed'
+rm -rf "$ACTIVE"
+RC=0; /usr/bin/sh "$GUARDJOB" >/dev/null 2>&1 || RC=$?
+expect_rc 0; assert_no_file "$GUARDJOB"
+grep -qx op-sdk-original "$OC/system/product/framework/com.oplus.camera.unit.sdk.jar" || fail 'SDK 未还原'
+grep -qx op-lut-original "$OC/system/odm/etc/camera/meishe_lut/a.bin" || fail 'mirror 素材未还原'
+grep -qx op-hidden-original "$OC/system/odm/etc/camera/meishe_lut/b.bin" || fail 'hidden 未恢复'
+[ ! -e "$OC/system/odm/etc/camera/meishe_lut/b.bin.xpan-c16-hidden" ] || fail 'hidden 残留'
+grep -qx user-changed "$OC/system/odm/etc/camera/meishe_lut/c.bin" || fail '覆盖了用户后改文件'
+ok 'boot guard restores backed-up OPCameraPro bytes and preserves untracked user edits'
 
 printf '\nAll %s local uninstall scenarios passed. No device commands executed.\n' "$COUNT"

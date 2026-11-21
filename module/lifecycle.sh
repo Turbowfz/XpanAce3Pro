@@ -535,6 +535,12 @@ fi
 install_apk
 parent_phase && profile && check_files && verify_install && parent_phase || fail 'post-install verification failed; no APK identity published'
 atomic_write "$MODPATH/.xpan-apk-identity" "$IDENTITY" || fail 'cannot publish verified APK identity'
+# 登记独立开机清理守护：KSU 不执行 uninstall.sh 时，由 service.d 在模块目录
+# 真正缺席后恢复 OP 改动、清相机应用数据并完整卸载 Hook。登记失败不算安装成功。
+GUARD=$MODPATH/payload/uninstall-apk.sh
+[ -f "$GUARD" ] && [ ! -L "$GUARD" ] || fail 'uninstall guard helper missing; install not accepted'
+XPAN_ARM=1 XPAN_ARM_LOCKED=1 sh "$GUARD" >/dev/null 2>&1 || fail 'cannot arm boot uninstall guard'
+log 'boot uninstall guard armed (service.d)'
 log 'APK phase verified; config/mount integration and LSPosed selection remain separate'
 printf '%s\n' 'APK phase verified only; no config mounts or LSPosed enablement performed.'
 exit 0

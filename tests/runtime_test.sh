@@ -540,7 +540,7 @@ exit 0'
         journals_save
         case "$fault" in
             corrupt) printf 'parent_kind=ksu\n' >> "$STATE/parent.context" ;;
-            symlink) mv "$STATE/parent.context" "$XPAN_TEST_ROOT/originals/parent.context"; ln -s "$XPAN_TEST_ROOT/originals/parent.context" "$STATE/parent.context" ;;
+            symlink) mv "$STATE/parent.context" "$XPAN_TEST_ROOT/originals/parent.context"; MSYS=winsymlinks:nativestrict MSYS=winsymlinks:nativestrict ln -s "$XPAN_TEST_ROOT/originals/parent.context" "$STATE/parent.context" ;;
             missing) rm "$STATE/parent.context" ;;
         esac
         BEFORE=$(hash "$XPAN_TEST_ROOT/mountinfo")

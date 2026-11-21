@@ -355,6 +355,21 @@ xpan_reboot_ready() {
     rm -f "$X_MOD/.xpan-reboot-required" || return 1
     return 0
 }
+xpan_compat_settled() {
+    # op.compat 是“本启动内补全已改过”的持久事实：即使待重启标记写入失败，
+    # 也必须继续拒绝激活，直到真重启（boot_id 变化）后重新核对。
+    # 这是本模块自己写的 5 行状态文件，直接读，避免每 tick 额外起超时进程。
+    [ -f "$X_STATE/op.compat" ] && [ ! -L "$X_STATE/op.compat" ] || return 0
+    X_CS_BOOT=; X_CS_CHANGED=
+    while IFS='=' read -r X_CS_KEY X_CS_VAL; do
+        case "$X_CS_KEY" in
+            boot_id) X_CS_BOOT=$X_CS_VAL ;;
+            changed) X_CS_CHANGED=$X_CS_VAL ;;
+        esac
+    done < "$X_STATE/op.compat"
+    [ "$X_CS_BOOT" = "$X_BOOT_ID" ] || return 0
+    [ "$X_CS_CHANGED" != 1 ]
+}
 xpan_qualify() {
     local X_R
     X_REAL_MODEL=$(xpan_bounded getprop ro.product.model 2>/dev/null) || return 1
@@ -705,6 +720,7 @@ xpan_parent_mounts() {
 }
 xpan_parent_pin() {
     local X_PKEY X_PVAL X_PLINE X_PSEEN X_PCOUNT X_PBOOT X_PNS X_PTOKEN X_PHASH X_PINODE X_PKIND
+    local X_PCUR_HASH X_PCUR_INODE X_PCUR_KIND
     xpan_safe_path "$X_STATE/parent.context" && [ -f "$X_STATE/parent.context" ] || return 1
     [ "${XPAN_TEST_MODE:-}" = 1 ] || {
         X_PMODE=$(xpan_bounded stat -c '%a:%u' "$X_STATE/parent.context") || return 1
@@ -735,6 +751,29 @@ xpan_parent_pin() {
         return 0
     fi
     [ "$X_PNS" = "$X_NAMESPACE" ] && [ "$X_PTOKEN" = "$X_TOKEN" ] || return 1
+    # 同一次启动内父层也可能变化：KernelSU 元模块（如 mountify）可能晚于
+    # post-fs-data 才挂上 OPCameraPro 的 /odm/etc overlay，父层从 normal 变为
+    # ksu。boot/namespace/token 仍一致时自动刷新上下文，而不是永久拒绝。
+    # service 刚启动时 X_PARENT_HASH 还是空的，此时用 parent_start 刚刚观测到的
+    # XP_PARENT_* 作为“现状”比对，否则旧记录会被无条件接受、随后在
+    # xpan_parent_mounts 里被拒，表现为 service 启动即退出（active 永远为 0）。
+    if [ -n "$XP_PARENT_HASH" ]; then
+        # parent_start 每次都先观测；现状优先于本进程缓存，否则常驻 worker
+        # 会把“缓存==旧记录”当成没变化，随后在 parent_mounts 里失败。
+        X_PCUR_HASH=$XP_PARENT_HASH
+        X_PCUR_INODE=$XP_PARENT_INODE
+        X_PCUR_KIND=$XP_PARENT_KIND
+    else
+        X_PCUR_HASH=$X_PARENT_HASH
+        X_PCUR_INODE=$X_PARENT_INODE
+        X_PCUR_KIND=$X_PARENT_KIND
+    fi
+    if [ -n "$X_PCUR_HASH" ] && { [ "$X_PCUR_HASH" != "$X_PHASH" ] ||
+        [ "$X_PCUR_INODE" != "$X_PINODE" ] || [ "$X_PCUR_KIND" != "$X_PKIND" ]; }; then
+        # 若本实例已有自有挂载，xpan_parent_refresh 内部会拒绝，不会乱动。
+        xpan_parent_refresh "$X_BOOT_ID" || return 1
+        return 0
+    fi
     if [ "${X_PARENT_RECOVERING:-0}" != 1 ]; then
         [ -z "$X_PARENT_HASH" ] || { [ "$X_PARENT_HASH" = "$X_PHASH" ] && [ "$X_PARENT_INODE" = "$X_PINODE" ]; } || return 1
     else
@@ -789,7 +828,20 @@ xpan_parent_refresh() {
     done
     X_PARENT_PREVIOUS=$(xpan_bounded sha256sum "$X_STATE/parent.context") || return 1
     X_PARENT_PREVIOUS=${X_PARENT_PREVIOUS%% *}
-    xpan_parent_commit || return 1
+    # 刷新是显式重新验证：递归 pin 必须认可新父层，所以先更新 seal；
+    # commit 失败时恢复原 seal，仍按旧值 fail-closed。
+    X_SEAL_OLD_HASH=$X_PARENT_SEALED_HASH
+    X_SEAL_OLD_INODE=$X_PARENT_SEALED_INODE
+    X_SEAL_OLD_KIND=$X_PARENT_SEALED_KIND
+    X_PARENT_SEALED_HASH=$XP_PARENT_HASH
+    X_PARENT_SEALED_INODE=$XP_PARENT_INODE
+    X_PARENT_SEALED_KIND=$XP_PARENT_KIND
+    if ! xpan_parent_commit; then
+        X_PARENT_SEALED_HASH=$X_SEAL_OLD_HASH
+        X_PARENT_SEALED_INODE=$X_SEAL_OLD_INODE
+        X_PARENT_SEALED_KIND=$X_SEAL_OLD_KIND
+        return 1
+    fi
     xpan_log '已自动刷新本次启动的父层上下文，运行前仍检查真实配置与 SDK'
 }
 xpan_parent_prepare() {
@@ -966,7 +1018,7 @@ xpan_tick() {
     fi
     # Validate first without oscillating the live token during healthy monitoring.
     X_READY=$(xpan_bounded getprop sys.boot_completed 2>/dev/null) || X_READY=
-    if [ "$X_READY" != 1 ] || ! { xpan_markers && xpan_tokens && xpan_reboot_ready && xpan_qualify && xpan_receipt && xpan_apk; }; then
+    if [ "$X_READY" != 1 ] || ! { xpan_markers && xpan_tokens && xpan_reboot_ready && xpan_compat_settled && xpan_qualify && xpan_receipt && xpan_apk; }; then
         xpan_inactive
         xpan_cleanup
         xpan_unlock
@@ -1674,17 +1726,38 @@ xpan_main() {
             xpan_lock || return 1
             xpan_worker_bind || { xpan_unlock; return 1; }
             X_TOKEN=$X_WORKER_TOKEN
-            xpan_op_compat || true
-            if [ "${X_OC_CHANGED:-0}" = 1 ]; then
-                xpan_write "$X_MOD/.xpan-reboot-required" "$X_BOOT_ID" || { xpan_unlock; return 1; }
-                xpan_inactive || { xpan_unlock; return 1; }
-                xpan_log '补全已更新，重启手机后生效；本次启动保持未启用'
-            fi
+            # OP 素材核对在真机可达数十秒（逐文件探测原厂来源）；放在激活之前
+            # 会阻塞监护循环，导致 active 长期为 0、hook 资格被拒、XPAN 崩溃。
+            # 生产环境放到激活之后异步执行；测试保持同步语义以便断言。
             xpan_parent_start || { xpan_inactive; xpan_unlock; return 1; }
             X_PARENT_SEALED_HASH=$X_PARENT_HASH
             X_PARENT_SEALED_INODE=$X_PARENT_INODE
             X_PARENT_SEALED_KIND=$X_PARENT_KIND
             xpan_unlock
+            # 慢探测（真机逐文件核对可达数十秒）不持锁；提交改动前重新取锁并
+            # 复核实例 token，避免旧后台任务在新安装后改到新实例。
+            xpan_op_compat_service() {
+                xpan_op_compat || true
+                if [ "${X_OC_CHANGED:-0}" = 1 ]; then
+                    xpan_lock || return 1
+                    xpan_worker_current || { xpan_unlock; return 1; }
+                    if ! xpan_write "$X_MOD/.xpan-reboot-required" "$X_BOOT_ID"; then
+                        # 标记写不进去也有兜底：op.compat 的 changed/boot_id 会让
+                        # xpan_compat_settled 继续拒绝激活，直到真正重启。
+                        xpan_log '无法写入待重启标记；op.compat 将阻止激活'
+                    fi
+                    xpan_inactive
+                    X_OC_RC=$?
+                    xpan_unlock
+                    xpan_log '补全已更新，重启手机后生效'
+                    return "$X_OC_RC"
+                fi
+            }
+            if [ "${XPAN_TEST_MODE:-}" = 1 ]; then
+                xpan_op_compat_service
+            else
+                xpan_op_compat_service >>"$X_STATE/op-compat.log" 2>&1 &
+            fi
             # Long-lived functions survive removal of MODPATH and can clean only
             # this bound instance while its lifecycle authority remains current.
             while :; do

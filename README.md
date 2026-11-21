@@ -89,8 +89,17 @@
 
 ## 卸载
 
-在 KernelSU 中移除模块并重启。模块会自动清理 LSPosed 作用域与 hook APK，
-`/odm/etc/camera/config/` 下三个相机配置由模块目录卸载自动还原。
+在 KernelSU 中移除模块即可，**不依赖 KSU 执行 uninstall.sh**：
+
+- 安装时会在 `/data/adb/service.d/` 登记独立开机守护；只有确认
+  `/data/adb/modules/XpanAce3Pro` 与 `modules_update/XpanAce3Pro` 都真正缺席时才清理
+  （停用、remove 标记、升级/重装都不触发）。
+- 清理顺序：按现有备份还原对 OPCameraPro 的 SDK/native/滤镜素材改动 →
+  清空相机应用数据（当前用户中已安装的 `com.oplus.camera`）→
+  完整卸载 Hook APK（不带 `-k`，不保留应用数据）。
+- `/odm/etc/camera/config/` 下三个相机配置由模块目录卸载自动还原；
+  照片、LSPosed 数据库和其他模块不受影响。未覆盖用户后改且无备份的路径会保留并记入
+  `/data/local/tmp/xpan_uninstall.log`。
 
 ## 原理
 

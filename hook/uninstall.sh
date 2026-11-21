@@ -20,6 +20,7 @@
 # identity are unavailable, retain the job for manual retry, NOT a blind uninstall.
 
 PKG=com.xpanport.hook
+CAM=com.oplus.camera
 BASE=/data/adb
 LOG=/data/local/tmp/xpan_uninstall.log
 READY_TRIES=120
@@ -65,8 +66,12 @@ umask 077
 STATE=$BASE/xpan-lifecycle
 LOCK=$STATE/lock
 JOB=$BASE/service.d/xpan_cleanup.sh
+GUARD_JOB=$BASE/service.d/xpan_guard.sh
 ACTIVE=$BASE/modules/XpanAce3Pro
 STAGED=$BASE/modules_update/XpanAce3Pro
+OC=$BASE/modules/OPCameraPro
+OC_BACK=$BASE/xpan-runtime/op-compat-backup
+PROGRESS=$STATE/uninstall.progress
 log() { printf '%s\n' "xpan cleanup: $*" >> "$LOG"; }
 read_file() { [ -f "$1" ] && IFS= read -r VALUE < "$1"; }
 valid_token() {
@@ -226,27 +231,133 @@ still_owned() {
         fi
     fi
 }
+# KSU 可能不执行 uninstall.sh：service.d 守护只在本模块目录真正缺席时清理。
+# active 的 disable/remove 标记和 staged 更新都不算缺席。
+absent() {
+    [ ! -e "$ACTIVE" ] && [ ! -L "$ACTIVE" ] &&
+        [ ! -e "$STAGED" ] && [ ! -L "$STAGED" ]
+}
+# 守护模式没有 active 目录可读；只认安装时固定的 token。
+guard_owned() {
+    VALUE=
+    read_file "$STATE/current.token" || return 1
+    [ "$VALUE" = "$TOKEN" ] || return 1
+    absent
+}
+progress_owned() {
+    VALUE=
+    read_file "$PROGRESS" || return 1
+    [ "$VALUE" = "token=$TOKEN" ]
+}
+stage_done() {
+    progress_owned && grep -qx "done=$1" "$PROGRESS"
+}
+mark_stage() {
+    if progress_owned; then printf 'done=%s\n' "$1" >> "$PROGRESS"; else
+        { printf 'token=%s\n' "$TOKEN"; printf 'done=%s\n' "$1"; } > "$PROGRESS" || return 1
+    fi
+}
+# 只按现有备份还原，绝不凭当前原厂来源猜历史写入；备份缺失的路径原样保留。
+restore_op() {
+    [ -d "$OC" ] && [ ! -L "$OC" ] || { log 'restore: OPCameraPro 不在，跳过'; return 0; }
+    [ -d "$OC_BACK" ] || { log 'restore: 无备份目录，保留现状'; return 0; }
+    FAIL=0
+    for NAME in com.oplus.camera.unit.sdk.jar com.oplus.camera.unit.sdk.adapter.jar; do
+        SRC=$OC_BACK/$NAME
+        DST=$OC/system/product/framework/$NAME
+        [ -f "$SRC" ] || continue
+        [ -f "$DST" ] || { log "restore: 目标缺失 $NAME"; continue; }
+        cmp -s "$SRC" "$DST" && continue
+        TMP=$DST.xpan-restore.$$
+        if cp -f "$SRC" "$TMP" && chmod 0644 "$TMP" && mv -f "$TMP" "$DST"; then
+            log "restore: 已还原 $NAME"
+        else
+            rm -f "$TMP"; log "restore: 还原失败 $NAME"; FAIL=1
+        fi
+    done
+    if [ -d "$OC_BACK/mirror" ] && [ ! -L "$OC_BACK/mirror" ]; then
+        find "$OC_BACK/mirror" -type f > "$STATE/restore.list.$$" 2>/dev/null || : > "$STATE/restore.list.$$"
+        while IFS= read -r SRC; do
+            REL=${SRC#"$OC_BACK/mirror/"}
+            case "$REL" in ''|*..*) continue ;; esac
+            DST=$OC/system/$REL
+            [ -f "$DST" ] || continue
+            cmp -s "$SRC" "$DST" && continue
+            TMP=$DST.xpan-restore.$$
+            if cp -f "$SRC" "$TMP" && chmod 0644 "$TMP" && mv -f "$TMP" "$DST"; then
+                log "restore: 已还原 mirror/$REL"
+            else
+                rm -f "$TMP"; log "restore: 还原失败 mirror/$REL"; FAIL=1
+            fi
+        done < "$STATE/restore.list.$$"
+        rm -f "$STATE/restore.list.$$"
+    fi
+    find "$OC" -type f -name '*.xpan-c16-hidden' > "$STATE/restore.list.$$" 2>/dev/null || : > "$STATE/restore.list.$$"
+    while IFS= read -r HID; do
+        BASE_PATH=${HID%.xpan-c16-hidden}
+        [ -e "$BASE_PATH" ] && continue
+        if mv -f "$HID" "$BASE_PATH"; then log "restore: 已恢复隐藏文件 ${HID##*/}"; else log "restore: 恢复隐藏失败 ${HID##*/}"; FAIL=1; fi
+    done < "$STATE/restore.list.$$"
+    rm -f "$STATE/restore.list.$$"
+    log "restore: 结束 fail=$FAIL（未覆盖用户后改且无备份的路径）"
+    return "$FAIL"
+}
+# 卸载要求：相机应用数据清空；仅清当前用户中已安装的相机。
+clear_camera() {
+    package_users || { log 'camera: PM 未就绪'; return 1; }
+    FAIL=0
+    for USER in $USERS; do
+        LIST=$(pm_run list packages --user "$USER" "$CAM" 2>/dev/null) || { FAIL=1; continue; }
+        case "$LIST" in "package:$CAM") ;; *) continue ;; esac
+        OUT=$(pm_run clear --user "$USER" "$CAM" 2>&1)
+        RC=$?
+        log "camera clear user=$USER rc=$RC: $OUT"
+        [ "$RC" = 0 ] && case "$OUT" in *Success*) ;; *) FAIL=1 ;; esac || FAIL=1
+    done
+    [ "$FAIL" = 0 ]
+}
 owns_job() {
-    [ -f "$JOB" ] || return 1
-    grep -Fqx "XPAN_JOB_TOKEN='$TOKEN'" "$JOB" && return 0
+    [ -f "$CUR_JOB" ] || return 1
+    grep -Fqx "XPAN_JOB_TOKEN='$TOKEN'" "$CUR_JOB" && return 0
     # Migration: only the EXACT shipped legacy Xpan worker is ours. A name
     # or package string alone is not ownership of a service.d script.
-    JOB_HASH=$(sha256sum "$JOB" 2>/dev/null) || return 1
+    JOB_HASH=$(sha256sum "$CUR_JOB" 2>/dev/null) || return 1
     JOB_HASH=${JOB_HASH%% *}
     [ "$JOB_HASH" = 0261785d42aadaf66423999f8478f409202b86046df4848bb03eb45fb0dd1952 ]
 }
 remove_own_job() {
     # Never remove another token's replacement job (including after reinstall).
-    if owns_job; then rm -f "$JOB" || return 1; fi
+    if owns_job; then rm -f "$CUR_JOB" || return 1; fi
 }
 
 # Return 0: verified absent, 1: retry, 2: cancelled by replacement/reinstall.
 attempt() {
-    still_owned || { log 'cancelled: module instance changed/active/disabled'; return 2; }
+    if [ "$GUARD" = 1 ]; then
+        guard_owned || { log 'guard: 模块目录已回来或 token 已更换，保留任务'; return 2; }
+    else
+        still_owned || { log 'cancelled: module instance changed/active/disabled'; return 2; }
+    fi
     package_users || { log 'PM unavailable (framework/users); retain retry'; return 1; }
+    # 1) 还原本模块对 OPCameraPro 的改动（有备份才动）。
+    if ! stage_done restore; then
+        restore_op || { log 'restore 未完成；保留任务下次重试'; return 1; }
+        mark_stage restore || { log 'restore 进度写入失败'; return 1; }
+    fi
+    if [ "$GUARD" = 1 ]; then guard_owned || return 2; else still_owned || return 2; fi
+    # 2) 清空相机应用数据（用户明确要求；仅当前用户中已安装的相机）。
+    if ! stage_done camera; then
+        clear_camera || { log '相机数据清理未完成；保留任务下次重试'; return 1; }
+        mark_stage camera || { log '相机清理进度写入失败'; return 1; }
+    fi
+    if [ "$GUARD" = 1 ]; then guard_owned || return 2; else still_owned || return 2; fi
+    # 3) 完整卸载 Hook（不带 -k，不保留 APK 数据）。
+    if stage_done apk; then
+        return 0
+    fi
     package_present || { log 'PM package query failed; retain retry'; return 1; }
     if [ "$PRESENT" = 0 ]; then
         log 'verified absent for every current user'
+        mark_stage apk || return 1
         return 0
     fi
     package_identity || { log 'APK identity unavailable; retain retry'; return 1; }
@@ -255,50 +366,62 @@ attempt() {
     fi
     [ -n "$EXPECTED" ] || { log 'no uninstall-time APK identity; retain for manual retry'; return 1; }
     [ "$IDENTITY" = "$EXPECTED" ] || { log 'cancelled: installed APK identity changed'; return 2; }
-    still_owned || return 2
-    # Global uninstall covers secondary/work-profile users too. -k preserves app
-    # data/settings. No --user 0 fallback that can falsely claim global success.
-    OUT=$(pm_run uninstall -k "$PKG" 2>&1)
+    if [ "$GUARD" = 1 ]; then guard_owned || return 2; else still_owned || return 2; fi
+    # Global uninstall covers secondary/work-profile users too. No -k: 用户要求
+    # 卸载后不留 Hook 应用数据；相机照片/设置不动。
+    OUT=$(pm_run uninstall "$PKG" 2>&1)
     RESULT=$?
     log "uninstall rc=$RESULT: $OUT"
     [ "$RESULT" = 0 ] && [ "$OUT" = Success ] || return 1
     package_users && package_present || { log 'post-uninstall PM verification failed'; return 1; }
     [ "$PRESENT" = 0 ] || { log 'still installed for at least one user'; return 1; }
     log 'APK removal verified for every current user'
+    mark_stage apk || return 1
     return 0
 }
 write_job() {
     SCRIPT_SOURCE=$0
-    if [ "$DEFERRED" = 0 ] && [ -e "$ACTIVE/payload/uninstall-apk.sh" ]; then
+    if [ "$DEFERRED" = 0 ] && [ -e "$ACTIVE/payload/uninstall-apk.sh" ] && [ "${0%/*}" = "$ACTIVE" ]; then
         # The root wrapper sources this packaged helper to preserve $0 identity.
         # Copy the helper, not the wrapper which needs the soon-removed MODPATH.
-        [ "${0%/*}" = "$ACTIVE" ] && [ ! -L "$ACTIVE/payload" ] &&
+        [ ! -L "$ACTIVE/payload" ] &&
             [ -f "$ACTIVE/payload/uninstall-apk.sh" ] &&
             [ ! -L "$ACTIVE/payload/uninstall-apk.sh" ] || return 1
         SCRIPT_SOURCE=$ACTIVE/payload/uninstall-apk.sh
     fi
     [ -f "$SCRIPT_SOURCE" ] && [ ! -L "$SCRIPT_SOURCE" ] || return 1
-    if [ -e "$JOB" ] && ! owns_job; then
-        log 'retry path occupied by unowned job; refuse to overwrite'
-        return 1
+    if [ -e "$CUR_JOB" ] && ! owns_job; then
+        # 只允许覆盖“本模块安装的守护副本”（新 token 重装后重新登记）。
+        if [ -f "$CUR_JOB" ] && [ ! -L "$CUR_JOB" ] && grep -qx "XPAN_JOB_MODE='guard'" "$CUR_JOB"; then
+            log 'replacing previous guard job with new instance token'
+        else
+            log 'retry path occupied by unowned job; refuse to overwrite'
+            return 1
+        fi
     fi
+    JOB_MODE=${JOB_MODE:-retry}
     mkdir -p "$BASE/service.d" || return 1
     # Self-contained copy survives removal of the original module directory.
     # The temporary file is non-executable and published only under the lock.
-    TEMP=$JOB.tmp
+    TEMP=$CUR_JOB.tmp
     {
         printf '#!/system/bin/sh\nXPAN_JOB_TOKEN=\047%s\047\nXPAN_JOB_IDENTITY=\047%s\047\n' "$TOKEN" "$EXPECTED"
+        [ "$JOB_MODE" != guard ] || printf 'XPAN_JOB_MODE=\047guard\047\n'
         cat "$SCRIPT_SOURCE"
     } > "$TEMP" || { rm -f "$TEMP"; return 1; }
-    chmod 0700 "$TEMP" && mv -f "$TEMP" "$JOB" || { rm -f "$TEMP"; return 1; }
-    log 'retry job retained in service.d (bounded, no background worker)'
+    chmod 0700 "$TEMP" && mv -f "$TEMP" "$CUR_JOB" || { rm -f "$TEMP"; return 1; }
+    if [ "$JOB_MODE" = guard ]; then
+        log 'guard job retained in service.d (bounded, no background worker)'
+    else
+        log 'retry job retained in service.d (bounded, no background worker)'
+    fi
 }
 
 [ "$(id -u)" = 0 ] || exit 1
 mkdir -p "$STATE" || exit 1
-# Without timeout every PM query fails closed; the immediate path still writes
-# a retry job rather than dropping the uninstall request.
 DEFERRED=0
+GUARD=0
+CUR_JOB=$JOB
 TOKEN=
 EXPECTED=
 if [ -n "${XPAN_JOB_TOKEN:-}" ]; then
@@ -307,6 +430,32 @@ if [ -n "${XPAN_JOB_TOKEN:-}" ]; then
     EXPECTED=${XPAN_JOB_IDENTITY:-}
     valid_token "$TOKEN" || exit 1
     [ -z "$EXPECTED" ] || valid_identity "$EXPECTED" || exit 1
+    if [ "${XPAN_JOB_MODE:-}" = guard ]; then GUARD=1; CUR_JOB=$GUARD_JOB; fi
+elif [ "${XPAN_ARM:-}" = 1 ]; then
+    # 安装完成后的常驻守护：KSU 可能根本不执行 uninstall.sh，必须在每次开机
+    # 自己判断“模块目录真的没了”，再做恢复/清数据/卸 Hook。
+    [ "${0%/*}" = "$ACTIVE" ] || case "$0" in "$ACTIVE"/*|"$STAGED"/*) ;; *) exit 1 ;; esac
+    grep -qx 'id=XpanAce3Pro' "$ACTIVE/module.prop" 2>/dev/null ||
+        grep -qx 'id=XpanAce3Pro' "$STAGED/module.prop" 2>/dev/null || exit 1
+    TOKEN_SRC=$ACTIVE
+    case "${0%/*}" in "$STAGED"/*) TOKEN_SRC=$STAGED ;; esac
+    read_file "$TOKEN_SRC/.xpan-instance" && valid_token "$VALUE" || exit 1
+    TOKEN=$VALUE
+    read_file "$TOKEN_SRC/.xpan-apk-identity" && valid_identity "$VALUE" || exit 1
+    EXPECTED=$VALUE
+    JOB_MODE=guard
+    CUR_JOB=$GUARD_JOB
+    if [ "${XPAN_ARM_LOCKED:-}" = 1 ]; then
+        write_job || exit 1
+    else
+        lock || exit 1
+        VALUE=
+        if read_file "$STATE/current.token"; then [ "$VALUE" = "$TOKEN" ] || { unlock; exit 1; }; fi
+        write_job || { unlock; exit 1; }
+        unlock
+    fi
+    log '已登记开机卸载守护（模块目录缺席时清理）'
+    exit 0
 else
     # Only a real module instance may initialize legacy lifecycle state.
     [ "${0%/*}" = "$ACTIVE" ] || { log 'not the Xpan module uninstall hook'; exit 1; }
@@ -366,17 +515,29 @@ else
 fi
 
 # PM readiness waiting is bounded, and timeout is NOT logged as readiness.
+# 守护模式还要等 sys.boot_completed，不能把开机中的 PM 假成功当成就绪。
 I=0
 READY=0
 while [ "$I" -lt "$READY_TRIES" ]; do
     I=$((I+1))
-    lock || { log 'lifecycle lock busy; keep job'; exit 1; }
-    if ! still_owned; then
+    # 开机时 service/tick 会短暂持锁；忙就等下一轮，不放弃任务。
+    lock || { [ "$I" -ge "$READY_TRIES" ] || sleep "$LOCK_DELAY"; continue; }
+    if [ "$GUARD" = 1 ]; then
+        if ! guard_owned; then
+            # 守护常驻：模块还在/换了新 token 都只暂停，不删任务；重装会重新登记。
+            log 'guard: 模块目录仍在或 token 已更换，本轮不清理，保留守护'
+            unlock
+            exit 0
+        fi
+    elif ! still_owned; then
         log 'cancelled before waiting: replacement/active/disabled module'
         remove_own_job
         RESULT=$?
         unlock
         exit "$RESULT"
+    fi
+    if [ "$GUARD" = 1 ]; then
+        [ "$(getprop sys.boot_completed 2>/dev/null)" = 1 ] || { unlock; sleep "$READY_DELAY"; continue; }
     fi
     if package_users; then READY=1; fi
     unlock
@@ -388,7 +549,12 @@ log 'PM ready'
 N=0
 while [ "$N" -lt "$UNINSTALL_TRIES" ]; do
     N=$((N+1))
-    lock || { log 'lifecycle lock busy; keep job'; exit 1; }
+    # 锁忙只算一次重试，不当成放弃；本轮结束后统一按 RETRY_DELAY 等待。
+    if ! lock; then
+        log 'lifecycle lock busy; keep job'
+        [ "$N" -ge "$UNINSTALL_TRIES" ] || sleep "$RETRY_DELAY"
+        continue
+    fi
     attempt
     RESULT=$?
     if [ "$RESULT" = 0 ] || [ "$RESULT" = 2 ]; then

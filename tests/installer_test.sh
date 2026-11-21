@@ -24,6 +24,8 @@ expect_rc() {
     if [ "$RC" != "$1" ]; then
         printf '%s\n' "$(<"$XPAN_TEST_ROOT/stdout")" >&2
         [ ! -f "$XPAN_TEST_ROOT/install.log" ] || printf '%s\n' "$(<"$XPAN_TEST_ROOT/install.log")" >&2
+        [ ! -f "$XPAN_TEST_ROOT/uninstall.log" ] || printf '%s\n' "$(<"$XPAN_TEST_ROOT/uninstall.log")" >&2
+        [ ! -f "$XPAN_TEST_ROOT/pm.calls" ] || printf '%s\n' "$(<"$XPAN_TEST_ROOT/pm.calls")" >&2
         fail "expected rc=$1, got $RC"
     fi
 }
@@ -79,6 +81,7 @@ fixture() {
     printf 'fixture/ROM:exact\n' > "$XPAN_TEST_ROOT/fingerprint"
     next_uuid 1
     cp "$UNINSTALL" "$ACTIVE/uninstall.sh"
+    cp "$UNINSTALL" "$ACTIVE/payload/uninstall-apk.sh"
     for name in camera_unit_config camera_unit_feature_config.protobuf oplus_camera_config; do
         printf 'fake original %s\n' "$name" > "$XPAN_TEST_ROOT/stock/$name"
         printf 'fake qualified output %s\n' "$name" > "$ACTIVE/payload/qualified-config/$name"
@@ -128,6 +131,14 @@ case "$*" in
         [ "$MODE" != target-text-error ] || { printf 'Error: query failed\n'; exit 0; }
         [ "$MODE" != secondary-error ] || [ "$4" != 10 ] || { printf 'Error: work profile unavailable\n'; exit 1; }
         if [ -f "$R/installed.$4" ]; then printf 'package:com.xpanport.hook\n'; fi
+        ;;
+    'list packages --user '*" com.oplus.camera")
+        [ ! -f "$R/camera-absent.$4" ] || exit 0
+        printf 'package:com.oplus.camera\n'
+        ;;
+    'clear --user '*" com.oplus.camera")
+        : > "$R/camera-cleared.$3"
+        printf 'Success\n'
         ;;
     'path --user '*" com.xpanport.hook")
         IFS= read -r GEN < "$R/generation"
@@ -193,10 +204,12 @@ case "$*" in
         [ -d "$R/data/adb/xpan-lifecycle/lock" ] || exit 86
         IFS= read -r CURRENT < "$R/data/adb/xpan-lifecycle/current.token"
         B=$R/data/adb/xpan-lifecycle/apk-backup/$CURRENT
-        [ -f "$B/base.apk" ] && [ -f "$B/identity" ] && [ -f "$B/receipt" ] || exit 86
-        IFS= read -r GEN < "$R/generation"
-        cmp -s "$B/base.apk" "$R/data/app/$GEN/com.xpanport.hook/base.apk" || exit 86
-        printf 'complete-backup-before-uninstall\n' >> "$R/protocol.calls"
+        if [ -d "$B" ]; then
+            [ -f "$B/base.apk" ] && [ -f "$B/identity" ] && [ -f "$B/receipt" ] || exit 86
+            IFS= read -r GEN < "$R/generation"
+            cmp -s "$B/base.apk" "$R/data/app/$GEN/com.xpanport.hook/base.apk" || exit 86
+            printf 'complete-backup-before-uninstall\n' >> "$R/protocol.calls"
+        fi
         IFS= read -r ACTION < "$R/uninstall-mode"
         if [ "$ACTION" = failure ]; then printf 'Failure [DELETE_FAILED_INTERNAL_ERROR]\n'; exit 1; fi
         rm -f "$R/installed.0" "$R/installed.10"
