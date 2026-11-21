@@ -861,6 +861,24 @@ run boot; expect 0; off; no_mounts
 run; expect 0; on
 ok 'OP C16 mounted SDK installs APK as pending reboot, real C17 SDK required before activation'
 
+# 待重启标记在真实重启（boot_id 变化）后必须被消费：
+# 否则软重启（system_server 重启、boot_id 不变）会让激活永久被拒，
+# hook 资格失效，相机点 XPAN 因 BaseMode 空引用崩溃（v2.1 实测）。
+fixture
+op_fixture
+run install; expect 0; off; no_mounts
+[ "$(<"$ACTIVE/.xpan-reboot-required")" = "$(<"$XPAN_TEST_ROOT/boot-id")" ] || fail 'install did not arm pending reboot'
+cp "$XPAN_TEST_OP_DIR/system/product/framework/"*.jar "$XPAN_TEST_ROOT/product/framework/"
+printf '12345678-1234-4234-8234-000000000007\n' > "$XPAN_TEST_ROOT/boot-id"
+printf 'mnt:[4026531999]\n' > "$XPAN_TEST_ROOT/ns"
+run boot; expect 0; off; no_mounts
+run; expect 0; on
+[ ! -e "$ACTIVE/.xpan-reboot-required" ] || fail 'verified reboot did not consume pending marker'
+: > "$XPAN_TEST_ROOT/commands"
+run; expect 0; on
+[ ! -e "$ACTIVE/.xpan-reboot-required" ] || fail 'soft reboot resurrected pending marker'
+ok 'verified reboot consumes pending marker; soft reboot cannot deadlock activation'
+
 for mode in active staged old-boot; do
     fixture
     op_fixture

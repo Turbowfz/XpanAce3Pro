@@ -347,7 +347,13 @@ xpan_install_sdk() {
 }
 xpan_reboot_ready() {
     [ -e "$X_MOD/.xpan-reboot-required" ] || [ -L "$X_MOD/.xpan-reboot-required" ] || return 0
-    xpan_read "$X_MOD/.xpan-reboot-required" && xpan_uuid "$X_VALUE" && [ "$X_VALUE" != "$X_BOOT_ID" ]
+    xpan_read "$X_MOD/.xpan-reboot-required" && xpan_uuid "$X_VALUE" || return 1
+    [ "$X_VALUE" != "$X_BOOT_ID" ] || return 1
+    # 记录的启动已经是过去式＝真实重启发生过；立即消费标记。
+    # 不消费的话，软重启（system_server 重启、boot_id 不变）会让本检查
+    # 永远拒绝激活，hook 资格被拒，相机点 XPAN 因 BaseMode 空引用崩溃。
+    rm -f "$X_MOD/.xpan-reboot-required" || return 1
+    return 0
 }
 xpan_qualify() {
     local X_R
